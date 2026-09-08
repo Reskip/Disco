@@ -1,0 +1,92 @@
+# context/ — fast orientation for agents
+
+This folder is **not** Disco's documentation. The user-facing docs live in [`apps/disco-docs/pages/guide/`](../apps/disco-docs/pages/guide/) and on [disco.live](https://disco.live).
+
+This folder is a small set of **agent-oriented cheat sheets** — tight pointers, file maps, gotchas, and design rationale that an LLM dropped into the repo would actually want to skim before opening code.
+
+## Working principles
+
+- **Code is ground truth.** If a doc here drifts from the code, the code wins.
+- **Guides are user truth.** If a topic has a guide page, this folder links to it instead of duplicating it.
+- **Keep it small.** A bloated `context/` is a tax on every agent that loads it.
+
+If you're tempted to add a long prose doc here — write it as a guide in `apps/disco-docs/pages/guide/` instead, and link to it from here.
+
+---
+
+## Layout
+
+### `concepts/` — agent cheat sheets
+
+Tight, code-pointer-heavy notes on internals.
+
+| File                                                                      | What it's for                                                             |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| [`core.md`](concepts/core.md)                                             | The five primitives (Branch, Board, Session, Task, Report). Mental model. |
+| [`architecture.md`](concepts/architecture.md)                             | System shape: services / repos / executor / storage. Where to look first. |
+| [`branches.md`](concepts/branches.md)                                     | Branch-centric architecture (read before touching boards).                |
+| [`security.md`](concepts/security.md)                                     | Web-layer hardening: CSP, CORS, recipes, debugging.                       |
+| [`multitenancy.md`](concepts/multitenancy.md)                             | Triggers, resource classification, code owners, and proportional proof.   |
+| [`daemon-filesystem-boundary.md`](concepts/daemon-filesystem-boundary.md) | Daemon-host filesystem capability guard, registry, and limitations.       |
+| [`id-management.md`](concepts/id-management.md)                           | UUIDv7, branded ID types, short-ID resolution.                            |
+| [`task-queueing.md`](concepts/task-queueing.md)                           | Task lifecycle and queue-on-busy semantics.                               |
+| [`task-runtime-state.md`](concepts/task-runtime-state.md)                 | Task states, executor liveness, SDK pulses, watchdogs, and containment.   |
+| [`mcp-session-tools.md`](concepts/mcp-session-tools.md)                   | `disco_sessions_*` MCP tool surface and override semantics.                |
+
+### `guides/` — how-tos
+
+Step-by-step implementation guides referenced from code.
+
+- [`creating-database-migrations.md`](guides/creating-database-migrations.md) — Drizzle migrations (sqlite + postgres).
+- [`extending-feathers-services.md`](guides/extending-feathers-services.md) — Adding services, methods, hooks.
+- [`rbac-and-unix-isolation.md`](guides/rbac-and-unix-isolation.md) — Implementation guide for branch RBAC and simple/sandbox/delegated execution.
+- [`migrate-strict-to-sandbox.md`](guides/migrate-strict-to-sandbox.md) — Operator runbook for moving a deployment from `strict`/`insulated` to `unix_user_mode: sandbox` (uses the `scripts/*sandbox*` migration + pre-flight scripts).
+
+### `guidelines/` — house rules
+
+- [`frontend.md`](guidelines/frontend.md) — AntD-first components, theme tokens, accessibility, and exact-color exceptions.
+- [`logging.md`](guidelines/logging.md) — Safe, bounded operational logging and its boundary with analytics, telemetry, and usage accounting.
+- [`testing.md`](guidelines/testing.md) — Vitest patterns and conventions.
+- [`toasts.md`](guidelines/toasts.md) — Toast/message pattern. Always `useThemedMessage()` — never static `message.x()`.
+- [`onboarding-design.md`](guidelines/onboarding-design.md) — Onboarding wizard: goal-over-role framing, the locked goal cards, and composable-block recs.
+
+### `explorations/` — active design docs
+
+Designs that are referenced from code or in flight. Anything here is either still being built or documents a security/behavior contract you'd want before touching the relevant code.
+
+- [`executor-isolation.md`](explorations/executor-isolation.md) — executor process / unix isolation architecture (referenced from `packages/executor/` and `apps/disco-docs/pages/guide/architecture.mdx`).
+- [`executor-expansion.md`](explorations/executor-expansion.md) — referenced from `packages/core/src/config/`.
+- [`executor-implementation-plan.md`](explorations/executor-implementation-plan.md) — phased plan for executor work.
+- [`env-var-access.md`](explorations/env-var-access.md) — per-user / per-session env var access model (referenced from schemas, types, and migrations).
+- [`kb-agent-targeted-edits.md`](explorations/kb-agent-targeted-edits.md) — design proposal for small, version-checked agent edits to large Knowledge Base markdown documents.
+- [`kb-teammate-framework-integration.md`](explorations/kb-teammate-framework-integration.md) — options for backing Disco teammate framework memory/docs/skills with Knowledge Base namespaces and tools.
+- [`teammate-kb-namespace-memory-plan.md`](explorations/teammate-kb-namespace-memory-plan.md) — implementation plan for teammate primary KB namespaces, memory append tools, and branch-scoped namespace grants.
+- [`kb-namespace-rbac-v1.md`](explorations/kb-namespace-rbac-v1.md) — directed V1 plan for Knowledge namespace RBAC and teammate home namespaces.
+- [`session-sharing.md`](explorations/session-sharing.md) — `dangerously_allow_session_sharing` security contract (referenced from `AGENTS.md` and `apps/disco-docs/pages/security.mdx`).
+- [`parent-session-callbacks.md`](explorations/parent-session-callbacks.md) — child-session completion notifications (referenced from `docs/never-lose-prompt-design.md`).
+- [`frontend-hardcoded-colors.md`](explorations/frontend-hardcoded-colors.md) — Biome/GritQL color audit, classification, and enforcement rollout.
+- [`web-terminal-ownership-ha.md`](explorations/web-terminal-ownership-ha.md) — process-affine terminal ownership, HA support, and failure semantics.
+
+### Messaging & positioning (now in the Knowledge base)
+
+The source of truth for product copy (taglines, hero, package descriptions, blog voice) lives in the Disco team Knowledge base, **not** this repo: [`marketing/messaging-and-positioning`](https://disco.sandbox.preset.zone/kb/disco-cloud-team/marketing/messaging-and-positioning.md). Read it before writing user-facing prose; do **not** paraphrase the codebase to invent new framing.
+
+### `images/`
+
+Assets used by docs in this folder.
+
+---
+
+## What lives elsewhere now
+
+A previous version of this folder had ~95 files (concepts/, archives/, explorations/, projects/) totaling ~57k lines. Most was either:
+
+- duplicated by the user-facing guide pages in `apps/disco-docs/pages/guide/*.mdx`,
+- design exploration for features that have since shipped (the code is the source of truth),
+- or stale plans for features that never shipped.
+
+If you're looking for a topic and don't see it here, try (in order):
+
+1. The relevant guide page in `apps/disco-docs/pages/guide/`
+2. `git log --all --diff-filter=D -- 'context/**'` to find the deleted version
+3. The actual code under `packages/` or `apps/`

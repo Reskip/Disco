@@ -1,0 +1,201 @@
+/**
+ * Wrap an AGENT executor spawn in an OS sandbox (`bubblewrap`: user + mount
+ * namespaces, plus a PID namespace where the host allows it). Applied by
+ * `spawnExecutorLocal` — the chokepoint for agent workloads: prompt tasks and
+ * web terminals, across all agentic tools (tool-agnostic).
+ *
+ * NOT applied to daemon-internal command spawns (`runExecutorCommand` /
+ * `startInteractiveExecutor`: git-state/autocomplete probes, file reads, OAuth
+ * flows) — those are Disco's own trusted code with no agent-authored payload,
+ * analogous to daemon-owned maintenance operations running unwrapped.
+ *
+ * The network namespace stays shared (no `--unshare-net`), so the executor
+ * keeps its daemon/model connectivity. Network egress control, if wanted, is
+ * left to each tool's own config.
+ *
+ * Daemon-side + synchronous: takes the concrete paths the daemon already knows
+ * from its own DB state (Session workspace and per-owner home store) — it does
+ * NOT infer identity from on-disk Git pointers — resolves the policy via the
+ * pure `@disco/core` resolver, and returns the `bwrap` command that replaces the
+ * bare executor launch.
+ *
+ * See `context/explorations/executor-sandboxing.md`.
+ */
+
+import { existsSync, mkdirSync, realpathSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import {
+  type DiscoSandboxSettings,
+  resolveBwrapArgs,
+  type SandboxPathContext,
+} from '@disco/core/config';
+import { bwrapOnPath, probeBwrapPidNamespace, probeBwrapUserns } from '@disco/core/unix';
+
+export interface SandboxWrap {
+  cmd: string;
+  args: string[];
+  extraEnv: Record<string, string>;
+}
+
+/** Deployment paths resolved once from the daemon's immutable startup state. */
+export interface SandboxRuntimePaths {
+  homeDir: string;
+  dataHome: string;
+  protectedDataRoots: string[];
+  worktreesRoot: string;
+  agenticToolsPath: string;
+  discoConfigPath: string;
+  discoDbPath?: string;
+}
+
+function canonicalizeExistingPath(path: string): string {
+  return existsSync(path) ? realpathSync(path) : resolve(path);
+}
+
+// FUNCTIONAL availability: bwrap must be on PATH AND able to create an
+// unprivileged user namespace on this host (installed-but-blocked is common on
+// hardened kernels). Cached once — the kernel/userns capability does not change
+// during a daemon's lifetime, and the probe spawns a process.
+let bwrapAvailableCache: boolean | undefined;
+function bwrapAvailable(): boolean {
+  if (bwrapAvailableCache === undefined) {
+    bwrapAvailableCache = bwrapOnPath() && probeBwrapUserns();
+  }
+  return bwrapAvailableCache;
+}
+
+// Best-effort PID-namespace hardening: available on bare-metal hosts, commonly
+// blocked in containers (can't mount proc in a nested PID ns). Cached; warned
+// once so operators know the /proc process-side vector isn't closed on this
+// host (in a container the container itself is the isolation boundary).
+let pidNsCache: boolean | undefined;
+function pidNamespaceAvailable(): boolean {
+  if (pidNsCache === undefined) {
+    pidNsCache = probeBwrapPidNamespace();
+    if (!pidNsCache) {
+      console.warn(
+        '[Sandbox] This host cannot create a PID namespace for the executor sandbox ' +
+          '(common in containers). Falling back to a user + mount sandbox WITHOUT ' +
+          '--unshare-pid: filesystem masks still apply, but same-uid /proc process ' +
+          'inspection is governed by the host (ptrace_scope) or the surrounding container boundary.'
+      );
+    }
+  }
+  return pidNsCache;
+}
+
+/**
+ * Build the `bwrap <args> -- <command>` wrapper for an executor command.
+ * Returns null to spawn unwrapped (sandbox disabled, or `bwrap`/platform
+ * unavailable and `fail_if_unavailable` is false). Throws when unavailable and
+ * `fail_if_unavailable` is true.
+ *
+ * `userWorkspaceRoot` and `ownerHomeStore` are threaded from the daemon's
+ * authoritative Session/owner state — never inferred from a Git carrier.
+ */
+export function buildSandboxWrap(params: {
+  sandbox: DiscoSandboxSettings | undefined;
+  /** Session working directory (task cwd) — NOT the executor process cwd. */
+  workspacePath: string;
+  /** Complete `worktrees/user-*` root shared by this owner's Agents and sessions. */
+  userWorkspaceRoot?: string;
+  cmd: string;
+  args: string[];
+  ownerHomeStore?: string;
+  /** Immutable deployment paths injected by configureExecutor at startup. */
+  runtimePaths: SandboxRuntimePaths;
+}): SandboxWrap | null {
+  const { sandbox, workspacePath, userWorkspaceRoot, cmd, args, ownerHomeStore, runtimePaths } =
+    params;
+  if (!sandbox?.enabled) return null;
+
+  const unavailableReason =
+    process.platform !== 'linux'
+      ? `filesystem sandbox requires Linux (bubblewrap); platform is ${process.platform}`
+      : !bwrapAvailable()
+        ? '`bwrap` (bubblewrap) is missing or cannot create an unprivileged user namespace'
+        : null;
+  if (unavailableReason) {
+    if (sandbox.fail_if_unavailable) {
+      throw new Error(
+        `execution.sandbox.enabled but ${unavailableReason}. ` +
+          'Install bubblewrap or, outside unix_user_mode: sandbox, explicitly allow an unsandboxed fallback.'
+      );
+    }
+    console.warn(`[Sandbox] ${unavailableReason} — spawning executor UNSANDBOXED.`);
+    return null;
+  }
+
+  const home = runtimePaths.homeDir;
+  const dataHome = runtimePaths.dataHome;
+
+  const perUser = sandbox.home_mode === 'per_user' && !!ownerHomeStore;
+  if (perUser) {
+    // The overlay `--bind`s the store over the passwd home; bwrap aborts if the
+    // source is missing, so guarantee it exists (a fresh owner gets an empty
+    // home; tools seed their own state, and migration pre-populates it).
+    try {
+      mkdirSync(ownerHomeStore as string, { recursive: true });
+      // /tmp is bound to <store>/tmp (on-disk, per-user). bwrap `--bind` aborts
+      // if the source is missing, so ensure it exists alongside the store.
+      mkdirSync(join(ownerHomeStore as string, 'tmp'), { recursive: true });
+    } catch (err) {
+      throw new Error(
+        `execution.sandbox.home_mode=per_user but the owner home store ` +
+          `${ownerHomeStore} could not be created: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  const ctx: SandboxPathContext = {
+    workspacePath,
+    userWorkspaceRoot,
+    pidNamespace: pidNamespaceAvailable(),
+    homeDir: home,
+    canonicalHomeDir: canonicalizeExistingPath(home),
+    dataHome,
+    canonicalDataHome: canonicalizeExistingPath(dataHome),
+    protectedDataRoots: runtimePaths.protectedDataRoots.flatMap((root) => [
+      root,
+      canonicalizeExistingPath(root),
+    ]),
+    ownerHomeStore: perUser ? ownerHomeStore : undefined,
+    agenticToolsPath: perUser ? runtimePaths.agenticToolsPath : undefined,
+    discoConfigPath: runtimePaths.discoConfigPath,
+    discoDbPath: runtimePaths.discoDbPath,
+  };
+
+  const bwrapArgs = dropMasksForMissingTargets(resolveBwrapArgs(sandbox, ctx));
+  return {
+    cmd: 'bwrap',
+    args: [...bwrapArgs, '--', cmd, ...args],
+    // Tell the executor NOT to nest each tool's own sandbox inside ours.
+    extraEnv: { DISCO_OUTER_SANDBOX: '1' },
+  };
+}
+
+/**
+ * A mask on a NON-existent path (`--tmpfs <dir>` or `--ro-bind /dev/null <file>`)
+ * makes bubblewrap try to create the mountpoint under the read-only root and
+ * abort. Drop such entries — a path that doesn't exist has nothing to hide.
+ * (Real targets like /tmp and the worktrees root exist and are kept.)
+ */
+function dropMasksForMissingTargets(args: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; ) {
+    const a = args[i];
+    if (a === '--tmpfs') {
+      const dest = args[i + 1];
+      if (dest && existsSync(dest)) out.push(a, dest);
+      i += 2;
+    } else if ((a === '--ro-bind' || a === '--ro-bind-try') && args[i + 1] === '/dev/null') {
+      const dest = args[i + 2];
+      if (dest && existsSync(dest)) out.push(a, '/dev/null', dest);
+      i += 3;
+    } else {
+      out.push(a);
+      i += 1;
+    }
+  }
+  return out;
+}

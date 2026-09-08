@@ -1,0 +1,184 @@
+import type { DiscoConfig } from '@disco/core/config';
+import {
+  and,
+  count,
+  eq,
+  gte,
+  lt,
+  runWithTenantContext,
+  runWithTenantDatabaseScope,
+  select,
+  sessions,
+  type TenantScopeAwareDatabase,
+  tasks,
+} from '@disco/core/db';
+import {
+  normalizeTelemetryModelFamily,
+  normalizeTelemetryProvider,
+  openSourceTelemetryLogger,
+} from '@disco/core/telemetry';
+import type { DeepReadonly, Session, TenantID } from '@disco/core/types';
+
+const ONE_HOUR_MS = 60 * 60 * 1000;
+const ONE_DAY_MS = 24 * ONE_HOUR_MS;
+let lastUsageSummaryDayInProcess: string | undefined;
+
+interface TaskUsageRow {
+  taskData: {
+    model?: string;
+  } | null;
+  agenticTool: string | null;
+  sessionData: {
+    model_config?: Session['model_config'];
+  } | null;
+}
+
+function increment(map: Record<string, number>, key: string): void {
+  map[key] = (map[key] ?? 0) + 1;
+}
+
+function previousUtcDayRange(now = new Date()): { day: string; start: Date; end: Date } {
+  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const start = new Date(end.getTime() - ONE_DAY_MS);
+  return { day: start.toISOString().slice(0, 10), start, end };
+}
+
+async function countCreatedRows(
+  db: TenantScopeAwareDatabase,
+  table: typeof tasks | typeof sessions,
+  start: Date,
+  end: Date
+): Promise<number> {
+  const row = await select(db, { value: count() })
+    .from(table)
+    .where(and(gte(table.created_at, start), lt(table.created_at, end)))
+    .one();
+  return Number(row?.value ?? 0);
+}
+
+async function addDistinctCreatedBy(
+  db: TenantScopeAwareDatabase,
+  table: typeof tasks | typeof sessions,
+  start: Date,
+  end: Date,
+  users: Set<string>
+): Promise<void> {
+  const rows = await select(db, { createdBy: table.created_by })
+    .from(table)
+    .where(and(gte(table.created_at, start), lt(table.created_at, end)))
+    .groupBy(table.created_by)
+    .all();
+
+  for (const row of rows as Array<{ createdBy: string | null }>) {
+    if (row.createdBy) users.add(row.createdBy);
+  }
+}
+
+async function getTaskUsageRows(
+  db: TenantScopeAwareDatabase,
+  start: Date,
+  end: Date
+): Promise<TaskUsageRow[]> {
+  return (await select(db, {
+    taskData: tasks.data,
+    agenticTool: sessions.agentic_tool,
+    sessionData: sessions.data,
+  })
+    .from(tasks)
+    .innerJoin(sessions, eq(tasks.session_id, sessions.session_id))
+    .where(and(gte(tasks.created_at, start), lt(tasks.created_at, end)))
+    .all()) as TaskUsageRow[];
+}
+
+export async function flushOpenSourceTelemetryUsageSummary(
+  db: TenantScopeAwareDatabase,
+  config: DeepReadonly<DiscoConfig>
+): Promise<void> {
+  if (!openSourceTelemetryLogger.isEnabled()) return;
+
+  const { day, start, end } = previousUtcDayRange();
+  if (config.telemetry?.last_usage_summary_day === day || lastUsageSummaryDayInProcess === day)
+    return;
+
+  const { activeUsers, promptCount, sessionCreatedCount, taskRows } =
+    await runWithTenantDatabaseScope(db, undefined, async () => {
+      const [promptCount, sessionCreatedCount, taskRows] = await Promise.all([
+        countCreatedRows(db, tasks, start, end),
+        countCreatedRows(db, sessions, start, end),
+        getTaskUsageRows(db, start, end),
+      ]);
+
+      const activeUsers = new Set<string>();
+      await Promise.all([
+        addDistinctCreatedBy(db, tasks, start, end, activeUsers),
+        addDistinctCreatedBy(db, sessions, start, end, activeUsers),
+      ]);
+      return { activeUsers, promptCount, sessionCreatedCount, taskRows };
+    });
+
+  const taskCountByAgenticTool: Record<string, number> = {};
+  const taskCountByProvider: Record<string, number> = {};
+  const taskCountByModelFamily: Record<string, number> = {};
+
+  for (const task of taskRows) {
+    increment(taskCountByAgenticTool, task.agenticTool ?? 'unknown');
+    increment(
+      taskCountByProvider,
+      normalizeTelemetryProvider(task.sessionData?.model_config?.provider)
+    );
+    increment(
+      taskCountByModelFamily,
+      normalizeTelemetryModelFamily(task.taskData?.model ?? task.sessionData?.model_config?.model)
+    );
+  }
+
+  if (promptCount > 0 || sessionCreatedCount > 0) {
+    openSourceTelemetryLogger.track({
+      event: 'usage.daily_summary',
+      properties: {
+        day,
+        period: 'previous_utc_day',
+        prompt_count: promptCount,
+        active_user_count: activeUsers.size,
+        session_created_count: sessionCreatedCount,
+        task_count_by_agentic_tool: taskCountByAgenticTool,
+        task_count_by_provider: taskCountByProvider,
+        task_count_by_model_family: taskCountByModelFamily,
+      },
+    });
+    await openSourceTelemetryLogger.flush();
+  }
+  lastUsageSummaryDayInProcess = day;
+}
+
+export interface OpenSourceTelemetryUsageSummaryIntervalOptions {
+  /** Tenant used for daemon-global telemetry scans that have no request auth context. */
+  tenantId: TenantID | string;
+}
+
+export function startOpenSourceTelemetryUsageSummaryInterval(
+  db: TenantScopeAwareDatabase,
+  config: DeepReadonly<DiscoConfig>,
+  options: OpenSourceTelemetryUsageSummaryIntervalOptions
+): NodeJS.Timeout {
+  // Check hourly, but emit at most once per UTC day. The DB query only runs
+  // when the previous day has not yet been reported, keeping steady-state
+  // overhead to one config read per hour.
+  const run = (): void => {
+    runWithTenantContext(options.tenantId, () =>
+      flushOpenSourceTelemetryUsageSummary(db, config)
+    ).catch((error) => {
+      console.warn(
+        '[telemetry] failed to emit usage summary:',
+        error instanceof Error ? error.message : String(error)
+      );
+    });
+  };
+
+  const startupTimer = setTimeout(run, 30_000);
+  startupTimer.unref?.();
+
+  const timer = setInterval(run, ONE_HOUR_MS);
+  timer.unref?.();
+  return timer;
+}

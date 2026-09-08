@@ -1,0 +1,20 @@
+# package.json's "files" allowlist is authoritative: bin/, dist/, LICENSE,
+# and README.md. These rules further exclude development-only files.
+
+# Build script (not needed in published package)
+build.sh
+
+# Development files
+*.md
+!README.md
+
+# npm includes only the internal packages named in bundleDependencies.
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo

@@ -1,0 +1,445 @@
+/**
+ * MCP token module tests.
+ *
+ * Exercises the issue → verify cycle against an in-memory SQLite database.
+ * A minimal repo/branch/session fixture is seeded so the session-existence
+ * check in validate has something to read.
+ *
+ * Coverage:
+ *   - minted tokens carry `jti` + `exp` (+ `iat`, `iss`, `aud`) claims
+ *   - expired token → rejected
+ *   - deleted session → token rejected (even before `exp`)
+ *   - bogus issuer → rejected
+ *   - pre-rollout tokens (no jti/exp) → rejected
+ */
+
+import { resolveMultiTenancyConfig } from '@disco/core/config';
+import {
+  branches,
+  type Database,
+  deleteFrom,
+  eq,
+  generateId,
+  insert,
+  RepoRepository,
+  runWithTenantContext,
+  sessions,
+  shortId,
+} from '@disco/core/db';
+import type { SessionID, UserID } from '@disco/core/types';
+import jwt from 'jsonwebtoken';
+import { afterEach, describe, expect, vi } from 'vitest';
+import { dbTest } from '../../../../packages/core/src/db/test-helpers';
+import {
+  generateSessionToken,
+  initMcpTokens,
+  MCP_TOKEN_AUDIENCE,
+  MCP_TOKEN_ISSUER,
+  shutdownMcpTokens,
+  validateSessionToken,
+} from './tokens.js';
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+const JWT_SECRET = 'test-jwt-secret-do-not-use-in-production';
+
+/**
+ * Build a minimal `app` stub that exposes `settings.authentication.secret` —
+ * the only thing the token module reads off the Feathers application.
+ */
+function makeApp(): any {
+  return { settings: { authentication: { secret: JWT_SECRET } } };
+}
+
+function initTestMcpTokens(
+  db: Database,
+  options: {
+    expirationMs?: number;
+    now?: () => number;
+    multiTenancy?: Parameters<typeof resolveMultiTenancyConfig>[0];
+  } = {}
+): void {
+  const multiTenancyConfig = options.multiTenancy ?? {
+    multi_tenancy: { mode: 'required_from_auth', auth_claim: 'tenant_id' },
+  };
+  initMcpTokens({
+    db,
+    multiTenancy: resolveMultiTenancyConfig(multiTenancyConfig),
+    ...(options.expirationMs === undefined ? {} : { expirationMs: options.expirationMs }),
+    ...(options.now === undefined ? {} : { now: options.now }),
+  });
+}
+
+function mintSessionToken(
+  app: ReturnType<typeof makeApp>,
+  sessionId: SessionID,
+  userId: UserID,
+  tenantId = 'tenant-a'
+): Promise<string> {
+  return runWithTenantContext(tenantId, () => generateSessionToken(app, sessionId, userId));
+}
+
+async function seedSession(
+  db: Database,
+  opts: { sessionId: SessionID } = { sessionId: generateId() as SessionID }
+): Promise<SessionID> {
+  const repoRepo = new RepoRepository(db);
+  const repo = await repoRepo.create({
+    repo_id: generateId(),
+    slug: `slug-${shortId(opts.sessionId)}`,
+    name: 'Test Repo',
+    repo_type: 'remote' as const,
+    remote_url: 'https://github.com/test/test.git',
+    local_path: '/tmp/test',
+    default_branch: 'main',
+  });
+
+  const branchId = generateId();
+  await insert(db, branches)
+    .values({
+      branch_id: branchId,
+      repo_id: repo.repo_id,
+      created_at: new Date(),
+      created_by: 'test-user',
+      name: 'main',
+      ref: 'main',
+      branch_unique_id: 1,
+      data: { path: '/tmp/test/wt', git_state: { ref_at_start: 'main' } },
+    })
+    .run();
+
+  await insert(db, sessions)
+    .values({
+      session_id: opts.sessionId,
+      created_at: new Date(),
+      status: 'idle',
+      agentic_tool: 'claude-code',
+      branch_id: branchId,
+      created_by: 'test-user',
+      data: { genealogy: { children: [] }, contextFiles: [], tasks: [], git_state: {} },
+    })
+    .run();
+
+  return opts.sessionId;
+}
+
+afterEach(() => {
+  shutdownMcpTokens();
+  vi.useRealTimers();
+});
+
+// ---------------------------------------------------------------------------
+// Issuance
+// ---------------------------------------------------------------------------
+
+describe('generateSessionToken', () => {
+  dbTest('issues a token with jti, exp, iat, aud, iss claims', async ({ db }) => {
+    initTestMcpTokens(db, { expirationMs: 60_000 });
+    const sessionId = await seedSession(db, { sessionId: generateId() as SessionID });
+    const app = makeApp();
+
+    const token = await mintSessionToken(app, sessionId, 'user-1' as UserID);
+
+    const decoded = jwt.verify(token, JWT_SECRET, {
+      audience: MCP_TOKEN_AUDIENCE,
+    }) as Record<string, unknown>;
+
+    expect(decoded.sub).toBe(sessionId);
+    expect(decoded.uid).toBe('user-1');
+    expect(decoded.tid).toBe('tenant-a');
+    expect(decoded.aud).toBe(MCP_TOKEN_AUDIENCE);
+    expect(decoded.iss).toBe(MCP_TOKEN_ISSUER);
+    expect(typeof decoded.jti).toBe('string');
+    expect((decoded.jti as string).length).toBeGreaterThan(0);
+    expect(typeof decoded.iat).toBe('number');
+    expect(typeof decoded.exp).toBe('number');
+    expect((decoded.exp as number) - (decoded.iat as number)).toBe(60);
+  });
+
+  dbTest('reuses cached tokens until they approach expiry', async ({ db }) => {
+    const baseMs = Date.now();
+    vi.useFakeTimers({ now: baseMs, shouldAdvanceTime: false });
+    try {
+      initTestMcpTokens(db, { expirationMs: 60_000 });
+      const sessionId = await seedSession(db, { sessionId: generateId() as SessionID });
+
+      const t1 = await mintSessionToken(makeApp(), sessionId, 'u' as UserID);
+      const t2 = await mintSessionToken(makeApp(), sessionId, 'u' as UserID);
+      expect(t2).toBe(t1);
+
+      vi.setSystemTime(new Date(baseMs + 31_000));
+      const t3 = await mintSessionToken(makeApp(), sessionId, 'u' as UserID);
+      const d1 = jwt.decode(t1) as { jti?: string };
+      const d3 = jwt.decode(t3) as { jti?: string };
+
+      expect(d1.jti).toBeDefined();
+      expect(d3.jti).toBeDefined();
+      expect(d3.jti).not.toBe(d1.jti);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  dbTest('throws when the session does not exist', async ({ db }) => {
+    initTestMcpTokens(db);
+    const missingSessionId = generateId() as SessionID;
+    await expect(mintSessionToken(makeApp(), missingSessionId, 'u1' as UserID)).rejects.toThrow(
+      /not found/
+    );
+  });
+
+  dbTest(
+    'uses the default static tenant for request-less/background issuance with no config block',
+    async ({ db }) => {
+      initTestMcpTokens(db, { multiTenancy: {} });
+      const sessionId = await seedSession(db);
+
+      const token = await generateSessionToken(makeApp(), sessionId, 'u1' as UserID);
+
+      expect((jwt.decode(token) as { tid?: string }).tid).toBe('default');
+    }
+  );
+
+  dbTest('uses a custom configured static tenant without ambient scope', async ({ db }) => {
+    initTestMcpTokens(db, {
+      multiTenancy: {
+        multi_tenancy: { mode: 'static', static_tenant_id: 'tenant-static' },
+      },
+    });
+    const sessionId = await seedSession(db);
+
+    const token = await generateSessionToken(makeApp(), sessionId, 'u1' as UserID);
+
+    expect((jwt.decode(token) as { tid?: string }).tid).toBe('tenant-static');
+  });
+
+  dbTest('keeps an agreeing ambient static tenant authoritative', async ({ db }) => {
+    initTestMcpTokens(db, {
+      multiTenancy: {
+        multi_tenancy: { mode: 'static', static_tenant_id: 'tenant-static' },
+      },
+    });
+    const sessionId = await seedSession(db);
+
+    const token = await mintSessionToken(makeApp(), sessionId, 'u1' as UserID, 'tenant-static');
+
+    expect((jwt.decode(token) as { tid?: string }).tid).toBe('tenant-static');
+  });
+
+  dbTest('rejects an ambient tenant that conflicts with static configuration', async ({ db }) => {
+    initTestMcpTokens(db, {
+      multiTenancy: {
+        multi_tenancy: { mode: 'static', static_tenant_id: 'tenant-static' },
+      },
+    });
+    const sessionId = await seedSession(db);
+
+    await expect(
+      mintSessionToken(makeApp(), sessionId, 'u1' as UserID, 'tenant-other')
+    ).rejects.toThrow(/Conflicting tenant identities/);
+  });
+
+  dbTest(
+    'rejects malformed ambient tenant identity instead of using static fallback',
+    async ({ db }) => {
+      initTestMcpTokens(db, { multiTenancy: {} });
+      const sessionId = await seedSession(db);
+
+      await expect(
+        mintSessionToken(makeApp(), sessionId, 'u1' as UserID, '  default  ')
+      ).rejects.toThrow(/Invalid ambient tenant identity/);
+    }
+  );
+
+  dbTest('fails closed in required_from_auth mode without ambient scope', async ({ db }) => {
+    initTestMcpTokens(db);
+    const sessionId = await seedSession(db);
+
+    await expect(generateSessionToken(makeApp(), sessionId, 'u1' as UserID)).rejects.toThrow(
+      /missing active tenant context/
+    );
+  });
+
+  dbTest('issues in required_from_auth mode with an ambient tenant scope', async ({ db }) => {
+    initTestMcpTokens(db);
+    const sessionId = await seedSession(db);
+
+    const token = await mintSessionToken(makeApp(), sessionId, 'u1' as UserID, 'tenant-required');
+
+    expect((jwt.decode(token) as { tid?: string }).tid).toBe('tenant-required');
+  });
+
+  dbTest('keeps cached tokens distinct across tenant bindings', async ({ db }) => {
+    initTestMcpTokens(db);
+    const sessionId = await seedSession(db);
+
+    const tenantA = await mintSessionToken(makeApp(), sessionId, 'u1' as UserID, 'tenant-a');
+    const tenantB = await mintSessionToken(makeApp(), sessionId, 'u1' as UserID, 'tenant-b');
+
+    expect(tenantA).not.toBe(tenantB);
+    expect((jwt.decode(tenantA) as { tid?: string }).tid).toBe('tenant-a');
+    expect((jwt.decode(tenantB) as { tid?: string }).tid).toBe('tenant-b');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Validation — happy path, expiry, session-deletion, issuer check
+// ---------------------------------------------------------------------------
+
+describe('validateSessionToken', () => {
+  dbTest('accepts a freshly minted token', async ({ db }) => {
+    initTestMcpTokens(db);
+    const sessionId = await seedSession(db, { sessionId: generateId() as SessionID });
+    const token = await mintSessionToken(makeApp(), sessionId, 'u1' as UserID);
+
+    const ctx = await validateSessionToken(makeApp(), token);
+    expect(ctx).not.toBeNull();
+    expect(ctx?.sessionId).toBe(sessionId);
+    expect(ctx?.userId).toBe('u1');
+    expect(ctx?.tenantId).toBe('tenant-a');
+    expect(typeof ctx?.jti).toBe('string');
+  });
+
+  dbTest('rejects a token whose exp has passed', async ({ db }) => {
+    // Fake timers let us fast-forward past the 60s expiry without waiting —
+    // `jsonwebtoken.verify` reads `Date.now()` for exp checks, so we must
+    // stub the global clock (injecting `now` into the module alone isn't
+    // enough because verify uses the system clock directly).
+    const baseMs = Date.now();
+    vi.useFakeTimers({ now: baseMs, shouldAdvanceTime: false });
+    try {
+      initTestMcpTokens(db, { expirationMs: 60_000 });
+      const sessionId = await seedSession(db, { sessionId: generateId() as SessionID });
+      const token = await mintSessionToken(makeApp(), sessionId, 'u1' as UserID);
+
+      // Still valid right after issuance.
+      expect(await validateSessionToken(makeApp(), token)).not.toBeNull();
+
+      // Step past the 60s expiry plus some slack.
+      vi.setSystemTime(new Date(baseMs + 120_000));
+      const result = await validateSessionToken(makeApp(), token);
+      expect(result).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  dbTest('rejects tokens for sessions that have been deleted', async ({ db }) => {
+    initTestMcpTokens(db);
+    const sessionId = await seedSession(db, { sessionId: generateId() as SessionID });
+    const token = await mintSessionToken(makeApp(), sessionId, 'u1' as UserID);
+
+    // Simulate the session being deleted out from under us.
+    await deleteFrom(db, sessions).where(eq(sessions.session_id, sessionId)).run();
+
+    const result = await validateSessionToken(makeApp(), token);
+    expect(result).toBeNull();
+  });
+
+  dbTest('rejects a post-rollout token with the wrong issuer', async ({ db }) => {
+    initTestMcpTokens(db);
+    const sessionId = await seedSession(db, { sessionId: generateId() as SessionID });
+
+    // Hand-mint a token that has every other claim right but a bogus `iss`.
+    const nowSec = Math.floor(Date.now() / 1000);
+    const forged = jwt.sign(
+      {
+        sub: sessionId,
+        uid: 'u1',
+        tid: 'tenant-a',
+        aud: MCP_TOKEN_AUDIENCE,
+        iss: 'not-disco',
+        iat: nowSec,
+        exp: nowSec + 60,
+        jti: generateId(),
+      },
+      JWT_SECRET,
+      { algorithm: 'HS256' }
+    );
+
+    expect(await validateSessionToken(makeApp(), forged)).toBeNull();
+  });
+
+  dbTest('rejects a pre-rollout token missing jti/exp', async ({ db }) => {
+    initTestMcpTokens(db);
+    const sessionId = await seedSession(db, { sessionId: generateId() as SessionID });
+
+    // Pre-rollout tokens were minted without `jti` or `exp` (and no `iss`).
+    const legacy = jwt.sign(
+      {
+        sub: sessionId,
+        uid: 'u1',
+        aud: MCP_TOKEN_AUDIENCE,
+      },
+      JWT_SECRET,
+      { algorithm: 'HS256', noTimestamp: true }
+    );
+
+    expect(await validateSessionToken(makeApp(), legacy)).toBeNull();
+  });
+
+  dbTest('rejects a signature-valid token that has a jti but is missing exp', async ({ db }) => {
+    // Belt-and-suspenders guard: `jsonwebtoken.verify` only enforces `exp`
+    // when the claim is present. A forged-but-signature-valid token without
+    // `exp` would otherwise pass verify and be replayable forever. Confirm
+    // the explicit `payload.exp === undefined` check rejects it.
+    initTestMcpTokens(db);
+    const sessionId = await seedSession(db, { sessionId: generateId() as SessionID });
+
+    const forged = jwt.sign(
+      {
+        sub: sessionId,
+        uid: 'u1',
+        tid: 'tenant-a',
+        aud: MCP_TOKEN_AUDIENCE,
+        iss: MCP_TOKEN_ISSUER,
+        jti: generateId(),
+        // no `exp` — deliberate
+      },
+      JWT_SECRET,
+      { algorithm: 'HS256', noTimestamp: true }
+    );
+
+    expect(await validateSessionToken(makeApp(), forged)).toBeNull();
+  });
+
+  dbTest('rejects a signature-valid token that has an exp but is missing jti', async ({ db }) => {
+    initTestMcpTokens(db);
+    const sessionId = await seedSession(db, { sessionId: generateId() as SessionID });
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const forged = jwt.sign(
+      {
+        sub: sessionId,
+        uid: 'u1',
+        tid: 'tenant-a',
+        aud: MCP_TOKEN_AUDIENCE,
+        iss: MCP_TOKEN_ISSUER,
+        iat: nowSec,
+        exp: nowSec + 60,
+        // no `jti` — deliberate
+      },
+      JWT_SECRET,
+      { algorithm: 'HS256' }
+    );
+
+    expect(await validateSessionToken(makeApp(), forged)).toBeNull();
+  });
+
+  dbTest(
+    'rejects replay against a different expected tenant before session lookup',
+    async ({ db }) => {
+      initTestMcpTokens(db);
+      const sessionId = await seedSession(db);
+      const token = await mintSessionToken(makeApp(), sessionId, 'u1' as UserID, 'tenant-a');
+
+      expect(await validateSessionToken(makeApp(), token, 'tenant-b')).toBeNull();
+      expect(await validateSessionToken(makeApp(), token, 'tenant-a')).toMatchObject({
+        sessionId,
+        tenantId: 'tenant-a',
+      });
+    }
+  );
+});

@@ -1,0 +1,206 @@
+/**
+ * Thin OpenCode SDK adapter.
+ *
+ * Disco orchestration stays here; the OpenCode package owns the complete managed turn.
+ * Task settlement remains OpenCode-scoped until the generic runner migration lands.
+ */
+
+import {
+  OPENCODE_MODEL_CONFIG_PAIR_ERROR,
+  parseOpenCodeExecutorContext,
+} from '@disco/agentic-tool-opencode';
+import {
+  isOpenCodeCleanupUnverifiedError,
+  OpenCodeTool,
+} from '@disco/agentic-tool-opencode/runtime';
+import { generateId, shortId } from '@disco/core';
+import { getMcpServersForSession } from '@disco/core/mcp';
+import type {
+  ExecutorPulseKind,
+  MessageID,
+  MessageSource,
+  PermissionMode,
+  SessionID,
+  TaskID,
+} from '@disco/core/types';
+import { MessageRole } from '@disco/core/types';
+import { getDaemonUrl } from '../../config.js';
+import { createFeathersBackedRepositories } from '../../db/feathers-repositories.js';
+import type { ResolvedConfigSlice } from '../../payload-types.js';
+import { globalPermissionManager } from '../../permissions/permission-manager.js';
+import { PermissionService } from '../../permissions/permission-service.js';
+import { resolveContextUserId } from '../../sdk-handlers/base/context-user.js';
+import { enrichContentBlocks } from '../../sdk-handlers/base/diff-enrichment.js';
+import { EMPTY_MCP_TOOL_PERMISSION_INDEX } from '../../sdk-handlers/base/mcp-tool-permissions.js';
+import { createCanUseToolCallback } from '../../sdk-handlers/base/permission-hooks.js';
+import {
+  collectWithheldMcpServers,
+  reportWithheldMcpServers,
+} from '../../sdk-handlers/base/withheld-mcp-report.js';
+import { createUserMessage } from '../../sdk-handlers/claude/message-builder.js';
+import type { DiscoClient } from '../../services/feathers-client.js';
+import { createStreamingCallbacks, settleTaskFailure } from './base-executor.js';
+
+export async function executeOpenCodeTask(params: {
+  client: DiscoClient;
+  sessionId: SessionID;
+  taskId: TaskID;
+  prompt: string;
+  permissionMode?: PermissionMode;
+  abortController: AbortController;
+  messageSource?: MessageSource;
+  agenticToolContext?: Record<string, unknown>;
+  resolvedConfig?: ResolvedConfigSlice;
+  onPulse?: (kind: ExecutorPulseKind, detail?: string) => void;
+}): Promise<void> {
+  const { client, sessionId, taskId, prompt } = params;
+  console.log(`[opencode] Executing task ${shortId(taskId)}...`);
+
+  const permissionService = new PermissionService(async (event, data) => {
+    if (event === 'permission:request') params.onPulse?.('waiting', 'permission.request');
+    if (event === 'permission:timeout') params.onPulse?.('sdk_started', 'permission.timeout');
+    client.service('sessions').emit(event, data);
+  }, params.resolvedConfig?.execution?.permission_timeout_ms ?? 600_000);
+  globalPermissionManager.register(sessionId, permissionService);
+
+  try {
+    const session = await client.service('sessions').get(sessionId);
+    if (!session.model_config?.provider?.trim() || !session.model_config.model?.trim()) {
+      throw new Error(OPENCODE_MODEL_CONFIG_PAIR_ERROR);
+    }
+    const { dataHome } = parseOpenCodeExecutorContext(params.agenticToolContext);
+
+    const repos = createFeathersBackedRepositories(client);
+    const contextUserId = await resolveContextUserId({
+      session,
+      taskId,
+      tasksService: repos.tasksService,
+    });
+    const workingDirectory = session.working_directory?.trim();
+    if (!workingDirectory) throw new Error('OpenCode requires a Session working directory');
+
+    const [messages, sessionNextIndex] = await Promise.all([
+      repos.messages.findInitialUserMessagesByTaskId(taskId),
+      repos.messages.getNextIndexBySessionId(sessionId),
+    ]);
+    await createUserMessage(sessionId, prompt, taskId, sessionNextIndex, repos.messagesService, {
+      messageSource: params.messageSource,
+      existingMessages: messages,
+    });
+
+    const assistantMessageId = generateId() as MessageID;
+    const permissionLocks = new Map<SessionID, Promise<void>>();
+    const tool = new OpenCodeTool({
+      resolveMcpServers: async (targetSessionId) => {
+        const targetSession = await repos.sessionsService.get(targetSessionId);
+        const reporter = collectWithheldMcpServers();
+        const servers = await getMcpServersForSession(
+          targetSessionId,
+          {
+            sessionMCPRepo: repos.sessionMCP,
+            mcpServerRepo: repos.mcpServers,
+            mcpOAuthAuthHeadersRepo: repos.mcpOAuthAuthHeaders,
+            forUserId: contextUserId,
+            sessionOwnerId: targetSession.created_by,
+            onServerWithheld: reporter.onServerWithheld,
+          },
+          // OpenCode's invocation config carries no per-tool filter, so a server
+          // with gated tools cannot be honoured and is withheld whole. This is
+          // the only enforcement point on this path.
+          { toolFiltering: 'none' }
+        );
+        await reportWithheldMcpServers(repos.messages, {
+          sessionId: targetSessionId,
+          taskId,
+          withheld: reporter.withheld,
+        });
+        return servers;
+      },
+      getDaemonUrl,
+      createPermissionCallback: (targetSessionId, targetTaskId) =>
+        createCanUseToolCallback(targetSessionId, targetTaskId, {
+          permissionService,
+          tasksService: repos.tasksService,
+          messagesRepo: repos.messages,
+          messagesService: repos.messagesService,
+          sessionsService: repos.sessionsService,
+          permissionLocks,
+          mcpServerRepo: repos.mcpServers,
+          sessionMCPRepo: repos.sessionMCP,
+          // Gated servers never reach this handler, so nothing here can be
+          // configured; the admission gate above already withheld them.
+          mcpToolPermissions: EMPTY_MCP_TOOL_PERMISSION_INDEX,
+        }),
+      cancelPendingPermissions: (targetSessionId) =>
+        permissionService.cancelPendingRequests(targetSessionId),
+      enrichContentBlocks: (blocks) =>
+        enrichContentBlocks(blocks, {
+          workingDirectory,
+          snapshotScope: `${sessionId}:${taskId}`,
+        }),
+    });
+    const result = await tool.runTurn(
+      {
+        discoSessionId: sessionId,
+        taskId,
+        prompt,
+        discoAssistantMessageId: assistantMessageId,
+        existingOpenCodeSessionId: session.sdk_session_id,
+        title: session.title || `Task ${shortId(taskId)}`,
+        directory: workingDirectory,
+        provider: session.model_config.provider,
+        model: session.model_config.model,
+        effort: session.model_config.effort,
+        mcpToken: session.mcp_token,
+        permissionMode: params.permissionMode,
+        signal: params.abortController.signal,
+        dataHome,
+        persistOpenCodeSessionId: async (openCodeSessionId) => {
+          await client.service('sessions').patch(sessionId, { sdk_session_id: openCodeSessionId });
+        },
+      },
+      createStreamingCallbacks(client, 'opencode', sessionId, params.onPulse)
+    );
+
+    if (params.abortController.signal.aborted) return;
+
+    const finalIndex = await repos.messages.getNextIndexBySessionId(sessionId);
+    await repos.messagesService.create({
+      message_id: assistantMessageId,
+      session_id: sessionId,
+      task_id: taskId,
+      type: 'assistant' as const,
+      role: MessageRole.ASSISTANT,
+      index: finalIndex,
+      timestamp: new Date().toISOString(),
+      content_preview: result.finalMessage.content.substring(0, 200),
+      content: result.finalMessage.contentBlocks,
+      tool_uses: result.finalMessage.toolUses.length > 0 ? result.finalMessage.toolUses : undefined,
+      metadata: result.finalMessage.metadata,
+    });
+    await client.service('tasks').patch(taskId, {
+      status: 'completed',
+      completed_at: new Date().toISOString(),
+      model: `${session.model_config.provider}/${session.model_config.model}`,
+    });
+  } catch (error) {
+    const failure = error instanceof Error ? error : new Error(String(error));
+    console.error('[opencode] execution failed category=task_execution');
+
+    if (isOpenCodeCleanupUnverifiedError(failure)) {
+      // Keep the task active. Executor exit hands containment to the daemon;
+      // making it terminal here would release the session before absence is proven.
+      return;
+    }
+    if (!params.abortController.signal.aborted) {
+      await settleTaskFailure(client, sessionId, taskId, failure, {
+        status: 'failed',
+        completed_at: new Date().toISOString(),
+        error_message: failure.message,
+      });
+    }
+    throw failure;
+  } finally {
+    globalPermissionManager.unregister(sessionId);
+  }
+}

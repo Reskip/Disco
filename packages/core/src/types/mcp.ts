@@ -1,0 +1,492 @@
+// MCP (Model Context Protocol) server types
+//
+// MCP servers extend agent capabilities by connecting to external tools,
+// databases, and APIs. Disco federates MCP configurations to enable users
+// to leverage existing MCP investments while adding orchestration value.
+//
+// See: apps/disco-docs/pages/guide/internal-mcp.mdx for the user-facing reference
+
+import type { SessionID, UserID, UUID } from './id';
+
+/**
+ * MCP Server ID (branded UUID)
+ */
+export type MCPServerID = UUID & { readonly __brand: 'MCPServerID' };
+
+/**
+ * Durable identity for one browser-based MCP OAuth authorization attempt.
+ *
+ * This identifier is safe to expose to the initiating user for status reads.
+ * It is not the OAuth `state` capability: PostgreSQL stores only a SHA-256
+ * fingerprint of that high-entropy, one-time value.
+ */
+export type MCPOAuthAttemptID = UUID & { readonly __brand: 'MCPOAuthAttemptID' };
+
+/** Durable lifecycle of a browser-based MCP OAuth authorization attempt. */
+export type MCPOAuthPendingFlowStatus =
+  | 'pending'
+  | 'exchanging'
+  | 'succeeded'
+  | 'failed'
+  | 'ambiguous'
+  | 'expired';
+
+/** Authenticated durable-attempt read DTO; `not_found` avoids leaking rows. */
+export type MCPOAuthAttemptStatus = MCPOAuthPendingFlowStatus | 'not_found';
+
+export interface MCPOAuthAttemptResult {
+  status: MCPOAuthAttemptStatus;
+  mcp_server_id?: MCPServerID;
+  oauth_mode?: MCPOAuthMode;
+  failure_code?: string;
+}
+
+export interface MCPOAuthStatusResult {
+  authenticated_server_ids: MCPServerID[];
+}
+
+export interface MCPOAuthRefreshResult {
+  success: boolean;
+  expires_at?: number;
+  error?: string;
+}
+
+/** Credential subject selected for the resulting MCP OAuth grant. */
+export type MCPOAuthMode = 'per_user' | 'shared';
+export type MCPOAuthDCRMode = 'disabled' | 'advertised' | 'fallback';
+
+/**
+ * Safe diagnostics for a failed OAuth Dynamic Client Registration attempt.
+ *
+ * This closed shape classifies recovery without carrying provider response
+ * text, credentials, or OAuth protocol secrets across the process boundary.
+ */
+export interface MCPOAuthDCRDiagnostic {
+  stage: 'dcr_endpoint_discovery' | 'dcr_registration';
+  http_status?: number;
+  registration_endpoint_source?: 'metadata' | 'legacy_fallback';
+}
+
+export interface MCPOAuthStartFailure {
+  success: false;
+  error: string;
+  diagnostic?: MCPOAuthDCRDiagnostic;
+  redirect_uri?: string;
+}
+
+export const MCP_OAUTH_GRANT_BINDING_VERSIONS = [1, 2] as const;
+export type MCPOAuthGrantBindingVersion = (typeof MCP_OAUTH_GRANT_BINDING_VERSIONS)[number];
+
+export function isMCPOAuthGrantBindingVersion(
+  value: unknown
+): value is MCPOAuthGrantBindingVersion {
+  return (
+    typeof value === 'number' &&
+    MCP_OAUTH_GRANT_BINDING_VERSIONS.includes(value as MCPOAuthGrantBindingVersion)
+  );
+}
+
+/**
+ * Secret-bearing material required to exchange an authorization code.
+ * PostgreSQL stores this structure only inside an authenticated encrypted
+ * envelope derived from DISCO_MASTER_SECRET. Binding fields are duplicated in
+ * the row and verified after decryption so ciphertext cannot be moved between
+ * attempts, users, tenants, or MCP servers.
+ */
+export interface MCPOAuthPendingFlowSealedMaterial {
+  version: 2;
+  attemptId: MCPOAuthAttemptID;
+  tenantId: string;
+  userId: UserID;
+  mcpServerId: MCPServerID;
+  oauthMode: MCPOAuthMode;
+  grantGeneration: number;
+  configFingerprintVersion: MCPOAuthGrantBindingVersion;
+  configFingerprint: string;
+  resourceUri: string;
+  issuer: string;
+  authorizationEndpoint: string;
+  metadataUrl: string;
+  tokenEndpoint: string;
+  redirectUri: string;
+  pkceVerifier: string;
+  clientId: string;
+  clientSecret?: string;
+  compatibilityMode: 'strict' | 'legacy';
+  allowLocalhostHttp: boolean;
+}
+
+/**
+ * What a non-admin member may do with MCP server configuration, tenant-wide.
+ *
+ * "Configuration" is the caller-supplied surface — the fields somebody submits
+ * to create, update, or delete a server. Capability refresh is not on it:
+ * `mcp-servers/discover` opens the server's own transport and writes back the
+ * `tools` / `resources` / `prompts` that endpoint reported, which is nobody's
+ * submission. It answers to its own owner-or-admin rule
+ * (`denyDiscoverOfAnotherUsersServer`) instead, so that a member who may no
+ * longer configure servers can still refresh one that is already running in
+ * their sessions — revoking refresh would leave the stale tool list the agent
+ * actually sees, not stop the server being used.
+ *
+ * - `use_existing_only` — members attach servers an admin already configured;
+ *   they create nothing. The default, and the only behaviour that existed
+ *   before private servers.
+ * - `allow_private_only` — members create servers owned by themselves. A
+ *   private server is usable only in its owner's sessions.
+ * - `allow_crud` — members additionally create, update, and delete shared
+ *   (unowned) servers, the way an admin does. Another member's private server
+ *   stays out of reach under every value.
+ *
+ * Under both permissive values members are restricted to remote transports:
+ * a `stdio` server is a command line the executor runs on its host, which is a
+ * different grant from "may point Disco at an HTTP endpoint".
+ */
+export const MCP_MEMBER_POLICIES = [
+  'use_existing_only',
+  'allow_private_only',
+  'allow_crud',
+] as const;
+
+export type MCPMemberPolicy = (typeof MCP_MEMBER_POLICIES)[number];
+
+export const DEFAULT_MCP_MEMBER_POLICY: MCPMemberPolicy = 'use_existing_only';
+
+/**
+ * The payload of the `mcp-member-policy` endpoint, read and written.
+ *
+ * A wrapper rather than the bare value so the setting can gain a field — who
+ * last changed it, whether a per-user override applies — without every caller
+ * changing shape.
+ */
+export interface MCPMemberPolicySetting {
+  policy: MCPMemberPolicy;
+  /**
+   * Whether this caller may configure servers at all — role floor and policy
+   * together, answered by the daemon so a client greys out its control instead
+   * of rebuilding the rule. Advisory: the write path is what authorizes.
+   */
+  can_configure: boolean;
+}
+
+/**
+ * MCP transport types
+ */
+export const MCP_TRANSPORTS = ['stdio', 'http', 'sse'] as const;
+
+export type MCPTransport = (typeof MCP_TRANSPORTS)[number];
+
+/**
+ * MCP server scope levels. Orthogonal to ownership: `scope` says how a server
+ * reaches a session, `owner_user_id` says whose sessions it may reach.
+ * - global: in every session's effective set without being attached
+ * - session: only in the sessions it is attached to, via the junction table
+ *
+ * `mcp_member_policy` is the one place the two are not free of each other: see
+ * `mayMemberUseMCPScope` in `@disco/core/mcp/member-policy`.
+ */
+export const MCP_SCOPES = ['global', 'session'] as const;
+
+export type MCPScope = (typeof MCP_SCOPES)[number];
+
+/**
+ * Where a server's configuration came from.
+ *
+ * - `user`: somebody typed it, through the UI or `POST /mcp-servers`
+ * - `imported`: read out of a file on disk; `import_path` records which
+ * - `disco`: Disco's own built-in server
+ * - `catalog`: installed from the marketplace; `catalog_entry_name` records
+ *   which entry, the way `import_path` records which file
+ *
+ * This is provenance, not authorization — nothing reads it to decide access.
+ */
+export type MCPSource = 'user' | 'imported' | 'disco' | 'catalog';
+
+/**
+ * MCP server authentication configuration
+ */
+export interface MCPAuth {
+  type: 'none' | 'bearer' | 'jwt' | 'oauth';
+  // Bearer token
+  token?: string;
+  // JWT config
+  api_url?: string;
+  api_token?: string;
+  api_secret?: string;
+  // OAuth 2.0 config
+  oauth_authorization_url?: string; // Override auto-discovered authorization endpoint
+  oauth_token_url?: string;
+  oauth_client_id?: string;
+  oauth_client_secret?: string;
+  oauth_scope?: string;
+  oauth_grant_type?: string;
+  /** Strict current MCP Authorization behavior is the default. */
+  oauth_compatibility_mode?: 'strict' | 'legacy';
+  /**
+   * Dynamic Client Registration policy. Missing values use `advertised` for
+   * compatibility with servers that publish an RFC 7591 endpoint. The
+   * `fallback` mode additionally permits the legacy guessed `/register` URL.
+   */
+  oauth_dcr_mode?: MCPOAuthDCRMode;
+  // OAuth 2.1 runtime tokens (obtained via browser flow)
+  oauth_access_token?: string;
+  oauth_token_expires_at?: number; // Unix timestamp in milliseconds
+  oauth_refresh_token?: string;
+  // OAuth mode: 'per_user' stores tokens per-user, 'shared' uses single token for all users
+  oauth_mode?: 'per_user' | 'shared';
+  // Common
+  insecure?: boolean;
+}
+
+/**
+ * JSON Schema type for tool input schemas
+ */
+export type JSONSchema = Record<string, unknown>;
+
+/**
+ * MCP Tool definition
+ * Represents a callable function exposed by an MCP server
+ */
+export interface MCPTool {
+  name: string; // e.g., "mcp__filesystem__list_files"
+  description: string;
+  input_schema?: JSONSchema; // Optional - not all MCP servers provide schemas
+}
+
+/**
+ * MCP Resource definition
+ * Represents data that can be read from an MCP server
+ */
+export interface MCPResource {
+  uri: string; // e.g., "file:///path/to/file"
+  name: string;
+  mimeType?: string;
+}
+
+/**
+ * MCP Prompt definition
+ * Represents a pre-built prompt template exposed as a slash command
+ */
+export interface MCPPrompt {
+  name: string; // Becomes slash command
+  description: string;
+  arguments?: PromptArgument[];
+}
+
+export interface PromptArgument {
+  name: string;
+  description: string;
+  required?: boolean;
+}
+
+/**
+ * MCP Server Capabilities
+ * Discovered from server via MCP protocol
+ */
+export interface MCPCapabilities {
+  tools?: MCPTool[];
+  resources?: MCPResource[];
+  prompts?: MCPPrompt[];
+}
+
+/**
+ * Tool permission setting
+ * Controls whether a tool requires permission approval
+ */
+export type ToolPermission = 'ask' | 'allow' | 'deny';
+
+/**
+ * MCP Server entity
+ * Core configuration for an MCP server
+ */
+export interface MCPServer {
+  // Identity
+  mcp_server_id: MCPServerID;
+  name: string; // e.g., "filesystem", "sentry"
+  display_name?: string; // e.g., "Filesystem Access"
+  description?: string;
+
+  // Transport configuration
+  transport: MCPTransport;
+
+  // stdio config
+  command?: string; // e.g., "npx"
+  args?: string[]; // e.g., ["@modelcontextprotocol/server-filesystem"]
+
+  // HTTP/SSE config
+  url?: string; // e.g., "https://mcp.sentry.dev/mcp"
+  /**
+   * Custom HTTP headers for remote HTTP/SSE transports. Values may be
+   * secret-bearing and can use templates such as {{ user.env.DATADOG_API_KEY }}.
+   * Not applied to stdio transports. Authorization is reserved for auth.*.
+   */
+  headers?: Record<string, string>;
+
+  // Environment variables
+  env?: Record<string, string>; // e.g., { "ALLOWED_PATHS": "/Users/me/projects" }
+
+  // Authentication (for HTTP/SSE transports)
+  auth?: MCPAuth;
+
+  // Scope
+  scope: MCPScope;
+  /**
+   * Owner of a private server, or undefined for a shared one.
+   *
+   * A private server is reachable only from sessions its owner created — see
+   * `isMCPServerUsableInSession`. Immutable after creation: transferring one
+   * would move a configured credential to another identity.
+   */
+  owner_user_id?: UserID;
+
+  // Metadata
+  source: MCPSource;
+  import_path?: string; // e.g., "/Users/me/project/.mcp.json"
+  /**
+   * The catalog entry this server was installed from, if any.
+   *
+   * Stamped as the entry's reverse-DNS catalog name, which is what the entry is
+   * unique on. Every other field of an entry can be rewritten without the
+   * install ceasing to be an install of it, so the name is the only thing worth
+   * recording here — and renaming an entry is what orphans one.
+   */
+  catalog_entry_name?: string;
+  enabled: boolean;
+
+  // Capabilities (discovered from server)
+  tools?: MCPTool[];
+  resources?: MCPResource[];
+  prompts?: MCPPrompt[];
+
+  // Tool permissions (per-tool permission settings)
+  tool_permissions?: Record<string, ToolPermission>; // e.g., { "list_files": "allow", "write_file": "ask" }
+
+  // Timestamps
+  created_at: Date;
+  updated_at: Date;
+}
+
+/**
+ * Session-MCP Server relationship
+ * Many-to-many relationship between sessions and MCP servers
+ */
+export interface SessionMCPServer {
+  session_id: SessionID;
+  mcp_server_id: MCPServerID;
+  enabled: boolean;
+  added_at: Date;
+}
+
+/**
+ * MCP Server filters for list queries
+ */
+export interface MCPServerFilters {
+  scope?: MCPScope;
+  scopeId?: string; // owner user_id or attached session_id
+  transport?: MCPTransport;
+  enabled?: boolean;
+  source?: MCPSource;
+  /** Shared servers plus private servers owned by this user. */
+  usableByUserId?: string;
+  /** Restrict to system-owned rows, used for the official catalog. */
+  ownerless?: boolean;
+}
+
+/**
+ * Create MCP Server input
+ */
+export interface CreateMCPServerInput {
+  name: string;
+  display_name?: string;
+  description?: string;
+  transport: MCPTransport;
+  command?: string;
+  args?: string[];
+  url?: string;
+  headers?: Record<string, string>;
+  env?: Record<string, string>;
+  auth?: MCPAuth;
+  scope: MCPScope;
+  owner_user_id?: UserID; // Private to this user; omit for a shared server
+  source?: MCPSource;
+  import_path?: string;
+  catalog_entry_name?: string;
+  enabled?: boolean;
+}
+
+/**
+ * Update MCP Server input
+ */
+export interface UpdateMCPServerInput {
+  display_name?: string;
+  description?: string;
+  command?: string;
+  args?: string[];
+  url?: string;
+  headers?: Record<string, string>;
+  env?: Record<string, string>;
+  auth?: MCPAuth;
+  scope?: MCPScope;
+  enabled?: boolean;
+  transport?: 'stdio' | 'http' | 'sse';
+  tool_permissions?: Record<string, ToolPermission>;
+  tools?: MCPTool[];
+  resources?: MCPResource[];
+  prompts?: MCPPrompt[];
+}
+
+/**
+ * MCP Server test result
+ */
+export interface MCPTestResult {
+  success: boolean;
+  error?: string;
+  latency_ms?: number;
+  capabilities?: MCPCapabilities;
+}
+
+/**
+ * MCP configuration format (from .mcp.json)
+ */
+export interface MCPConfigFile {
+  mcpServers: {
+    [name: string]: {
+      command?: string;
+      args?: string[];
+      transport?: 'http' | 'sse';
+      url?: string;
+      headers?: Record<string, string>;
+      env?: Record<string, string>;
+    };
+  };
+}
+
+/**
+ * MCP Servers config for SDK (passed to query())
+ * Uses 'type' field as per Claude Code's MCP config format
+ */
+export type MCPServersConfig = Record<
+  string,
+  {
+    type?: 'stdio' | 'http' | 'sse';
+    command?: string;
+    args?: string[];
+    url?: string;
+    headers?: Record<string, string>;
+    env?: Record<string, string>;
+  }
+>;
+
+// ============================================================================
+// MCP Session Tokens (daemon ↔ MCP server channel)
+// ============================================================================
+
+/**
+ * JWT `aud` claim for MCP session tokens. Enforced by `jsonwebtoken.verify`.
+ */
+export const MCP_TOKEN_AUDIENCE = 'disco:mcp:internal';
+
+/**
+ * JWT `iss` claim for MCP session tokens (post-rollout tokens only).
+ */
+export const MCP_TOKEN_ISSUER = 'disco';

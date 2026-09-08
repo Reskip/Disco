@@ -1,0 +1,84 @@
+{
+  "name": "@disco-live/client",
+  "version": "0.25.2",
+  "description": "TypeScript client for connecting to the Disco daemon",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./config": {
+      "source": "./src/config.ts",
+      "types": "./dist/config.d.ts",
+      "import": "./dist/config.js",
+      "require": "./dist/config.cjs"
+    },
+    "./yaml": {
+      "source": "./src/yaml.ts",
+      "types": "./dist/yaml.d.ts",
+      "import": "./dist/yaml.js",
+      "require": "./dist/yaml.cjs"
+    },
+    "./jwt": {
+      "source": "./src/jwt.ts",
+      "types": "./dist/jwt.d.ts",
+      "import": "./dist/jwt.js",
+      "require": "./dist/jwt.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup && node scripts/build-dts.mjs && node scripts/patch-dts.mjs",
+    "check:pack": "node scripts/validate-pack-artifact.mjs",
+    "dev": "tsup --watch",
+    "prepublishOnly": "pnpm build && pnpm check:pack",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@feathersjs/authentication-client": "^5.0.46",
+    "@feathersjs/feathers": "^5.0.46",
+    "@feathersjs/rest-client": "^5.0.46",
+    "@feathersjs/socketio-client": "^5.0.46",
+    "js-yaml": "^5.2.3",
+    "socket.io-client": "^4.8.3"
+  },
+  "devDependencies": {
+    "@disco/agentic-tools": "workspace:*",
+    "@disco/core": "workspace:*",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^24.6.0",
+    "tsup": "^8.5.1",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.10"
+  },
+  "keywords": [
+    "disco",
+    "client",
+    "ai",
+    "agents",
+    "orchestration"
+  ],
+  "author": "Maxime Beauchemin <maximebeauchemin@gmail.com>",
+  "license": "BUSL-1.1",
+  "homepage": "https://disco.live",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Reskip/Disco.git",
+    "directory": "packages/client"
+  },
+  "bugs": {
+    "url": "https://github.com/Reskip/Disco/issues"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}

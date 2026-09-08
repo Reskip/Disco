@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Root-absolute so Vite rebases it to the configured base (/ui/ in prod);
+         a relative href would 404 on deep-linked nested routes. -->
+    <link rel="icon" type="image/svg+xml" href="/disco-mark-light.svg" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
+    />
+    <title>Disco</title>
+    <style>
+      /* biome-ignore-all lint/plugin/noFirstPartyCss: pre-React viewport sizing must apply before the themed application mounts */
+      body {
+        width: 100vw;
+        height: 100vh;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        container-type: inline-size;
+      }
+      #root {
+        width: 100%;
+        height: var(--disco-visible-viewport-height, 100dvh);
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+      }
+      #root > * {
+        width: 100%;
+        height: 100%;
+        min-height: 0;
+        max-width: 100%;
+        max-height: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,140 @@
+---
+title: Multi-Tenant Filesystem
+description: Configure tenant-isolated repositories, branches, and uploads for hosted Disco deployments.
+---
+
+# Multi-Tenant Filesystem
+
+Disco can partition tenant-owned files while keeping daemon state shared. This
+is intended for hosted deployments that resolve tenant identity from trusted
+authentication.
+
+## Configuration
+
+```yaml
+multi_tenancy:
+  mode: required_from_auth
+  auth_claim: tenant_id
+  filesystem_isolation_enabled: true
+  tenants_base_folder: ~/.disco/tenants
+
+uploads:
+  location: ~/.disco
+  max_age_days: 0
+  max_file_size_mb: 0
+```
+
+`filesystem_isolation_enabled` defaults to `false`, preserving the existing
+single-tenant layout. It is required when `mode` is `required_from_auth`; the
+daemon rejects that mode without filesystem isolation.
+
+`tenants_base_folder` may be absolute, such as `/data/disco-tenants`, or relative
+to the daemon home (`~/.disco`). Its default is `~/.disco/tenants`.
+
+## Filesystem layout
+
+With filesystem isolation enabled, Disco creates directories lazily:
+
+```text
+~/.disco/
+  tenants/
+    <tenant-id>/
+      repos/
+      worktrees/
+      uploads/
+  disco.db
+  config.yaml
+```
+
+`uploads.location` is a **base storage location**, not the final upload folder.
+Disco owns and appends the tenant and `uploads/` namespaces beneath it. Local
+multi-tenant uploads therefore use
+`<location>/tenants/<tenant-id>/uploads/`. In single-tenant mode they use
+`<location>/uploads/`. `max_age_days` defaults to `0`, so valid attachments are
+retained indefinitely. Set a positive number only when automatic expiry is
+desired. `max_file_size_mb: 0` disables the Disco application-layer size cap;
+disk, proxy and infrastructure limits still apply.
+
+The base may also be an `s3://bucket/prefix` URI. The daemon uses the
+AWS SDK credential and region provider chains, so configure credentials through
+the workload identity (recommended), environment, or shared AWS configuration;
+never embed credentials in the URI. Set the region through workload/shared
+configuration or `AWS_REGION`.
+
+S3 objects always use the same tenant-first partition. Operators provide only
+the bucket and optional base prefix; Disco manages everything below it:
+
+```text
+<prefix>/tenants/<tenant-id>/uploads/objects/<handle-shard>/<upload-ref>
+```
+
+Disco enforces tenant, branch, and session ownership before every read or delete.
+The bucket policy should grant the daemon only the configured prefix. Disco does
+not list or reconcile the bucket during upload requests. Configure S3 lifecycle
+rules to expire objects after the configured retention and abort incomplete
+multipart uploads. Failed transfers are also aborted directly by the uploader.
+When `max_age_days` is zero, omit object expiration if permanent retention is
+intended.
+
+The daemon needs `s3:GetObject`, `s3:PutObject`, and `s3:DeleteObject` on the
+configured object prefix, plus `s3:AbortMultipartUpload` for failed multipart
+transfers. It does not require bucket-list permissions for normal upload
+operation.
+
+## Expired upload maintenance
+
+Upload expiry is enforced on access. S3 lifecycle rules are the normal Cloud
+mechanism for physical byte retention. Deployment operators may also remove a
+bounded batch of expired database metadata and its exact storage objects:
+
+```bash
+# Static/single-tenant deployment
+disco local uploads cleanup --limit 500
+
+# One tenant, or an explicit cross-tenant Cloud maintenance job
+disco local uploads cleanup --tenant-id acme --limit 500
+disco local uploads cleanup --all-tenants --limit 500
+```
+
+Use `--dry-run` to count without deleting. This is a deployment-local command:
+it reads the runtime database/configuration and uses local filesystem or AWS
+credentials directly. It is not an authenticated, tenant-bound user API. The
+S3 path performs exact-key operations and never lists or reconciles the bucket.
+
+In the default single-tenant mode, paths remain unchanged:
+
+```text
+~/.disco/
+  repos/
+  worktrees/
+  uploads/
+  disco.db
+  config.yaml
+```
+
+## User homes and container mounts
+
+Disco does not provision or relocate Unix user home directories as part of this
+setting. In Kubernetes or another container scheduler, user-home persistence is
+an executor provisioning responsibility. A deployment may mount a stable home
+for the Disco user together with only the authorized branch paths, using
+read-only or read-write mounts according to its RBAC policy.
+
+The daemon upload root is not mounted into executors. When an agent needs an
+upload, Disco streams an authorized copy into the executor-owned
+`.disco/session-staging/<session-id>/` directory inside the existing branch
+workspace mount.
+
+## Migration
+
+Enabling filesystem isolation does **not** move existing repositories,
+worktrees, or uploads. Configure it for a new multi-tenant deployment, or move
+existing tenant data into the target topology while the daemon is stopped.
+Database rows containing filesystem paths must agree with the resulting
+locations.
+
+## Moving and removing tenant data
+
+To inspect, export, import, verify, or delete a single tenant's database and
+filesystem data — for migration, backup and restore, or offboarding — see
+[Tenant Data Portability](/guide/tenant-data-portability).

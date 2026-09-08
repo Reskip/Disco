@@ -1,0 +1,159 @@
+# Disco Documentation
+
+Documentation website built with Nextra.
+
+## Development
+
+```bash
+# From project root
+pnpm docs:dev
+
+# Or directly
+cd apps/disco-docs
+pnpm dev
+```
+
+Open http://localhost:3001
+
+## Site analytics
+
+The public docs deployment sets `NEXT_PUBLIC_GA_ID=G-DME77D3LDH`. A measurement ID is
+public configuration, not a credential. The integration is omitted when the variable is
+unset and is otherwise enabled for production builds. To exercise it in `pnpm dev`, also
+set `NEXT_PUBLIC_ANALYTICS_DEBUG=true`; use a test property or block collection requests.
+
+Google Analytics sends one explicit `page_view` for the initial URL and each client-side
+App Router navigation. Its automatic page view is disabled to prevent duplicates. The
+site currently has no cookie-consent gate and does not interpret the browser's legacy Do
+Not Track signal; this matches the existing site-wide Microsoft Clarity and HubSpot
+loaders. Visitors can block these third-party scripts with browser privacy controls.
+
+The GitHub Pages deployment does not currently send a Content Security Policy. If one is
+added, it must allow the GA loader from `https://www.googletagmanager.com` and collection
+to `https://www.google-analytics.com` (plus the existing Clarity and HubSpot origins).
+
+## Brand assets
+
+`public/logo-mark.svg` is the transparent Disco mark for normal web and
+in-product rendering. `public/logo.svg` contains the same artwork on a fixed
+dark circular plate for favicons and other small contexts where the mark needs
+a predictable backdrop. Both have explicit `734 × 734` intrinsic dimensions
+and the same square viewBox.
+
+The standalone Vite app keeps byte-identical deployment copies of both SVGs in
+`../disco-ui/public/`; `pnpm validate:brand-assets` guards the copies and the
+transparent/backed distinction against drift. Do not add PNG logo/favicon
+copies for ordinary browser rendering.
+
+`public/apple-touch-icon.png` is the only compatibility raster. Apple touch
+icons require PNG output, so regenerate its transparent `180 × 180` render from
+the canonical SVG with:
+
+```bash
+apps/disco-docs/scripts/generate-apple-touch-icon.sh
+```
+
+Screenshots, social-card images, generated video frames, and third-party tool
+logos are content assets rather than alternate Disco marks and keep the format
+required by their destination.
+
+## Structure
+
+```
+pages/
+├── index.mdx          # Landing page (symlink to README.md)
+├── guide/             # User guides
+│   ├── getting-started.mdx
+│   ├── docker.mdx
+│   └── development.mdx
+├── cli/               # CLI reference (auto-generated in Phase 2)
+│   └── index.mdx
+└── api/               # API reference (auto-generated in Phase 2)
+    └── index.mdx
+```
+
+## Page metadata and social previews
+
+All page-level social metadata is centralized in `theme.config.tsx`. Authors should set
+frontmatter instead of adding ad hoc `<Head>` tags:
+
+```mdx
+---
+title: Cards
+description: Generic workflow cards that give you spatial oversight of any agentic workflow.
+heroImage: '/screenshots/cards-hero.png'
+---
+```
+
+- `image` is the existing blog-post hero/card image convention.
+- `heroImage` is the docs/feature-page convention for pages with a visible hero screenshot.
+- `socialImage` or `ogImage` may be used only when the social preview should intentionally
+  differ from the visible hero image.
+
+Local image paths must live under `public/` and start with `/`. The metadata layer turns
+them into absolute `og:image` and `twitter:image` URLs using `NEXT_PUBLIC_SITE_URL` plus
+`NEXT_PUBLIC_BASE_PATH` when configured. Pages without any image field fall back to
+`/screenshots/board-hero.png`. Add `imageWidth` and `imageHeight` only when you know the exact image
+dimensions.
+
+## Phase 1 (Complete)
+
+- ✅ Nextra setup with dark mode
+- ✅ Disco brand colors (#2e9a92 teal)
+- ✅ Landing page from README.md
+- ✅ Basic navigation structure
+- ✅ Guide pages (Getting Started, Docker, Development)
+- ✅ Auto-generated CLI docs from oclif
+- ✅ Auto-generated API docs from FeathersJS services
+
+## Phase 2 (Next)
+
+- [ ] Add more guide content
+- [ ] Improve CLI doc parsing
+- [ ] Add code examples to API docs
+- [ ] Deploy to docs.disco.dev
+
+## Generate Documentation
+
+Auto-generate CLI and API docs:
+
+```bash
+# From root
+pnpm docs:generate
+
+# Or from docs directory
+pnpm generate        # Generate both CLI and API docs
+pnpm generate:cli    # Generate CLI docs only
+pnpm generate:api    # Generate API docs only
+```
+
+## Build
+
+```bash
+pnpm docs:build      # Auto-generates docs then builds
+```
+
+Output: `.next/` directory
+
+## Deployment
+
+Docs are automatically deployed to GitHub Pages on every push to `main` that changes:
+
+- `apps/disco-docs/**`
+- `apps/disco-cli/src/commands/**` (CLI docs are auto-generated)
+
+**GitHub Pages Setup (one-time):**
+
+1. Go to repository Settings → Pages
+2. Source: **GitHub Actions**
+3. That's it! The workflow (`.github/workflows/deploy-docs.yml`) handles the rest.
+
+**Manual deployment trigger:**
+
+```bash
+gh workflow run deploy-docs.yml
+```
+
+**Deployment URL:** https://disco.live/
+
+Alternative deployment targets (Cloudflare Pages, Vercel) work as well — Nextra static export is portable.

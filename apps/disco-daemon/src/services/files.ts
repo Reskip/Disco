@@ -1,0 +1,162 @@
+/**
+ * Files Service
+ *
+ * Provides file and folder autocomplete search for Session workspaces.
+ * Delegates git ls-files to the executor so the daemon does not run git in a
+ * managed Session working directory.
+ */
+
+import {
+  requireCurrentTenantId,
+  runWithTenantDatabaseScope,
+  SessionRepository,
+  type TenantScopeAwareDatabase,
+} from '@disco/core/db';
+import type { Application } from '@disco/core/feathers';
+import type { AuthenticatedParams, Session, SessionID, UserID } from '@disco/core/types';
+import { resolveDelegatedExecutionHomeKey } from '../utils/executor-delegated-home.js';
+import {
+  generateScopedServiceToken,
+  getDaemonUrl,
+  runExecutorCommand,
+} from '../utils/spawn-executor.js';
+
+// Constants for file search
+const MAX_FILE_RESULTS = 10;
+const _MAX_USER_RESULTS = 5;
+
+interface FileSearchQuery {
+  sessionId: SessionID;
+  search: string;
+}
+
+interface FileResult {
+  path: string;
+  type: 'file' | 'folder';
+}
+
+function isFileResultArray(value: unknown): value is FileResult[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (item) =>
+        item &&
+        typeof item === 'object' &&
+        typeof (item as FileResult).path === 'string' &&
+        ((item as FileResult).type === 'file' || (item as FileResult).type === 'folder')
+    )
+  );
+}
+
+function extractResults(data: unknown): FileResult[] {
+  if (!data || typeof data !== 'object') return [];
+  const results = (data as { results?: unknown }).results;
+  return isFileResultArray(results) ? results : [];
+}
+
+/**
+ * Files service for autocomplete search
+ */
+export class FilesService {
+  private sessionRepo: SessionRepository;
+
+  constructor(
+    private db: TenantScopeAwareDatabase,
+    private app: Application
+  ) {
+    this.sessionRepo = new SessionRepository(db);
+  }
+
+  /**
+   * Search files and folders in a session's branch
+   *
+   * Query params:
+   * - sessionId: Session ID
+   * - search: Search query string (case-insensitive substring match)
+   *
+   * Returns array of file and folder results (folders first), max 10 items total
+   */
+  async find(
+    params: { query: FileSearchQuery } & Partial<AuthenticatedParams>
+  ): Promise<FileResult[]> {
+    const { sessionId, search } = params.query;
+
+    // Empty search returns no results
+    if (!search || search.trim() === '') {
+      return [];
+    }
+
+    // Keep repository and identity reads inside a short tenant transaction.
+    // The executor call below is deliberately outside this scope. Resolve the
+    // identity before opening the unit of work and never turn boundary failures
+    // into an empty autocomplete response.
+    const tenantId = requireCurrentTenantId(
+      'Missing active tenant context for files database access'
+    );
+    const resolved = await runWithTenantDatabaseScope(this.db, tenantId, async () => {
+      const cachedSession = (params as AuthenticatedParams & { session?: Session }).session;
+      const session =
+        cachedSession?.session_id === sessionId
+          ? cachedSession
+          : await this.sessionRepo.findById(sessionId);
+      if (!session) return null;
+
+      const currentUserId = params.user?.user_id as UserID | undefined;
+      if (!currentUserId || session.created_by !== currentUserId || !session.working_directory) {
+        return null;
+      }
+      const delegatedHomeKey = await resolveDelegatedExecutionHomeKey(
+        this.db,
+        currentUserId,
+        this.app.get('config')
+      );
+      return { workingDirectory: session.working_directory, delegatedHomeKey };
+    });
+    if (!resolved) return [];
+
+    try {
+      const sessionToken = generateScopedServiceToken(
+        this.app as unknown as { settings: { authentication?: { secret?: string } } }
+      );
+
+      const result = await runExecutorCommand(
+        {
+          command: 'workspace.files.list',
+          sessionToken,
+          daemonUrl: getDaemonUrl(),
+          params: {
+            workingDirectory: resolved.workingDirectory,
+            search,
+            limit: MAX_FILE_RESULTS,
+          },
+        },
+        {
+          logPrefix: `[FilesService ${sessionId}]`,
+          // Delegated mode passes the caller's stable execution-home key to
+          // the external launcher. Local modes do not select a host identity.
+          delegatedHomeKey: resolved.delegatedHomeKey,
+        }
+      );
+
+      if (!result.success) {
+        console.warn(
+          `Executor file search failed for session ${sessionId}: ${result.error?.message ?? 'unknown error'}`
+        );
+        return [];
+      }
+
+      return extractResults(result.data);
+    } catch (error) {
+      // Log error but return empty array (don't block UX)
+      console.error(`Error searching files for session ${sessionId}:`, error);
+      return [];
+    }
+  }
+}
+
+/**
+ * Service factory function
+ */
+export function createFilesService(db: TenantScopeAwareDatabase, app: Application): FilesService {
+  return new FilesService(db, app);
+}

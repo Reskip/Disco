@@ -1,0 +1,323 @@
+---
+title: Disco MCP Server
+description: Agents are first-class users in Disco. The built-in MCP server gives them the same surface area you have in the UI (sessions, branches, boards, zones, users, environments) as structured JSON-RPC.
+heroImage: '/mcp_self_aware.png'
+---
+
+# Disco MCP Server
+
+<div style={{ marginTop: '20px', marginBottom: '30px', display: 'flex', justifyContent: 'center' }}>
+  <img
+    src="/mcp_self_aware.png"
+    alt="Claude Code discovering Disco MCP capabilities"
+    style={{ width: '500px', maxWidth: '100%', borderRadius: '8px' }}
+  />
+</div>
+
+**Anything a user can do in Disco, an agent can do too.** The same daemon that serves the UI's REST and WebSocket APIs also exposes a built-in **Model Context Protocol (MCP) server**, a structured automation surface that turns every session into a self-aware orchestrator.
+
+This is the foundational layer: [teammates](/guide/teammates), [scheduled prompts](/guide/scheduler), [cards](/guide/cards), [artifacts](/guide/artifacts), and the [message gateway](/guide/message-gateway) are all built on top of it.
+
+> **The other doorway:** if you're driving Disco from outside an agent (TS/JS scripts, custom dashboards, internal services), reach for the official [`@disco-live/client`](/guide/typescript-client) instead. Same daemon, same types, REST + Socket.IO + a reactive session API.
+
+## Key Ideas
+
+- **Agents as first-class users:** Every MCP tool wraps a FeathersJS service. Sessions, branches, boards, zones, users, environments. Anything you can click or reach via the `disco` CLI is available as JSON-RPC.
+- **Self-aware sessions:** Each session is auto-issued a scoped MCP token, so the agent already knows _which_ session, branch, and board it's in, and can act on that context.
+- **No separate server:** MCP is part of the daemon. Nothing to install, nothing extra to run.
+- **Remote access:** External agents and dashboards can connect over HTTP to drive Disco (create boards, branches, or even invite new users).
+
+> MCP is enabled by default and every session already has credentials injected. No setup required for in-Disco agents.
+
+## Capabilities At a Glance
+
+| Domain                | What agents can do                                                                                      |
+| --------------------- | ------------------------------------------------------------------------------------------------------- |
+| **Sessions**          | Introspect the current session, list siblings, spawn child sessions with prompts, archive/complete work |
+| **Repositories**      | List repositories, clone remote repos, register local repos, manage repo metadata                       |
+| **Branches & Boards** | List or fetch branches, create new ones, assign them to boards, update metadata, move cards spatially   |
+| **Board Zones**       | Create zones on boards, update zone properties (position, size, color), manage zone triggers            |
+| **Tasks & Reports**   | Fetch task history, create follow-up tasks, log progress, generate reports                              |
+| **Users & Teams**     | Create users, update profiles or avatars, assign roles, invite collaborators                            |
+| **Context Resources** | Enumerate context files, load concept docs, ingest repo metadata                                        |
+
+Because tools route through FeathersJS services, every action emits the same events the UI listens to. Real-time updates appear instantly for everyone watching the board.
+
+### Progressive tool discovery
+
+When `mcp_tool_search` is enabled (the default), `tools/list` intentionally
+returns only three stable facade tools:
+
+- `disco_search_tools` browses domains or searches concise tool summaries.
+- `disco_get_tool_details` returns the exact schema for one selected tool.
+- `disco_execute_tool` invokes the selected domain tool with validated arguments.
+
+The MCP `2026-07-28` revision adds `server/discover` for protocol capabilities
+and standard cache hints for tool lists. It does **not** replace Disco's semantic
+catalog search, domain filters, annotation filters, or detail-on-demand flow.
+Disco keeps those features while using the standard discovery response and
+private 60-second cache hints for its deterministic visible catalog.
+
+## Self-Aware Agents Inside Disco
+
+When you launch a session in Disco, the SDK config includes the internal MCP server automatically:
+
+```json
+{
+  "type": "http",
+  "url": "http://localhost:3030/mcp",
+  "headers": {
+    "Authorization": "Bearer <mcp_token>"
+  }
+}
+```
+
+The daemon requires the token in the `Authorization: Bearer` header. Query-
+string tokens are rejected. Don't put secrets in URLs, where they'd leak
+into access logs and browser history.
+
+From there agents can:
+
+- Discover their **current session** and branch context.
+- **Spawn subsessions** to fan out work (e.g., spin up multiple coders to process a checklist).
+- Inspect the **board layout** to decide where to place new branches or sessions.
+- Update their own **user profile** to signal who is speaking.
+
+This self-awareness is what lets agents behave like team members instead of detached copilots.
+
+## Automation Examples
+
+- **Repository bootstrap:** "Clone this GitHub repo, create a branch off `main`, and start the dev environment automatically."
+- **Zone-based workflows:** "Create a 'Human PR Review' zone on the board, positioned based on existing zones, with a trigger that prompts for review feedback."
+- **Mass subsession fan-out:** "Read `context/js-to-ts-refactor`, split the file list, create a subsession per chunk, and report back when done."
+- **Bulk account provisioning:** Paste a CSV of emails; the agent calls MCP to create users and invite them automatically.
+- **Issue triage pipeline:** Source GitHub issues by label, triage them, and create branches linked to each issue, dropping them onto the active board as cards.
+- **Environment orchestration:** Start/stop branch environments via MCP before delegating work to collaborators or other agents.
+
+Because MCP calls are just JSON-RPC, complex workflows can be scripted once and reused by any tool that speaks the protocol.
+
+Environment MCP tools call the same branch environment service as the UI. If an
+operator sets `execution.managed_envs_execution_mode: webhook-only`, MCP
+`disco_environment_start`, `disco_environment_stop`, `disco_environment_logs`, and
+`disco_environment_nuke` reject rendered shell commands and only invoke explicit
+HTTP(S) webhook URLs. See [Environments: webhook-only mode](/guide/environment-configuration#webhook-only-mode).
+
+## External Agent Access
+
+External clients connect to the same HTTP MCP endpoint. Use the hosted URL
+`https://<your-disco-host>/mcp`, or `http://<daemon-host>:3030/mcp` for a
+default self-hosted daemon. In Disco, open **User Settings → Personal API Keys**,
+create a key, copy it once, and store it in a password manager or your shell's
+secret-loading mechanism:
+
+```bash
+export DISCO_API_KEY='…'
+```
+
+Disco authenticates personal keys with the `X-API-Key` header. Never paste a
+real key into a command, committed config, issue, or chat transcript.
+
+### Claude Code
+
+This user-scoped registration works for the hosted sandbox:
+
+```bash
+claude mcp add -s user -t http disco-sandbox https://disco.sandbox.preset.zone/mcp \
+  -H 'X-API-Key: ${DISCO_API_KEY}'
+```
+
+The single quotes are important: your shell passes the placeholder rather than
+the secret. Claude Code stores `${DISCO_API_KEY}` in its user configuration and
+expands it when it loads the MCP server, so the variable must also exist in the
+environment that launches Claude Code. This exact behavior was verified with
+Claude Code's generated configuration; it also matches Anthropic's documented
+environment expansion for HTTP headers.
+
+Use `-s local` (the default) for private configuration in only the current
+project, or `-s project` only when the shareable `.mcp.json` contains the
+placeholder—not a secret. Check the registration with:
+
+```bash
+claude mcp get disco-sandbox
+```
+
+### Codex
+
+Codex supports environment-backed HTTP headers in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.disco]
+url = "https://disco.sandbox.preset.zone/mcp"
+env_http_headers = { "X-API-Key" = "DISCO_API_KEY" }
+```
+
+`env_http_headers` maps the header to an environment-variable **name**; do not
+use `http_headers` with the literal key. The global file is shared by Codex CLI,
+the IDE extension, and the Codex app. For one trusted repository, put the same
+table in `.codex/config.toml` instead. Restart the client after changing its
+environment or configuration, then use `/mcp` or `codex mcp list` to inspect
+the connection.
+
+### Optional session context
+
+An external personal API key identifies you but does not imply an Disco session.
+Most tools accept explicit IDs. To make current-session tools work, add
+`X-Disco-Session-Id: <session-id>` as another header. The session must be visible
+to your user. Do not copy Disco's short-lived internal session JWT into an
+external client; those tokens are injected automatically into sessions that
+Disco launches.
+
+That is the key distinction: **inside an Disco session**, the endpoint, scoped
+JWT, tenant, user, and session context are attached automatically. **From an
+external client**, you configure the endpoint and personal API key yourself,
+and session context is absent unless you add it.
+
+### Built-in transport contract
+
+Disco's built-in endpoint uses the stable TypeScript MCP SDK v2 in a dual-era,
+stateless request/response configuration:
+
+- Modern `2026-07-28` clients use the handshake-free per-request metadata
+  contract. They may call `server/discover`; ordinary RPC results are bounded
+  JSON and include standard cache hints where required.
+- Initialization-era clients through `2025-11-25` continue to use
+  `initialize` and `notifications/initialized`. The compatibility path may
+  return one bounded, request-scoped SSE response for a legacy request. It does
+  not create or retain a transport session.
+- Neither era receives `Mcp-Session-Id`. Disco does not retain a transport Map
+  or timer, open a standalone server event stream, or send transport-level
+  progress, logging, subscription, or tool-list-change notifications.
+- Authenticated `GET /mcp` and `DELETE /mcp` return `405 Method Not Allowed`
+  (requests still pass the normal authentication boundary first). Streamable
+  HTTP clients may optimistically try `GET`; compatible clients treat `405` as
+  the server declining that optional stream.
+- Authentication, trusted tenant identity, current user data, and optional
+  `X-Disco-Session-Id` access are reconstructed and authorized on every request.
+
+This contract applies only to Disco's built-in endpoint. MCP servers that users
+configure under **Settings → MCP Servers** remain separate external services;
+Disco still passes their configured stdio, Streamable HTTP, or legacy SSE
+transports directly to the selected executor.
+
+Version selection is protocol-driven rather than an Disco-specific client
+switch. V2 clients can probe with `server/discover` and select the modern era;
+older clients send `initialize` and are served by the stateless compatibility
+arm. Both paths use the same authenticated server factory and tool definitions.
+
+### Smoke test and troubleshooting
+
+Ask the client to call `disco_search_tools` with no arguments, then
+`disco_boards_list` with `{ "limit": 1 }`. A successful response should show
+tool domains and one accessible board page.
+
+- **401:** confirm `DISCO_API_KEY` exists in the environment that launched the
+  client, the header is exactly `X-API-Key`, and the key has not been revoked.
+  Re-register if the client stored a literal secret or an unexpanded shell
+  expression.
+- **Proxy or TLS errors:** verify the `/mcp` URL is reachable from the client,
+  configure its supported `HTTP_PROXY`/`HTTPS_PROXY` settings, and install your
+  organization's CA rather than disabling certificate verification.
+- **Unsupported transport or interpolation:** use Streamable HTTP (not stdio or
+  legacy SSE). If a client cannot resolve environment-backed custom headers,
+  use a supported secret store or a local proxy that injects the header; do not
+  commit the key as a static header.
+
+Client syntax is based on the current official
+[Claude Code MCP documentation](https://docs.anthropic.com/en/docs/claude-code/mcp)
+and [Codex MCP documentation](https://developers.openai.com/codex/mcp/).
+
+### Multi-tenant authentication boundary
+
+The default `multi_tenancy.mode: static` behavior is unchanged: MCP requests
+use `multi_tenancy.static_tenant_id`, and clients do not send a tenant header.
+
+In hosted `required_from_auth` deployments:
+
+- Internal MCP session JWTs carry a signed tenant binding. The daemon verifies
+  that binding before it reads the session or user, and a token cannot be
+  replayed with another tenant header.
+- Personal API keys are opaque and do not contain a signed tenant. Using them
+  at `/mcp` therefore requires `multi_tenancy.trusted_header`; the trusted
+  reverse proxy must remove any client-supplied value and set the header from
+  its authenticated routing decision. It must send exactly one tenant value;
+  duplicate or comma/list-valued tenant headers are rejected. Do not expose the
+  daemon directly when this mode relies on a trusted header.
+- If more than one tenant signal is present, all signals must agree. Missing or
+  conflicting identity fails closed before tenant-owned authentication data is
+  queried.
+- The built-in endpoint retains no transport context. Every POST resolves the
+  tenant, authenticates and reloads the user, and authorizes any optional Disco
+  Session independently. An `Mcp-Session-Id` is never a source of identity or
+  authority.
+
+Tenant identity is ambient for the MCP operation, but it does not hold a
+database transaction open. Individual service and repository calls use short
+tenant-scoped units of work.
+
+## Best Practices
+
+- **Keep permission policies tight.** MCP calls respect Disco’s permission system. Configure approvals so agents only do what the team expects.
+- **Design idempotent workflows.** Make repeated calls safe; agents may retry when handling errors.
+- **Log agent activity.** Sessions capture every MCP action they trigger, making reviews and audits straightforward.
+- **Reuse concept files.** Agents can load `context/` docs via MCP, ensuring automations stay aligned with team conventions.
+
+## MCP Tokens
+
+MCP session tokens are short-lived JWTs (aud `disco:mcp:internal`) embedding
+the session (`sub`), authenticated caller (`uid`), tenant (`tid`), a
+per-issuance ID (`jti`), and an expiry (`exp`). A still-valid token may be
+reused from a cache keyed by tenant, session, and user; otherwise `GET
+/sessions/:id` or `POST /sessions` mints a new one.
+
+There is no revocation mechanics, no per-jti ledger, no session-generation
+counter. The authorised blast radius of a leak is bounded by `exp` (default
+24h). Validation additionally rejects tokens whose session has been deleted
+from the signed tenant. Tokens issued before the tenant binding was introduced
+are rejected and are replaced the next time the session is fetched or created.
+These session tokens are for daemon-to-executor use; external clients should
+use personal API keys rather than treating this JWT format as a general-purpose
+authentication protocol.
+
+### Access gating
+
+Because an MCP token binds `uid` to the authorized caller and lets the bearer
+act as that user on the MCP channel, it is only issued to callers who are
+allowed to receive a token for the session:
+
+- **`GET /sessions/:id`** first applies normal session and branch
+  authorization, then issues a caller-scoped token to any authenticated
+  `member+` or to the executor's service identity (`role: 'service'`, used when
+  spawning the child process). The caller need not be the session creator:
+  MCP tools continue to act as that caller and enforce their normal
+  authorization checks.
+- For **`POST /sessions`**, the caller is the creator by construction, so
+  `member+` is the only gate here.
+- Callers with the account role **viewer** never receive an `mcp_token` on
+  either path. They cannot
+  prompt via REST either, so MCP would be useless for them regardless.
+
+### Config knobs
+
+```yaml
+execution:
+  # Token lifetime — keep short to cap the damage from a leak.
+  mcp_token_expiration_ms: 86400000 # 24h (default)
+```
+
+### Troubleshooting
+
+| Symptom                               | Likely cause                          | Fix                                          |
+| ------------------------------------- | ------------------------------------- | -------------------------------------------- |
+| `token rejected: expired`             | Token past its `exp`                  | Session will re-mint on next `GET /sessions` |
+| `token rejected: session … not found` | Token's session was deleted           | Expected — token can no longer be used       |
+| `token rejected: missing sub/uid/tid` | Pre-tenant-binding or malformed token | Fetch / recreate the session to re-mint      |
+| `token rejected: missing jti or exp`  | Pre-expiry-binding or malformed token | Fetch / recreate the session to re-mint      |
+
+## Related Reading
+
+- [Sessions & Trees](/guide/sessions) (how agents spawn, fork, and ask side questions through MCP)
+- [Teammates](/guide/teammates) (long-lived AI teammates that drive Disco through MCP)
+- [Scheduler](/guide/scheduler) (cron-style triggers that fire prompts via the same surface)
+- [TypeScript Client](/guide/typescript-client) (the non-agent doorway: drive Disco from JS/TS apps, scripts, and services)
+- [Architecture: Disco as an MCP Server](/guide/architecture#disco-as-an-mcp-server)
+- [SDK Comparison](/guide/sdk-comparison)

@@ -1,0 +1,32 @@
+# Dev compose for the Disco docs site.
+#
+# Used by the `docs` variant in .disco.yml. Compose project name is
+# namespaced per-branch so multiple branches can run side by side.
+#
+# Override the host port by exporting PORT before `docker compose up`
+# (the .disco.yml variant does this via {{add 7000 branch.unique_id}}).
+
+services:
+  docs:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - '${PORT:-3001}:3001'
+    environment:
+      # Used by canonical, Open Graph, Twitter, and sitemap URLs while
+      # previewing docs from Disco's managed dev environment.
+      NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL:-http://localhost:${PORT:-3001}}
+      NEXT_PUBLIC_BASE_PATH: ${NEXT_PUBLIC_BASE_PATH:-}
+    volumes:
+      # Bind-mount source for hot reload.
+      - .:/app
+      # Anonymous volume shadows /app/node_modules so the host (which has no
+      # node_modules) doesn't clobber the image's install.
+      - /app/node_modules
+      - /app/.next
+    # Invoke next directly: `pnpm exec` runs a deps-status check against the
+    # bind-mounted source, which can't see the image-side install config
+    # (see Dockerfile) and aborts trying to purge node_modules without a TTY.
+    command: node_modules/.bin/next dev -H 0.0.0.0 -p 3001
+    restart: unless-stopped

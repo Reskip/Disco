@@ -1,0 +1,1364 @@
+/**
+ * Claude Code Tool Implementation
+ *
+ * Current capabilities:
+ * - ✅ Live execution via Anthropic SDK
+ * - ❌ Create new sessions (waiting for SDK)
+ */
+
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { generateId, shortId } from '@disco/core/db';
+import type { PermissionMode as ClaudeSDKPermissionMode } from '@disco/core/sdk';
+import { mapPermissionMode } from '@disco/core/utils/permission-mode-mapper';
+import type {
+  MCPOAuthAuthHeadersRepository,
+  MCPServerRepository,
+  MessagesRepository,
+  SessionMCPServerRepository,
+  SessionRepository,
+} from '../../db/feathers-repositories.js';
+import type { PermissionService } from '../../permissions/permission-service.js';
+import { truncateContentIfNeeded } from '../../services/tool-result-truncator.js';
+import type { NormalizedSdkResponse, RawSdkResponse } from '../../types/sdk-response.js';
+// Removed import of calculateModelContextWindowUsage - inlined instead
+import type { TokenUsage } from '../../types/token-usage.js';
+import {
+  type Message,
+  type MessageID,
+  MessageRole,
+  type MessageSource,
+  type PermissionMode,
+  type SessionID,
+  type TaskID,
+} from '../../types.js';
+import { enrichToolResults, registerToolUses } from '../base/diff-enrichment.js';
+import type {
+  ITool,
+  MessagesService,
+  SessionsPatchClient,
+  TasksService,
+  TasksStreamingService,
+  ToolCapabilities,
+} from '../base/index.js';
+import {
+  createAssistantMessage,
+  createSystemMessage,
+  createUserMessage,
+  createUserMessageFromContent,
+  extractTokenUsage,
+} from './message-builder.js';
+import type { ProcessedEvent } from './message-processor.js';
+import { ClaudePromptService } from './prompt-service.js';
+
+const DEBUG_CLAUDE_STREAMING =
+  process.env.DISCO_DEBUG_CLAUDE_STREAMING === '1' ||
+  process.env.DEBUG?.includes('claude-streaming');
+
+function claudeStreamingDebug(...args: unknown[]): void {
+  if (DEBUG_CLAUDE_STREAMING) {
+    console.debug(...args);
+  }
+}
+
+/**
+ * Format a human-readable rate limit message for the conversation UI.
+ *
+ * Only called for statuses that indicate actual throttling:
+ * - 'rejected': Hard blocked — show urgently
+ * - 'allowed_warning': Approaching limit — show as warning
+ */
+function formatRateLimitText(event: Extract<ProcessedEvent, { type: 'rate_limit' }>): string {
+  const type = event.rateLimitType || 'unknown';
+  const resetsAtStr = event.resetsAt ? new Date(event.resetsAt * 1000).toLocaleString() : undefined;
+
+  if (event.status === 'rejected') {
+    return `Rate limited (${type}). ${resetsAtStr ? `Resets at ${resetsAtStr}.` : ''} Waiting for limit to reset...`;
+  }
+  if (event.status === 'allowed_warning') {
+    return `Approaching rate limit (${type}). ${resetsAtStr ? `Resets at ${resetsAtStr}.` : ''} Requests may be delayed.`;
+  }
+  return `Rate limit: ${event.status} (${type})`;
+}
+
+/**
+ * Build a rate_limit content block for system messages.
+ * Shared between streaming and non-streaming paths.
+ */
+function buildRateLimitContentBlock(
+  event: Extract<ProcessedEvent, { type: 'rate_limit' }>
+): Array<{ type: string; [key: string]: unknown }> {
+  return [
+    {
+      type: 'rate_limit',
+      text: formatRateLimitText(event),
+      status: event.status,
+      rateLimitType: event.rateLimitType,
+      resetsAt: event.resetsAt,
+      overageStatus: event.overageStatus,
+      isUsingOverage: event.isUsingOverage,
+    },
+  ];
+}
+
+type ClassifiedProviderFailureKind = Extract<
+  NonNullable<Message['metadata']>['error_kind'],
+  'missing_credential' | 'provider_credit_exhausted'
+>;
+
+function getClassifiedProviderFailureKind(
+  message: Message | null | undefined
+): ClassifiedProviderFailureKind | undefined {
+  const kind = message?.metadata?.error_kind;
+  return kind === 'missing_credential' || kind === 'provider_credit_exhausted' ? kind : undefined;
+}
+
+function buildProviderFailureContent(
+  subtype: string,
+  errors: string[]
+): Array<{ type: string; text?: string }> {
+  return [
+    { type: 'text', text: `Agent SDK error (${subtype}): ` },
+    ...errors.flatMap((error, index) => [
+      { type: 'text', text: error },
+      ...(index < errors.length - 1 ? [{ type: 'text', text: '\n' }] : []),
+    ]),
+  ];
+}
+
+function sanitizeClassifiedClaudeResponse(
+  response: import('@disco/core/sdk').SDKResultMessage | undefined,
+  kind: ClassifiedProviderFailureKind | undefined
+): unknown {
+  if (!response || !kind) return response;
+
+  // Provider result/error bodies can contain secrets. Accounting fields remain
+  // useful after removing only the body-bearing result fields.
+  const sanitized = { ...response } as Record<string, unknown>;
+  delete sanitized.result;
+  delete sanitized.errors;
+  return sanitized;
+}
+
+/**
+ * Wrapper for withSessionGuard that accepts Feathers repositories
+ * The Feathers repositories have the same interface but different type signatures
+ */
+async function withFeathersSessionGuard<T>(
+  sessionId: SessionID,
+  sessionsRepo: SessionRepository | undefined,
+  operation: () => Promise<T>
+): Promise<T | null> {
+  // Check session exists before executing operation
+  const sessionExists = await sessionsRepo?.findById(sessionId);
+  if (!sessionExists) {
+    console.warn(`⚠️  Session ${shortId(sessionId)} no longer exists, skipping guarded operation`);
+    return null;
+  }
+
+  return operation();
+}
+
+export class ClaudeTool implements ITool {
+  readonly toolType = 'claude-code' as const;
+  readonly name = 'Claude Code';
+
+  private promptService?: ClaudePromptService;
+
+  constructor(
+    private messagesRepo?: MessagesRepository,
+    private sessionsRepo?: SessionRepository,
+    apiKey?: string,
+    private messagesService?: MessagesService,
+    sessionMCPRepo?: SessionMCPServerRepository,
+    mcpServerRepo?: MCPServerRepository,
+    permissionService?: PermissionService,
+    private tasksService?: TasksService,
+    private tasksStreamingService?: TasksStreamingService,
+    sessionsService?: SessionsPatchClient,
+    mcpEnabled?: boolean,
+    _useNativeAuth?: boolean, // Claude supports `claude login` OAuth, but no special handling needed in tool
+    usersRepo?: import('../../db/feathers-repositories').UsersRepository,
+    mcpOAuthAuthHeadersRepo?: MCPOAuthAuthHeadersRepository
+  ) {
+    if (messagesRepo && sessionsRepo) {
+      this.promptService = new ClaudePromptService(
+        messagesRepo,
+        sessionsRepo,
+        apiKey,
+        sessionMCPRepo,
+        mcpServerRepo,
+        permissionService,
+        tasksService,
+        sessionsService,
+        messagesService,
+        mcpEnabled,
+        usersRepo,
+        mcpOAuthAuthHeadersRepo
+      );
+    }
+  }
+
+  getCapabilities(): ToolCapabilities {
+    return {
+      supportsSessionCreate: false, // ❌ Waiting for SDK
+      supportsLiveExecution: true, // ✅ Now supported via Anthropic SDK
+      supportsSessionFork: false,
+      supportsChildSpawn: false,
+      supportsGitState: true, // Transcripts contain git state
+      supportsStreaming: true, // ✅ Streaming via callbacks during message generation
+    };
+  }
+
+  async checkInstalled(): Promise<boolean> {
+    try {
+      // Check if ~/.claude directory exists
+      const claudeDir = path.join(os.homedir(), '.claude');
+      const stats = await fs.stat(claudeDir);
+      return stats.isDirectory();
+    } catch {
+      return false;
+    }
+  }
+
+  private async emitTaskEvent(
+    event: 'tool:start' | 'tool:complete' | 'thinking:chunk',
+    data: Record<string, unknown>
+  ): Promise<void> {
+    if (this.tasksStreamingService) {
+      await this.tasksStreamingService.create({ event, data });
+      return;
+    }
+
+    // Fallback for environments that don't expose /tasks/streaming.
+    this.tasksService?.emit(event, data);
+  }
+
+  /**
+   * Execute a prompt against a session WITH real-time streaming
+   *
+   * Creates user message, streams response chunks from Claude, then creates complete assistant messages.
+   * Calls streamingCallbacks during message generation for real-time UI updates.
+   * Agent SDK may return multiple assistant messages (e.g., tool invocation, then response).
+   *
+   * @param sessionId - Session to execute prompt in
+   * @param prompt - User prompt text
+   * @param taskId - Optional task ID for linking messages
+   * @param permissionMode - Optional permission mode for SDK
+   * @param streamingCallbacks - Optional callbacks for real-time streaming (enables typewriter effect)
+   * @param abortController - Optional AbortController for cancellation support (passed to SDK)
+   * @returns User message ID and array of assistant message IDs
+   */
+  async executePromptWithStreaming(
+    sessionId: SessionID,
+    prompt: string,
+    taskId?: TaskID,
+    permissionMode?: PermissionMode,
+    streamingCallbacks?: import('../base').StreamingCallbacks,
+    abortController?: AbortController,
+    messageSource?: MessageSource
+  ): Promise<{
+    userMessageId: MessageID;
+    assistantMessageIds: MessageID[];
+    tokenUsage?: TokenUsage;
+    durationMs?: number;
+    agentSessionId?: string;
+    contextWindow?: number;
+    contextWindowLimit?: number;
+    model?: string;
+    modelUsage?: unknown;
+    rawSdkResponse?: unknown;
+    /** Raw SDK context usage snapshot from getContextUsage() — authoritative source */
+    rawContextUsage?: import('@disco/core/sdk').SDKControlGetContextUsageResponse;
+    wasStopped?: boolean;
+    hadError?: boolean;
+    /** Error details from SDK when hadError is true (e.g., errors array from error_during_execution) */
+    errorDetails?: string[];
+  }> {
+    if (!this.promptService || !this.messagesRepo) {
+      throw new Error('ClaudeTool not initialized with repositories for live execution');
+    }
+
+    if (!this.messagesService) {
+      throw new Error('ClaudeTool not initialized with messagesService for live execution');
+    }
+
+    // Hydrate only this Task while deriving the append position from one row.
+    const [existingMessages, sessionNextIndex] = await Promise.all([
+      taskId ? this.messagesRepo.findInitialUserMessagesByTaskId(taskId) : Promise.resolve([]),
+      this.messagesRepo.getNextIndexBySessionId(sessionId),
+    ]);
+    let nextIndex = sessionNextIndex;
+
+    // Create user message (or reuse the daemon's pre-write — see Alt D in
+    // docs/never-lose-prompt-design.md). When the row is reused, advance
+    // nextIndex from the returned message's actual index.
+    const userMessage = await createUserMessage(
+      sessionId,
+      prompt,
+      taskId,
+      nextIndex,
+      this.messagesService!,
+      { messageSource, existingMessages }
+    );
+    nextIndex = Math.max(nextIndex, userMessage.index + 1);
+
+    // Execute prompt via Agent SDK with streaming
+    const assistantMessageIds: MessageID[] = [];
+    let capturedAgentSessionId: string | undefined;
+    let resolvedModel: string | undefined;
+
+    /**
+     * Stream Separation Pattern (Option C)
+     *
+     * Each stream type (thinking, text, tool) gets its own independent message ID.
+     * This prevents state conflicts when multiple streams are active simultaneously.
+     *
+     * Lifecycle:
+     * 1. Thinking stream: thinking:start → thinking:chunk* → thinking:complete
+     * 2. Text stream: streaming:start → streaming:chunk* → streaming:end
+     * 3. Final message: Both streams merge into single DB message with same ID
+     *
+     * Example flow:
+     * - Claude thinks (thinking stream with ID abc123)
+     * - Claude responds (text stream with ID def456)
+     * - Complete message saved (uses def456, or abc123 if no text, or generates new)
+     *
+     * Benefits:
+     * - No ID collision between concurrent streams
+     * - Clear separation of concerns
+     * - Future-proof for tool streaming
+     * - Easy to refactor to unified pattern later
+     */
+    let currentTextMessageId: MessageID | null = null;
+    let currentThinkingMessageId: MessageID | null = null;
+    // Future: let currentToolMessageId: MessageID | null = null;
+
+    let streamStartTime = Date.now();
+    let firstTokenTime: number | null = null;
+    let firstActivityTime: number | null = null; // Any SDK activity (thinking, tools, text)
+    let apiWaitMessageSent = false; // Track whether we've sent an "API waiting" message
+    const API_WAIT_THRESHOLD_MS = 30_000; // 30 seconds before warning user
+    let tokenUsage: TokenUsage | undefined;
+    let durationMs: number | undefined;
+    let contextWindow: number | undefined;
+    let contextWindowLimit: number | undefined;
+    let modelUsage: unknown | undefined;
+    let rawSdkResponse: import('@disco/core/sdk').SDKResultMessage | undefined;
+    let rawContextUsage: import('@disco/core/sdk').SDKControlGetContextUsageResponse | undefined;
+    let wasStopped = false;
+    let hadError = false;
+    let errorDetails: string[] | undefined;
+    let errorSubtype: string | undefined;
+    let classifiedProviderFailureKind: ClassifiedProviderFailureKind | undefined;
+
+    // Map our permission mode to Claude SDK's permission mode
+    const mappedPermissionMode = permissionMode
+      ? (mapPermissionMode(permissionMode, 'claude-code') as ClaudeSDKPermissionMode)
+      : undefined;
+
+    for await (const event of this.promptService.promptSessionStreaming(
+      sessionId,
+      prompt,
+      taskId,
+      mappedPermissionMode,
+      undefined, // chunkCallback (unused)
+      abortController,
+      streamingCallbacks?.onPulse
+    )) {
+      // Detect if execution was stopped early
+      if (event.type === 'stopped') {
+        wasStopped = true;
+        console.log(`🛑 Claude execution was stopped for session ${sessionId}`);
+        continue; // Skip processing this event
+      }
+
+      // Capture resolved model from first event
+      if (!resolvedModel && 'resolvedModel' in event && event.resolvedModel) {
+        resolvedModel = event.resolvedModel;
+      }
+
+      // Capture Agent SDK session_id
+      if (!capturedAgentSessionId && 'agentSessionId' in event && event.agentSessionId) {
+        capturedAgentSessionId = event.agentSessionId;
+        await this.captureAgentSessionId(sessionId, capturedAgentSessionId);
+      }
+
+      // Handle slash commands discovered (persist to session for UI autocomplete)
+      if (event.type === 'slash_commands_discovered') {
+        if (this.sessionsRepo) {
+          try {
+            // Repository does deep merge in transaction - just pass the keys we want to update
+            await this.sessionsRepo.update(sessionId, {
+              custom_context: {
+                slash_commands: event.slashCommands,
+                skills: event.skills,
+              },
+            });
+          } catch (error) {
+            console.warn('Failed to persist slash commands to session:', error);
+          }
+        }
+      }
+
+      // Handle tool execution start
+      if (event.type === 'tool_start') {
+        if (taskId) {
+          await this.emitTaskEvent('tool:start', {
+            task_id: taskId,
+            session_id: sessionId,
+            tool_use_id: event.toolUseId,
+            tool_name: event.toolName,
+          });
+        }
+      }
+
+      // Handle tool execution complete
+      if (event.type === 'tool_complete') {
+        if (taskId) {
+          await this.emitTaskEvent('tool:complete', {
+            task_id: taskId,
+            session_id: sessionId,
+            tool_use_id: event.toolUseId,
+          });
+        }
+      }
+
+      // Check for slow API response BEFORE marking first activity.
+      // This ensures the warning fires when the first event arrives after the threshold.
+      const isActivityEvent =
+        event.type === 'partial' ||
+        event.type === 'thinking_partial' ||
+        event.type === 'tool_start' ||
+        event.type === 'message_start' ||
+        event.type === 'rate_limit' ||
+        event.type === 'sdk_event' ||
+        event.type === 'complete';
+
+      if (
+        !apiWaitMessageSent &&
+        !firstActivityTime &&
+        isActivityEvent &&
+        Date.now() - streamStartTime > API_WAIT_THRESHOLD_MS
+      ) {
+        apiWaitMessageSent = true;
+        const waitSeconds = Math.round((Date.now() - streamStartTime) / 1000);
+        const waitText = `API response delayed (waiting ${waitSeconds}s+). The API may be experiencing high load.`;
+        console.warn(`⏳ ${waitText}`);
+
+        await withFeathersSessionGuard(sessionId, this.sessionsRepo, async () => {
+          const waitMessageId = generateId() as MessageID;
+
+          if (streamingCallbacks) {
+            await streamingCallbacks.onStreamStart(waitMessageId, {
+              session_id: sessionId,
+              task_id: taskId,
+              role: MessageRole.SYSTEM,
+              timestamp: new Date().toISOString(),
+            });
+          }
+
+          await createSystemMessage(
+            sessionId,
+            waitMessageId,
+            [
+              {
+                type: 'api_wait',
+                text: waitText,
+                waitMs: Date.now() - streamStartTime,
+              },
+            ],
+            taskId,
+            nextIndex++,
+            resolvedModel,
+            this.messagesService!
+          );
+
+          if (streamingCallbacks) {
+            await streamingCallbacks.onStreamEnd(waitMessageId);
+          }
+        });
+      }
+
+      // Track first SDK activity AFTER the api_wait check so the warning can fire
+      if (!firstActivityTime && isActivityEvent) {
+        firstActivityTime = Date.now();
+      }
+
+      // Handle thinking partial (streaming)
+      if (event.type === 'thinking_partial') {
+        // Emit to tasks service for task-level tracking
+        if (taskId) {
+          await this.emitTaskEvent('thinking:chunk', {
+            task_id: taskId,
+            session_id: sessionId,
+            chunk: event.thinkingChunk,
+          });
+        }
+
+        // Emit to streaming callbacks for message-level UI updates
+        // Thinking blocks are part of assistant messages, but tracked separately
+        if (streamingCallbacks?.onThinkingChunk) {
+          // Start thinking stream if needed (separate from text stream)
+          if (!currentThinkingMessageId) {
+            currentThinkingMessageId = generateId() as MessageID;
+            const thinkingStartTime = Date.now();
+            const ttfb = thinkingStartTime - streamStartTime;
+            claudeStreamingDebug(`⏱️ [SDK] TTFB (thinking): ${ttfb}ms`);
+
+            if (streamingCallbacks.onThinkingStart) {
+              // Note: budget is extracted from thinking block if available
+              await streamingCallbacks.onThinkingStart(currentThinkingMessageId, {
+                budget: undefined, // TODO: Extract from SDK if available
+              });
+            }
+          }
+
+          // Stream thinking chunk with dedicated message ID
+          await streamingCallbacks.onThinkingChunk(currentThinkingMessageId, event.thinkingChunk);
+        }
+      }
+
+      // Handle thinking complete
+      if (event.type === 'thinking_complete') {
+        if (streamingCallbacks?.onThinkingEnd && currentThinkingMessageId) {
+          await streamingCallbacks.onThinkingEnd(currentThinkingMessageId);
+          // Keep ID around for potential merging with text message later
+          // Don't reset to null - we may need it for the complete message
+        }
+      }
+
+      // Handle system_complete events (e.g., compaction finished)
+      // Store as NEW message to preserve timeline and metadata
+      if (event.type === 'system_complete') {
+        const systemCompleteEvent = event as Extract<ProcessedEvent, { type: 'system_complete' }>;
+        if (systemCompleteEvent.systemType === 'compaction') {
+          const metadata = systemCompleteEvent.metadata;
+          console.log(`✅ Compaction complete (trigger: ${metadata?.trigger || 'unknown'})`);
+
+          // Create a NEW system message for compaction complete
+          // This preserves the event stream and allows UI to aggregate
+          await withFeathersSessionGuard(sessionId, this.sessionsRepo, async () => {
+            const completeMessageId = generateId() as MessageID;
+
+            // Start streaming event for this system message
+            if (streamingCallbacks) {
+              await streamingCallbacks.onStreamStart(completeMessageId, {
+                session_id: sessionId,
+                task_id: taskId,
+                role: MessageRole.ASSISTANT,
+                timestamp: new Date().toISOString(),
+              });
+            }
+
+            await createSystemMessage(
+              sessionId,
+              completeMessageId,
+              [
+                {
+                  type: 'system_complete',
+                  systemType: 'compaction',
+                  text: 'Context compacted successfully',
+                  // Store metadata for UI rendering
+                  trigger: metadata?.trigger,
+                  pre_tokens: metadata?.pre_tokens,
+                },
+              ],
+              taskId,
+              nextIndex++,
+              resolvedModel,
+              this.messagesService!
+            );
+
+            // End streaming for this system message
+            // This ensures UI removes the spinner immediately
+            if (streamingCallbacks) {
+              await streamingCallbacks.onStreamEnd(completeMessageId);
+            }
+          });
+        }
+      }
+
+      // Handle rate_limit events — surface as system messages
+      if (event.type === 'rate_limit') {
+        const rateLimitEvent = event as Extract<ProcessedEvent, { type: 'rate_limit' }>;
+        const content = buildRateLimitContentBlock(rateLimitEvent);
+        console.log(`⏳ Rate limit → system message: ${content[0].text}`);
+
+        await withFeathersSessionGuard(sessionId, this.sessionsRepo, async () => {
+          const rateLimitMessageId = generateId() as MessageID;
+
+          if (streamingCallbacks) {
+            await streamingCallbacks.onStreamStart(rateLimitMessageId, {
+              session_id: sessionId,
+              task_id: taskId,
+              role: MessageRole.SYSTEM,
+              timestamp: new Date().toISOString(),
+            });
+          }
+
+          await createSystemMessage(
+            sessionId,
+            rateLimitMessageId,
+            content,
+            taskId,
+            nextIndex++,
+            resolvedModel,
+            this.messagesService!
+          );
+
+          if (streamingCallbacks) {
+            await streamingCallbacks.onStreamEnd(rateLimitMessageId);
+          }
+        });
+      }
+
+      // Handle sdk_event — surface unhandled SDK messages as system messages
+      if (event.type === 'sdk_event') {
+        const sdkEvent = event as Extract<ProcessedEvent, { type: 'sdk_event' }>;
+        const content: Array<{
+          type: string;
+          text?: string;
+          sdkType?: string;
+          sdkSubtype?: string;
+          metadata?: Record<string, unknown>;
+          [key: string]: unknown;
+        }> = [
+          {
+            type: 'sdk_event',
+            text: sdkEvent.summary,
+            sdkType: sdkEvent.sdkType,
+            sdkSubtype: sdkEvent.sdkSubtype,
+            metadata: sdkEvent.rawMessage,
+          },
+        ];
+        console.log(`📡 SDK event → system message: ${sdkEvent.summary}`);
+
+        await withFeathersSessionGuard(sessionId, this.sessionsRepo, async () => {
+          const sdkEventMessageId = generateId() as MessageID;
+
+          if (streamingCallbacks) {
+            await streamingCallbacks.onStreamStart(sdkEventMessageId, {
+              session_id: sessionId,
+              task_id: taskId,
+              role: MessageRole.SYSTEM,
+              timestamp: new Date().toISOString(),
+            });
+          }
+
+          await createSystemMessage(
+            sessionId,
+            sdkEventMessageId,
+            content,
+            taskId,
+            nextIndex++,
+            resolvedModel,
+            this.messagesService!
+          );
+
+          if (streamingCallbacks) {
+            await streamingCallbacks.onStreamEnd(sdkEventMessageId);
+          }
+        });
+      }
+
+      // Capture raw SDK response for token accounting
+      if (event.type === 'result') {
+        rawSdkResponse = event.raw_sdk_message;
+        // Detect error results from SDK (e.g., error_during_execution)
+        if (rawSdkResponse && 'subtype' in rawSdkResponse) {
+          const sdkResult = rawSdkResponse as {
+            subtype?: string;
+            errors?: string[];
+            is_error?: boolean;
+          };
+          if (sdkResult.subtype && sdkResult.subtype !== 'success') {
+            hadError = true;
+            errorSubtype = sdkResult.subtype;
+            errorDetails = sdkResult.errors;
+
+            // Create a system message with the error details so it's visible in the conversation UI
+            if (this.messagesService && sdkResult.errors?.length) {
+              const errorMessageId = generateId() as MessageID;
+              const persisted = await withFeathersSessionGuard(
+                sessionId,
+                this.sessionsRepo,
+                async () =>
+                  createSystemMessage(
+                    sessionId,
+                    errorMessageId,
+                    buildProviderFailureContent(sdkResult.subtype!, sdkResult.errors!),
+                    taskId,
+                    nextIndex++,
+                    resolvedModel,
+                    this.messagesService!,
+                    { is_provider_failure_result: true }
+                  )
+              );
+              classifiedProviderFailureKind ??= getClassifiedProviderFailureKind(persisted);
+            }
+          }
+        }
+      }
+
+      // Capture SDK context usage snapshot (authoritative context window data)
+      if (event.type === 'context_usage') {
+        rawContextUsage = event.contextUsage;
+      }
+
+      // Capture metadata from result events (SDK may not type this properly)
+      if ('token_usage' in event && event.token_usage) {
+        tokenUsage = extractTokenUsage(event.token_usage);
+      }
+      if ('duration_ms' in event && typeof event.duration_ms === 'number') {
+        durationMs = event.duration_ms;
+      }
+      if ('model_usage' in event && event.model_usage) {
+        // Save full model usage for later (per-model breakdown)
+        // Token accounting now handled by ClaudeCodeNormalizer.normalizeMultiModel()
+        modelUsage = event.model_usage;
+      }
+
+      // Handle partial streaming events (token-level chunks)
+      if (event.type === 'partial' && event.textChunk) {
+        // Start new text stream if needed (separate from thinking stream)
+        if (!currentTextMessageId) {
+          currentTextMessageId = generateId() as MessageID;
+          firstTokenTime = Date.now();
+          const ttfb = firstTokenTime - streamStartTime;
+          claudeStreamingDebug(`⏱️ [SDK] TTFB (text): ${ttfb}ms`);
+
+          if (streamingCallbacks) {
+            await streamingCallbacks.onStreamStart(currentTextMessageId, {
+              session_id: sessionId,
+              task_id: taskId,
+              role: MessageRole.ASSISTANT,
+              timestamp: new Date().toISOString(),
+            });
+          }
+        }
+
+        // Emit chunk immediately (no artificial delays - true streaming!)
+        if (streamingCallbacks) {
+          await streamingCallbacks.onStreamChunk(currentTextMessageId, event.textChunk);
+        }
+      }
+      // Handle complete message (save to database)
+      else if (event.type === 'complete' && event.content) {
+        // End text streaming if active (only for assistant messages)
+        if (
+          currentTextMessageId &&
+          streamingCallbacks &&
+          'role' in event &&
+          event.role === MessageRole.ASSISTANT
+        ) {
+          const streamEndTime = Date.now();
+          await streamingCallbacks.onStreamEnd(currentTextMessageId);
+          const totalTime = streamEndTime - streamStartTime;
+          const streamingTime = firstTokenTime ? streamEndTime - firstTokenTime : 0;
+          claudeStreamingDebug(
+            `⏱️ [Streaming] Complete - TTFB: ${firstTokenTime ? firstTokenTime - streamStartTime : 0}ms, streaming: ${streamingTime}ms, total: ${totalTime}ms`
+          );
+        }
+
+        // Handle based on role (narrow to complete event type)
+        if (event.type === 'complete' && event.role === MessageRole.ASSISTANT) {
+          // Type assertion needed because TypeScript can't properly narrow discriminated unions with optional properties
+          const completeEvent = event as Extract<ProcessedEvent, { type: 'complete' }>;
+          /**
+           * ID Selection Strategy:
+           * 1. Prefer text message ID (most common case - response with thinking)
+           * 2. Fallback to thinking ID (thinking-only message, rare)
+           * 3. Generate new ID (no streaming happened, very rare)
+           *
+           * This ensures:
+           * - UI sees consistent message ID from start to DB persistence
+           * - Thinking + text messages merge properly under one ID
+           * - Edge cases (no streaming) still work correctly
+           */
+          const assistantMessageId =
+            currentTextMessageId || currentThinkingMessageId || (generateId() as MessageID);
+
+          // Register tool uses for diff enrichment lookup
+          if (completeEvent.toolUses?.length) {
+            registerToolUses(completeEvent.toolUses);
+          }
+
+          // Truncate oversized content before persisting
+          const { blocks: safeAssistantContent } = truncateContentIfNeeded(
+            completeEvent.content,
+            completeEvent.toolUses
+          );
+
+          // Create assistant message with session guard (handles deleted sessions gracefully)
+          const created = await withFeathersSessionGuard(sessionId, this.sessionsRepo, async () => {
+            const persisted = await createAssistantMessage(
+              sessionId,
+              assistantMessageId,
+              safeAssistantContent,
+              completeEvent.toolUses,
+              taskId,
+              nextIndex++,
+              resolvedModel,
+              this.messagesService!,
+              this.tasksService,
+              completeEvent.parent_tool_use_id ?? null,
+              tokenUsage,
+              completeEvent.isSynthesizedResult
+            );
+            classifiedProviderFailureKind ??= getClassifiedProviderFailureKind(persisted);
+            return persisted;
+          });
+
+          if (created) {
+            assistantMessageIds.push(assistantMessageId);
+          }
+
+          // Reset all stream IDs for next message
+          // Both thinking and text streams are complete at this point
+          currentTextMessageId = null;
+          currentThinkingMessageId = null;
+          streamStartTime = Date.now();
+          firstTokenTime = null;
+          firstActivityTime = null;
+          apiWaitMessageSent = false; // Reset for next message cycle
+        } else if (event.type === 'complete' && event.role === MessageRole.USER) {
+          // Type assertion for user message
+          const completeEvent = event as Extract<ProcessedEvent, { type: 'complete' }>;
+
+          // Best-effort: enrich Edit/Write tool results with structuredPatch diff data
+          enrichToolResults(completeEvent.content);
+
+          // Truncate oversized tool results before persisting
+          const { blocks: safeUserContent } = truncateContentIfNeeded(
+            completeEvent.content,
+            undefined
+          );
+
+          // Create user message with session guard (handles deleted sessions gracefully)
+          await withFeathersSessionGuard(sessionId, this.sessionsRepo, async () => {
+            const userMessageId = generateId() as MessageID;
+            await createUserMessageFromContent(
+              sessionId,
+              userMessageId,
+              safeUserContent,
+              taskId,
+              nextIndex++,
+              this.messagesService!,
+              completeEvent.parent_tool_use_id ?? null
+            );
+          });
+          // Don't add to assistantMessageIds - these are user messages
+        } else if (event.type === 'complete' && event.role === MessageRole.SYSTEM) {
+          // Type assertion for system message
+          const completeEvent = event as Extract<ProcessedEvent, { type: 'complete' }>;
+
+          // Create system message with session guard (handles deleted sessions gracefully)
+          await withFeathersSessionGuard(sessionId, this.sessionsRepo, async () => {
+            const systemMessageId = generateId() as MessageID;
+            await createSystemMessage(
+              sessionId,
+              systemMessageId,
+              completeEvent.content,
+              taskId,
+              nextIndex++,
+              resolvedModel,
+              this.messagesService!
+            );
+
+            // End streaming for system messages (e.g., compaction complete)
+            // This ensures UI spinners stop when system events finish
+            if (streamingCallbacks) {
+              await streamingCallbacks.onStreamEnd(systemMessageId);
+            }
+          });
+          // Don't add to assistantMessageIds - these are system messages
+        }
+      }
+    }
+
+    if (hadError) {
+      if (classifiedProviderFailureKind) {
+        console.error(
+          `[claude-code] SDK result classified: subtype=${errorSubtype ?? 'unknown'} kind=${classifiedProviderFailureKind}`
+        );
+      } else {
+        console.error(
+          `[claude-code] SDK result indicates error: subtype=${errorSubtype ?? 'unknown'}, errors=${JSON.stringify(errorDetails)}`
+        );
+      }
+    }
+
+    return {
+      userMessageId: userMessage.message_id,
+      assistantMessageIds,
+      tokenUsage,
+      durationMs,
+      agentSessionId: capturedAgentSessionId,
+      contextWindow,
+      contextWindowLimit,
+      model: resolvedModel,
+      modelUsage,
+      rawSdkResponse: sanitizeClassifiedClaudeResponse(
+        rawSdkResponse,
+        classifiedProviderFailureKind
+      ),
+      rawContextUsage,
+      wasStopped,
+      hadError,
+      errorDetails: classifiedProviderFailureKind ? undefined : errorDetails,
+    };
+  }
+
+  /**
+   * Capture and store Agent SDK session_id for conversation continuity
+   * @private
+   */
+  private async captureAgentSessionId(sessionId: SessionID, agentSessionId: string): Promise<void> {
+    console.log(
+      `🔑 Captured Agent SDK session_id for Disco session ${sessionId}: ${agentSessionId}`
+    );
+
+    if (this.sessionsRepo) {
+      try {
+        // Guard: only set sdk_session_id if not already set (immutable after first capture)
+        const existingSession = await this.sessionsRepo.findById(sessionId);
+        if (existingSession?.sdk_session_id) {
+          if (existingSession.sdk_session_id === agentSessionId) {
+            console.log(`💾 Agent SDK session_id unchanged (already ${shortId(agentSessionId)})`);
+          } else {
+            console.warn(
+              `⚠️  Agent SDK returned new session_id ${shortId(agentSessionId)} but session already has ${shortId(existingSession.sdk_session_id)} — keeping original (sdk_session_id is immutable)`
+            );
+          }
+          return;
+        }
+
+        console.log(`📝 Setting sdk_session_id for first time: ${shortId(agentSessionId)}`);
+        const updated = await this.sessionsRepo.update(sessionId, {
+          sdk_session_id: agentSessionId,
+        });
+        console.log(`💾 Stored Agent SDK session_id in Disco session`);
+        console.log(`🔍 Verify: updated.sdk_session_id = ${updated.sdk_session_id}`);
+      } catch (error) {
+        // Session may have been deleted mid-execution - gracefully ignore
+        if (error instanceof Error && error.message.includes('not found')) {
+          console.log(
+            `⚠️  Session ${sessionId} not found (likely deleted mid-execution) - skipping agent session ID capture`
+          );
+          return;
+        }
+        // Re-throw other errors
+        throw error;
+      }
+    }
+  }
+
+  /**
+   * Execute a prompt against a session (non-streaming version)
+   *
+   * Creates user message, streams response from Claude, creates assistant messages.
+   * Agent SDK may return multiple assistant messages (e.g., tool invocation, then response).
+   * Returns user message ID and array of assistant message IDs.
+   *
+   * Also captures and stores the Agent SDK session_id for conversation continuity.
+   */
+  async executePrompt(
+    sessionId: SessionID,
+    prompt: string,
+    taskId?: TaskID,
+    permissionMode?: PermissionMode,
+    messageSource?: MessageSource
+  ): Promise<{
+    userMessageId: MessageID;
+    assistantMessageIds: MessageID[];
+    tokenUsage?: TokenUsage;
+    durationMs?: number;
+    agentSessionId?: string;
+    contextWindow?: number;
+    contextWindowLimit?: number;
+    model?: string;
+    modelUsage?: unknown;
+    rawSdkResponse?: unknown;
+    /** Raw SDK context usage snapshot from getContextUsage() — authoritative source */
+    rawContextUsage?: import('@disco/core/sdk').SDKControlGetContextUsageResponse;
+    wasStopped?: boolean;
+    hadError?: boolean;
+    /** Error details from SDK when hadError is true (e.g., errors array from error_during_execution) */
+    errorDetails?: string[];
+  }> {
+    if (!this.promptService || !this.messagesRepo) {
+      throw new Error('ClaudeTool not initialized with repositories for live execution');
+    }
+
+    if (!this.messagesService) {
+      throw new Error('ClaudeTool not initialized with messagesService for live execution');
+    }
+
+    // Hydrate only this Task while deriving the append position from one row.
+    const [existingMessages, sessionNextIndex] = await Promise.all([
+      taskId ? this.messagesRepo.findInitialUserMessagesByTaskId(taskId) : Promise.resolve([]),
+      this.messagesRepo.getNextIndexBySessionId(sessionId),
+    ]);
+    let nextIndex = sessionNextIndex;
+
+    // Create user message (or reuse the daemon's pre-write — see Alt D in
+    // docs/never-lose-prompt-design.md).
+    const userMessage = await createUserMessage(
+      sessionId,
+      prompt,
+      taskId,
+      nextIndex,
+      this.messagesService!,
+      { messageSource, existingMessages }
+    );
+    nextIndex = Math.max(nextIndex, userMessage.index + 1);
+
+    // Execute prompt via Agent SDK
+    const assistantMessageIds: MessageID[] = [];
+    let capturedAgentSessionId: string | undefined;
+    let resolvedModel: string | undefined;
+    let tokenUsage: TokenUsage | undefined;
+    let durationMs: number | undefined;
+    let contextWindow: number | undefined;
+    let contextWindowLimit: number | undefined;
+    let modelUsage: unknown | undefined;
+    let rawSdkResponse: import('@disco/core/sdk').SDKResultMessage | undefined;
+    let rawContextUsage: import('@disco/core/sdk').SDKControlGetContextUsageResponse | undefined;
+    let wasStopped = false;
+    let hadError = false;
+    let errorDetails: string[] | undefined;
+    let errorSubtype: string | undefined;
+    let classifiedProviderFailureKind: ClassifiedProviderFailureKind | undefined;
+
+    // Map our permission mode to Claude SDK's permission mode
+    const mappedPermissionMode = permissionMode
+      ? (mapPermissionMode(permissionMode, 'claude-code') as ClaudeSDKPermissionMode)
+      : undefined;
+
+    for await (const event of this.promptService.promptSessionStreaming(
+      sessionId,
+      prompt,
+      taskId,
+      mappedPermissionMode
+    )) {
+      // Detect if execution was stopped early
+      if (event.type === 'stopped') {
+        wasStopped = true;
+        console.log(`🛑 Claude execution was stopped for session ${sessionId}`);
+        continue; // Skip processing this event
+      }
+
+      // Capture resolved model from first event
+      if (!resolvedModel && 'resolvedModel' in event && event.resolvedModel) {
+        resolvedModel = event.resolvedModel;
+      }
+
+      // Capture Agent SDK session_id
+      if (!capturedAgentSessionId && 'agentSessionId' in event && event.agentSessionId) {
+        capturedAgentSessionId = event.agentSessionId;
+        await this.captureAgentSessionId(sessionId, capturedAgentSessionId);
+      }
+
+      // Handle rate_limit events in non-streaming path
+      if (event.type === 'rate_limit') {
+        const rateLimitEvent = event as Extract<ProcessedEvent, { type: 'rate_limit' }>;
+        const content = buildRateLimitContentBlock(rateLimitEvent);
+        console.log(`⏳ Rate limit → system message: ${content[0].text}`);
+
+        await withFeathersSessionGuard(sessionId, this.sessionsRepo, async () => {
+          const rateLimitMessageId = generateId() as MessageID;
+          await createSystemMessage(
+            sessionId,
+            rateLimitMessageId,
+            content,
+            taskId,
+            nextIndex++,
+            resolvedModel,
+            this.messagesService!
+          );
+        });
+      }
+
+      // Handle sdk_event in non-streaming path
+      if (event.type === 'sdk_event') {
+        const sdkEvent = event as Extract<ProcessedEvent, { type: 'sdk_event' }>;
+        console.log(`📡 SDK event → system message: ${sdkEvent.summary}`);
+
+        await withFeathersSessionGuard(sessionId, this.sessionsRepo, async () => {
+          const sdkEventMessageId = generateId() as MessageID;
+          await createSystemMessage(
+            sessionId,
+            sdkEventMessageId,
+            [
+              {
+                type: 'sdk_event',
+                text: sdkEvent.summary,
+                sdkType: sdkEvent.sdkType,
+                sdkSubtype: sdkEvent.sdkSubtype,
+                metadata: sdkEvent.rawMessage,
+              },
+            ],
+            taskId,
+            nextIndex++,
+            resolvedModel,
+            this.messagesService!
+          );
+        });
+      }
+
+      // Capture raw SDK response for token accounting
+      if (event.type === 'result') {
+        rawSdkResponse = event.raw_sdk_message;
+        // Detect error results from SDK (e.g., error_during_execution)
+        if (rawSdkResponse && 'subtype' in rawSdkResponse) {
+          const sdkResult = rawSdkResponse as {
+            subtype?: string;
+            errors?: string[];
+            is_error?: boolean;
+          };
+          if (sdkResult.subtype && sdkResult.subtype !== 'success') {
+            hadError = true;
+            errorSubtype = sdkResult.subtype;
+            errorDetails = sdkResult.errors;
+
+            // Create a system message with the error details so it's visible in the conversation UI
+            if (this.messagesService && sdkResult.errors?.length) {
+              const errorMessageId = generateId() as MessageID;
+              const persisted = await withFeathersSessionGuard(
+                sessionId,
+                this.sessionsRepo,
+                async () =>
+                  createSystemMessage(
+                    sessionId,
+                    errorMessageId,
+                    buildProviderFailureContent(sdkResult.subtype!, sdkResult.errors!),
+                    taskId,
+                    nextIndex++,
+                    resolvedModel,
+                    this.messagesService!,
+                    { is_provider_failure_result: true }
+                  )
+              );
+              classifiedProviderFailureKind ??= getClassifiedProviderFailureKind(persisted);
+            }
+          }
+        }
+      }
+
+      // Capture SDK context usage snapshot (authoritative context window data)
+      if (event.type === 'context_usage') {
+        rawContextUsage = event.contextUsage;
+      }
+
+      // Capture metadata from result events (SDK may not type this properly)
+      if ('token_usage' in event && event.token_usage) {
+        tokenUsage = extractTokenUsage(event.token_usage);
+      }
+      if ('duration_ms' in event && typeof event.duration_ms === 'number') {
+        durationMs = event.duration_ms;
+      }
+      if ('model_usage' in event && event.model_usage) {
+        // Save full model usage for later (per-model breakdown)
+        // Token accounting now handled by ClaudeCodeNormalizer.normalizeMultiModel()
+        modelUsage = event.model_usage;
+      }
+
+      // Skip partial events in non-streaming mode
+      if (event.type === 'partial') {
+        continue;
+      }
+
+      // Handle complete messages only
+      if (event.type === 'complete' && event.content) {
+        // Type assertion for complete event
+        const completeEvent = event as Extract<ProcessedEvent, { type: 'complete' }>;
+        const messageId = generateId() as MessageID;
+
+        // Create message with session guard (handles deleted sessions gracefully)
+        const created = await withFeathersSessionGuard(sessionId, this.sessionsRepo, async () => {
+          if (completeEvent.role === MessageRole.ASSISTANT) {
+            const persisted = await createAssistantMessage(
+              sessionId,
+              messageId,
+              completeEvent.content,
+              completeEvent.toolUses,
+              taskId,
+              nextIndex++,
+              resolvedModel,
+              this.messagesService!,
+              this.tasksService,
+              completeEvent.parent_tool_use_id ?? null,
+              tokenUsage,
+              completeEvent.isSynthesizedResult
+            );
+            classifiedProviderFailureKind ??= getClassifiedProviderFailureKind(persisted);
+            return true;
+          } else if (completeEvent.role === MessageRole.SYSTEM) {
+            // Handle system messages (compaction, etc.)
+            await createSystemMessage(
+              sessionId,
+              messageId,
+              completeEvent.content,
+              taskId,
+              nextIndex++,
+              resolvedModel,
+              this.messagesService!
+            );
+            return true;
+          }
+          return false;
+        });
+
+        if (created) {
+          assistantMessageIds.push(messageId);
+        }
+      }
+
+      // Handle system_complete events (compaction finished)
+      if (event.type === 'system_complete') {
+        const systemCompleteEvent = event as Extract<ProcessedEvent, { type: 'system_complete' }>;
+        if (systemCompleteEvent.systemType === 'compaction') {
+          console.log(`✅ Compaction complete`);
+          // Could update last system message with completion status
+          // For now, just log
+        }
+      }
+    }
+
+    if (hadError) {
+      if (classifiedProviderFailureKind) {
+        console.error(
+          `[claude-code] SDK result classified: subtype=${errorSubtype ?? 'unknown'} kind=${classifiedProviderFailureKind}`
+        );
+      } else {
+        console.error(
+          `[claude-code] SDK result indicates error: subtype=${errorSubtype ?? 'unknown'}, errors=${JSON.stringify(errorDetails)}`
+        );
+      }
+    }
+
+    return {
+      userMessageId: userMessage.message_id,
+      assistantMessageIds,
+      tokenUsage,
+      durationMs,
+      agentSessionId: capturedAgentSessionId,
+      contextWindow,
+      contextWindowLimit,
+      model: resolvedModel,
+      modelUsage,
+      rawSdkResponse: sanitizeClassifiedClaudeResponse(
+        rawSdkResponse,
+        classifiedProviderFailureKind
+      ),
+      rawContextUsage,
+      wasStopped,
+      hadError,
+      errorDetails: classifiedProviderFailureKind ? undefined : errorDetails,
+    };
+  }
+
+  /**
+   * Stop currently executing task in session
+   *
+   * Uses Claude Agent SDK's native interrupt() method to gracefully stop execution.
+   *
+   * @param sessionId - Session identifier
+   * @param taskId - Optional task ID (not used for Claude, session-level stop)
+   * @returns Success status and reason if failed
+   */
+  async stopTask(
+    sessionId: string,
+    taskId?: string
+  ): Promise<{
+    success: boolean;
+    partialResult?: Partial<{ taskId: string; status: 'completed' | 'failed' | 'cancelled' }>;
+    reason?: string;
+  }> {
+    if (!this.promptService) {
+      return {
+        success: false,
+        reason: 'ClaudeTool not initialized with prompt service',
+      };
+    }
+
+    const result = await this.promptService.stopTask(sessionId as SessionID);
+
+    if (result.success) {
+      return {
+        success: true,
+        partialResult: {
+          taskId: taskId || 'unknown',
+          status: 'cancelled',
+        },
+      };
+    }
+
+    return result;
+  }
+
+  // ============================================================
+  // Token Accounting (NEW)
+  // ============================================================
+
+  /**
+   * Normalize Claude SDK response to common format
+   *
+   * @deprecated This method is deprecated - use normalizeRawSdkResponse() from utils/sdk-normalizer instead
+   * This stub remains for API compatibility but should not be used.
+   */
+  normalizedSdkResponse(_rawResponse: RawSdkResponse): NormalizedSdkResponse {
+    throw new Error(
+      'normalizedSdkResponse() is deprecated - use normalizeRawSdkResponse() from utils/sdk-normalizer instead'
+    );
+  }
+
+  /**
+   * Compute context window usage for a Claude Code session
+   *
+   * Primary source: SDK's getContextUsage() (captured during prompt execution as context_usage event).
+   * This method serves as a fallback when getContextUsage() is not available.
+   *
+   * Uses the result message's usage data to estimate context:
+   *   context = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+   *
+   * This represents what's actually in the context window for the current turn,
+   * as input_tokens + cache tokens = total input context sent to the model.
+   *
+   * Note: In practice this fallback is rarely used — getContextUsage() from the SDK
+   * is the primary source and is captured via the context_usage event in prompt-service.
+   *
+   * @param sessionId - Session ID to compute context for
+   * @param _currentTaskId - Current task ID (unused in new implementation)
+   * @param currentRawSdkResponse - Raw SDK response for the current task
+   * @returns Promise resolving to computed context window usage in tokens
+   */
+  /**
+   * Fallback context window computation when getContextUsage() was unavailable.
+   * The primary path (SDK's getContextUsage()) is handled in base-executor.ts
+   * via rawContextUsage. This method is only called when that path fails.
+   *
+   * NOTE: The raw SDK response only has CUMULATIVE token counts across all API
+   * calls in a task (input + cache_creation + cache_read).  These sums routinely
+   * exceed the model's context window (e.g. 500k+ for a 200k window) because
+   * they count every API round-trip, not the current window snapshot.  Clamping
+   * the sum to maxContextWindow always produces exactly 100%, which is what
+   * caused the "everything shows 100%" bug.
+   *
+   * Rather than display a misleading value, return 0 so the UI shows "unknown"
+   * instead of a wrong percentage.  The SDK's getContextUsage() is the only
+   * reliable source for this metric.
+   */
+  async computeContextWindow(
+    sessionId: string,
+    _currentTaskId?: string,
+    _currentRawSdkResponse?: unknown
+  ): Promise<number> {
+    console.log(
+      `📊 Context window fallback for session ${sessionId}: returning 0 (cumulative token sums are unreliable for context window percentage)`
+    );
+    return 0;
+  }
+}

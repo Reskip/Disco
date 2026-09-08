@@ -1,0 +1,73 @@
+{
+  "name": "disco",
+  "version": "0.1.0",
+  "private": true,
+  "//": "This is the monorepo root. Published package version is in packages/disco-live/package.json",
+  "description": "Private multi-user browser workspace for standalone Codex conversations and persistent agents.",
+  "keywords": [
+    "ai",
+    "agents",
+    "orchestration",
+    "session-management"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Reskip/Disco.git"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "docs:dev": "pnpm --filter @disco/docs dev",
+    "docs:build": "pnpm --filter @disco/docs build",
+    "docs:generate": "pnpm --filter @disco/docs generate",
+    "lint": "biome check --diagnostic-level=warn --error-on-warnings . && node scripts/test-frontend-color-plugins.mjs",
+    "lint:fix": "biome check --write .",
+    "format": "prettier --write .",
+    "test": "turbo run test",
+    "test:postgres:integration": "node scripts/run-postgres-integration-tests.mjs",
+    "test:postgres:interruption": "node scripts/test-postgres-runner-interruption.mjs",
+    "test:postgres:docker": "bash scripts/test-postgres-docker.sh",
+    "typecheck": "turbo run typecheck --filter=!@disco/docs",
+    "check": "pnpm typecheck && pnpm lint && pnpm check:shortid && pnpm check:retired-method-carriers && pnpm check:multitenancy-boundaries && pnpm check:daemon-filesystem-boundaries && pnpm check:realtime-boundaries && turbo run build --filter=!@disco/docs",
+    "check:fix": "pnpm lint:fix && pnpm typecheck && pnpm check:shortid && pnpm check:retired-method-carriers && pnpm check:multitenancy-boundaries && pnpm check:daemon-filesystem-boundaries && pnpm check:realtime-boundaries && turbo run build --filter=!@disco/docs",
+    "check:clean": "turbo run typecheck build --filter=!@disco/docs --force && pnpm lint && pnpm check:shortid && pnpm check:daemon-filesystem-boundaries && pnpm check:realtime-boundaries",
+    "check:shortid": "node scripts/check-no-ad-hoc-shortid.mjs",
+    "check:retired-method-carriers": "node scripts/check-retired-method-carriers.mjs",
+    "clean": "turbo run clean && rm -rf node_modules",
+    "prepare": "husky",
+    "cli:link": "pnpm -C apps/disco-cli link --global",
+    "cli:unlink": "pnpm -C apps/disco-cli unlink --global",
+    "disco": "pnpm --filter @disco/cli dev",
+    "seed": "tsx scripts/seed.ts",
+    "load:fixtures": "tsx scripts/load-fixtures.ts",
+    "sync:disco-live-deps": "node scripts/sync-disco-live-deps.mjs",
+    "check:disco-live-deps": "node scripts/sync-disco-live-deps.mjs --check",
+    "check:multitenancy-boundaries": "node scripts/check-multitenancy-boundaries.mjs",
+    "check:daemon-filesystem-boundaries": "node scripts/check-daemon-filesystem-boundaries.mjs",
+    "check:realtime-boundaries": "node scripts/check-realtime-boundaries.mjs",
+    "test:daemon-filesystem-boundaries": "node --test scripts/check-daemon-filesystem-boundaries.test.mjs",
+    "test:sandbox-migration": "node --test scripts/strict-to-sandbox-migration.test.mjs",
+    "check:agentic-tool-packages": "node scripts/check-agentic-tool-packages.mjs",
+    "test:ha:docker": "node scripts/test-daemon-ha.mjs"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.7",
+    "@google-analytics/admin": "^9.2.0",
+    "husky": "^9.1.7",
+    "knip": "^5.85.0",
+    "lint-staged": "^17.2.0",
+    "postgres": "^3.4.9",
+    "prettier": "^3.9.6",
+    "rollup": "4.62.4",
+    "rollup-plugin-dts": "^6.5.1",
+    "socket.io-client": "^4.8.3",
+    "tsx": "4.23.11",
+    "turbo": "^2.10.9",
+    "typescript": "^6.0.3"
+  },
+  "packageManager": "pnpm@11.17.0",
+  "engines": {
+    "node": ">=22.12.0",
+    "pnpm": ">=11.17.0 <12"
+  }
+}

@@ -1,0 +1,1066 @@
+/**
+ * Users Service
+ *
+ * Handles user authentication and management.
+ * Only active when authentication is enabled via config.
+ */
+
+import {
+  materializeAgenticToolConfiguration,
+  normalizeAgenticToolModelConfiguration,
+} from '@disco/agentic-tools/config';
+import {
+  assertInlineAgenticConfigurationAllowed,
+  assertEnvVarScope,
+  getEnvVarBlockReason,
+  isEnvVarAllowed,
+  normalizeStoredEnvMap,
+  resolveUserEnvironment,
+  type StoredEnvVar,
+  validateEnvVar,
+} from '@disco/core/config';
+import {
+  and,
+  compare,
+  decryptApiKey,
+  deleteFrom,
+  encryptApiKey,
+  eq,
+  generateId,
+  hash,
+  insert,
+  select,
+  sql,
+  type TenantScopeAwareDatabase,
+  update,
+  users,
+} from '@disco/core/db';
+import { type Application, BadRequest, Forbidden, NotAuthenticated } from '@disco/core/feathers';
+import { isLikelyGitToken } from '@disco/core/git/pure';
+import { isInvalidModelConfigError } from '@disco/core/models';
+import type {
+  AgenticToolName,
+  AgenticToolsConfig,
+  AgenticToolsUpdate,
+  AuthenticatedParams,
+  EnvVarMetadata,
+  EnvVarScope,
+  InternalUser,
+  Paginated,
+  Params,
+  StoredAgenticTools,
+  User,
+  UserID,
+  UserRole,
+} from '@disco/core/types';
+import {
+  AGENTIC_TOOL_NAMES,
+  extractAgenticToolsPublicValues,
+  hasMinimumRole,
+  isValidExecutionHomeKey,
+  normalizeRole,
+  ROLES,
+  toAgenticToolsStatus,
+  WORKSPACE_DEFAULT_AGENTIC_CONFIGURATION,
+} from '@disco/core/types';
+
+function optionalNonNegativeInteger(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const numeric = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) return undefined;
+  return Math.floor(numeric);
+}
+
+function queryString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function normalizeLoginIdentifier(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (!/^[\p{L}\p{N}][\p{L}\p{N}\p{M}._-]{1,63}$/u.test(normalized)) {
+    throw new BadRequest(
+      'Username must be 2-64 letters, numbers, dots, underscores, or hyphens.'
+    );
+  }
+  return normalized;
+}
+
+function usersTableHasTenantColumn(): boolean {
+  return 'tenant_id' in (users as unknown as object);
+}
+
+function tenantPredicate(params?: Params) {
+  const tenantId = (params as { tenant?: { tenant_id?: string } } | undefined)?.tenant?.tenant_id;
+  if (!tenantId || !usersTableHasTenantColumn()) return undefined;
+  return eq((users as never as { tenant_id: never }).tenant_id, tenantId);
+}
+
+function withTenantPredicate(params: Params | undefined, predicate: unknown) {
+  const tenant = tenantPredicate(params);
+  return tenant ? and(predicate as never, tenant) : predicate;
+}
+
+function tenantInsertValues(params?: Params): { tenant_id?: string } {
+  const tenantId = (params as { tenant?: { tenant_id?: string } } | undefined)?.tenant?.tenant_id;
+  return tenantId && usersTableHasTenantColumn() ? { tenant_id: tenantId } : {};
+}
+
+/**
+ * Public User transport surface. UsersService is not a DrizzleService and
+ * defines no `update` — listing the verb here would make Feathers' hook wiring
+ * throw "Can not apply hooks. 'update' is not a function" at startup.
+ */
+export const USERS_SERVICE_TRANSPORT_METHODS = [
+  'find',
+  'get',
+  'create',
+  'patch',
+  'remove',
+  'getGitEnvironment',
+] as const;
+
+export const LOCAL_AUTH_LOOKUP_PARAM = Symbol('disco.users.local-auth-lookup');
+export const AUTH_INTERNAL_USER_LOOKUP_PARAM = Symbol('disco.users.auth-internal-lookup');
+
+export interface LocalAuthenticationLookupParams extends Params {
+  [LOCAL_AUTH_LOOKUP_PARAM]?: true;
+  [AUTH_INTERNAL_USER_LOOKUP_PARAM]?: true;
+}
+
+export function markLocalAuthenticationLookup(params: Params): void {
+  (params as LocalAuthenticationLookupParams)[LOCAL_AUTH_LOOKUP_PARAM] = true;
+}
+
+export function markAuthenticationUserLookup(params: Params): void {
+  (params as LocalAuthenticationLookupParams)[AUTH_INTERNAL_USER_LOOKUP_PARAM] = true;
+}
+
+export function isLocalAuthenticationLookup(params: Params | undefined): boolean {
+  return (
+    (params as LocalAuthenticationLookupParams | undefined)?.[LOCAL_AUTH_LOOKUP_PARAM] === true
+  );
+}
+
+export function isAuthenticationUserLookup(params: Params | undefined): boolean {
+  return (
+    (params as LocalAuthenticationLookupParams | undefined)?.[AUTH_INTERNAL_USER_LOOKUP_PARAM] ===
+    true
+  );
+}
+
+function shouldIncludeAuthMetadata(params: Params | undefined, includePassword = false): boolean {
+  return includePassword || !params?.provider || isAuthenticationUserLookup(params);
+}
+
+function isServiceAccount(params: Params | undefined): boolean {
+  return !!(params as AuthenticatedParams | undefined)?.user?._isServiceAccount;
+}
+
+function isAdmin(params: Params | undefined): boolean {
+  return hasMinimumRole((params as AuthenticatedParams | undefined)?.user?.role, ROLES.ADMIN);
+}
+
+function isSelfUsernameLookup(params: Params | undefined, username: string): boolean {
+  const requesterUsername = (params as AuthenticatedParams | undefined)?.user?.username;
+  return !!requesterUsername && requesterUsername.toLowerCase() === username.toLowerCase();
+}
+
+function ensureCanExactUsernameLookup(params: Params | undefined, username: string): void {
+  // Internal service calls are trusted and may perform exact-username lookups for
+  // auth/session bootstrap paths. External callers need an authenticated admin,
+  // service account, or a self lookup. The Feathers local strategy is the lone
+  // unauthenticated external path; it receives the password hash only inside the
+  // authentication pipeline and must never be exposed by /users responses.
+  if (!params?.provider || isLocalAuthenticationLookup(params)) return;
+
+  if (!(params as AuthenticatedParams | undefined)?.user) {
+    throw new NotAuthenticated('Authentication required');
+  }
+
+  if (isServiceAccount(params) || isAdmin(params) || isSelfUsernameLookup(params, username)) {
+    return;
+  }
+
+  throw new Forbidden('Exact username lookup is restricted');
+}
+
+/**
+ * Apply a per-tool credential patch to the encrypted-at-rest blob.
+ *
+ * Patch semantics (mirror UpdateUserInput.agentic_tools):
+ *   - `string` value → encrypt and set the field
+ *   - `null` value   → delete the field
+ *   - omitted field  → untouched
+ *   - if a tool's bucket becomes empty post-patch, the bucket is removed
+ *
+ * Returns the next stored shape (caller writes it back to `data.agentic_tools`).
+ */
+function applyAgenticToolsPatch(
+  current: StoredAgenticTools,
+  patch: AgenticToolsUpdate
+): StoredAgenticTools {
+  const next: StoredAgenticTools = { ...current };
+  for (const [tool, fields] of Object.entries(patch) as Array<
+    [AgenticToolName, Record<string, string | null> | undefined]
+  >) {
+    if (!fields) continue;
+    const bucket: Record<string, string> = { ...((next[tool] as Record<string, string>) ?? {}) };
+    for (const [field, value] of Object.entries(fields)) {
+      if (value === null || value === undefined) {
+        delete bucket[field];
+      } else {
+        try {
+          bucket[field] = encryptApiKey(value);
+          console.log(`🔐 Encrypted user agentic_tools.${tool}.${field}`);
+        } catch (err) {
+          console.error(`Failed to encrypt agentic_tools.${tool}.${field}:`, err);
+          throw new Error(`Failed to encrypt agentic_tools.${tool}.${field}`);
+        }
+      }
+    }
+    if (Object.keys(bucket).length > 0) {
+      (next as Record<string, Record<string, string>>)[tool] = bucket;
+    } else {
+      delete next[tool];
+    }
+  }
+  return next;
+}
+
+/**
+ * Create user input
+ */
+interface CreateUserData {
+  username: string;
+  password: string;
+  name?: string;
+  emoji?: string;
+  role?: UserRole;
+  unix_username?: string;
+  filesystem_home?: string;
+  must_change_password?: boolean;
+  avatar_url?: string | null;
+  avatar?: string | null;
+  avatar_source?: string | null;
+  avatar_source_id?: string | null;
+  avatar_synced_at?: string | null;
+}
+
+/**
+ * Update user input
+ */
+interface UpdateUserData {
+  username?: string;
+  password?: string;
+  name?: string;
+  emoji?: string;
+  role?: UserRole;
+  unix_username?: string;
+  filesystem_home?: string;
+  must_change_password?: boolean;
+  avatar_url?: string | null;
+  avatar?: string | null;
+  avatar_source?: string | null;
+  avatar_source_id?: string | null;
+  avatar_synced_at?: string | null;
+  preferences?: Record<string, unknown>;
+  onboarding_completed?: boolean;
+  /**
+   * Per-tool credential patch. Each tool's sub-object is a partial patch —
+   * `string` sets and encrypts, `null` clears, omitted fields are untouched.
+   * Field names are env var names exported into the SDK CLI environment.
+   */
+  agentic_tools?: AgenticToolsUpdate;
+  agentic_auth_methods?: import('@disco/core/types').AgenticAuthMethods;
+  // Environment variables for update (accepts plaintext, encrypted before storage)
+  env_vars?: Record<string, string | null>; // { "GITHUB_TOKEN": "ghp_...", "NPM_TOKEN": null }
+  // Per-var scope updates ('global' | 'session'). Applied after env_vars
+  // changes in the same PATCH. Scope for a var that doesn't exist is a no-op.
+  env_var_scopes?: Record<string, EnvVarScope>;
+  // Default agentic tool configurations
+  default_agentic_config?: import('@disco/core/types').DefaultAgenticConfig;
+  default_agentic_selection?: import('@disco/core/types').UserAgenticDefaultSelections;
+  default_mcp_server_ids?: string[];
+}
+
+function assertValidExecutionHomeKeyWrite(value: string | undefined): void {
+  if (value === undefined || isValidExecutionHomeKey(value)) return;
+  throw new BadRequest(
+    'Execution home key must start with a lowercase letter or underscore, contain only lowercase letters, numbers, hyphens, or underscores, and be at most 32 characters.'
+  );
+}
+
+/**
+ * Users Service Methods
+ */
+export class UsersService {
+  constructor(
+    protected db: TenantScopeAwareDatabase,
+    _app?: Application
+  ) {}
+
+  /**
+   * Find all users.
+   *
+   * Supports:
+   * - `username` exact lookup for authorized callers; password is included only
+   *   for the internal local-authentication lookup marker
+   * - `search` / `query` / `q` case-insensitive substring lookup across
+   *   name, username, and unix_username
+   * - Feathers-style `$limit` / `$skip`, plus plain `limit` / `skip` /
+   *   `offset` for MCP/client ergonomics
+   */
+  async find(params?: Params): Promise<Paginated<User>> {
+    const rawQuery = (params?.query ?? {}) as Record<string, unknown>;
+
+    const rawIdentifier = queryString(rawQuery.username);
+    const username = rawIdentifier ? normalizeLoginIdentifier(rawIdentifier) : undefined;
+    const includePassword = !!username && isLocalAuthenticationLookup(params);
+    const requesterId = (params as AuthenticatedParams | undefined)?.user?.user_id as
+      | UserID
+      | undefined;
+
+    let rows: (typeof users.$inferSelect)[];
+    if (username) {
+      ensureCanExactUsernameLookup(params, username);
+      // Find by username (for LocalStrategy / authorized exact lookup)
+      const row = await select(this.db)
+        .from(users)
+        .where(withTenantPredicate(params, eq(users.username, username)))
+        .one();
+      rows = row ? [row] : [];
+    } else {
+      // Find all
+      rows = tenantPredicate(params)
+        ? await select(this.db).from(users).where(tenantPredicate(params)).all()
+        : await select(this.db).from(users).all();
+    }
+
+    rows = rows.sort(
+      (a, b) => a.username.localeCompare(b.username) || a.user_id.localeCompare(b.user_id)
+    );
+
+    const search =
+      queryString(rawQuery.search) ?? queryString(rawQuery.query) ?? queryString(rawQuery.q);
+
+    if (search) {
+      const needle = search.toLowerCase();
+      rows = rows.filter((row) =>
+        [row.name, row.username, row.unix_username].some((value) =>
+          (value ?? '').toLowerCase().includes(needle)
+        )
+      );
+    }
+
+    const total = rows.length;
+    const skip =
+      optionalNonNegativeInteger(rawQuery.$skip) ??
+      optionalNonNegativeInteger(rawQuery.skip) ??
+      optionalNonNegativeInteger(rawQuery.offset) ??
+      0;
+    const limit =
+      optionalNonNegativeInteger(rawQuery.$limit) ?? optionalNonNegativeInteger(rawQuery.limit);
+    const pageRows =
+      limit === undefined ? rows.slice(skip) : rows.slice(skip, skip + Math.max(limit, 0));
+
+    const includeAuthMetadata = shouldIncludeAuthMetadata(params, includePassword);
+    const results = pageRows.map((row) =>
+      this.rowToUser(row, includePassword, requesterId, includeAuthMetadata)
+    );
+
+    return {
+      total,
+      limit: limit ?? results.length,
+      skip,
+      data: results,
+    };
+  }
+
+  /**
+   * Get user by ID
+   */
+  async get(id: UserID, params?: Params): Promise<User> {
+    const row = await select(this.db)
+      .from(users)
+      .where(withTenantPredicate(params, eq(users.user_id, id)))
+      .one();
+
+    if (!row) {
+      throw new Error(`User not found: ${id}`);
+    }
+
+    const requesterId = (params as AuthenticatedParams | undefined)?.user?.user_id as
+      | UserID
+      | undefined;
+    return this.rowToUser(row, false, requesterId, shouldIncludeAuthMetadata(params));
+  }
+
+  /**
+   * Create new user
+   */
+  async create(data: CreateUserData, params?: Params): Promise<User> {
+    assertValidExecutionHomeKeyWrite(data.unix_username);
+    const username = normalizeLoginIdentifier(data.username);
+    // Local usernames are case-insensitively unique.
+    const existing = await select(this.db)
+      .from(users)
+      .where(withTenantPredicate(params, sql`LOWER(${users.username}) = ${username}`))
+      .one();
+
+    if (existing) {
+      throw new BadRequest(`Username "${username}" is already in use.`);
+    }
+
+    // Hash password
+    const hashedPassword = await hash(data.password, 10);
+
+    // Create user
+    const now = new Date();
+    const user_id = generateId() as UserID;
+
+    const role = data.role || ROLES.MEMBER;
+    const defaultEmoji = role === ROLES.ADMIN ? '⭐' : '👤';
+
+    const row = await insert(this.db, users)
+      .values({
+        user_id,
+        username,
+        password: hashedPassword,
+        name: data.name,
+        emoji: data.emoji || defaultEmoji,
+        role,
+        unix_username: data.unix_username,
+        filesystem_home: data.filesystem_home,
+        must_change_password: data.must_change_password ?? false,
+        created_at: now,
+        updated_at: now,
+        ...tenantInsertValues(params),
+        data: {
+          avatar_url: data.avatar_url ?? data.avatar ?? undefined,
+          avatar_source:
+            data.avatar_source ?? ((data.avatar_url ?? data.avatar) ? 'manual' : undefined),
+          avatar_source_id: data.avatar_source_id ?? undefined,
+          avatar_synced_at: data.avatar_synced_at ?? undefined,
+          preferences: {},
+        },
+      })
+      .returning()
+      .one();
+
+    return this.rowToUser(row, false, undefined, shouldIncludeAuthMetadata(params));
+  }
+
+  /**
+   * Update user
+   */
+  async patch(id: UserID, data: UpdateUserData, params?: Params): Promise<User> {
+    assertValidExecutionHomeKeyWrite(data.unix_username);
+    const now = new Date();
+    const updates: Record<string, unknown> = { updated_at: now };
+
+    // Handle password separately (needs hashing)
+    if (data.password) {
+      updates.password = await hash(data.password, 10);
+      // Any password change requires fresh browser authentication; previously
+      // issued access and refresh tokens are rejected after this marker.
+      updates.tokens_valid_after = now;
+      // Auto-clear must_change_password when password is changed,
+      // UNLESS explicitly set in the same request (admin reset + force change scenario)
+      // e.g., `user update --password newpass --force-password-change` should keep flag true
+      updates.must_change_password = data.must_change_password ?? false;
+    } else if (data.must_change_password !== undefined) {
+      // Handle must_change_password flag when set WITHOUT password change (admin toggle)
+      updates.must_change_password = data.must_change_password;
+    }
+
+    // Reject case-insensitive collisions on rename.
+    if (data.username !== undefined) {
+      const username = normalizeLoginIdentifier(data.username);
+      const matches = await select(this.db)
+        .from(users)
+        .where(withTenantPredicate(params, sql`LOWER(${users.username}) = ${username}`))
+        .all();
+      if (matches.some((match: typeof users.$inferSelect) => match.user_id !== id)) {
+        throw new BadRequest(`Username "${username}" is already in use.`);
+      }
+      updates.username = username;
+    }
+    if (data.name) updates.name = data.name;
+    if (data.emoji !== undefined) updates.emoji = data.emoji;
+    if (data.role) updates.role = data.role;
+    if (data.unix_username !== undefined) updates.unix_username = data.unix_username;
+    if (data.filesystem_home !== undefined) updates.filesystem_home = data.filesystem_home;
+    if (data.onboarding_completed !== undefined)
+      updates.onboarding_completed = data.onboarding_completed;
+
+    // Update data blob
+    if (
+      data.avatar_url !== undefined ||
+      data.avatar !== undefined ||
+      data.avatar_source !== undefined ||
+      data.avatar_source_id !== undefined ||
+      data.avatar_synced_at !== undefined ||
+      data.preferences ||
+      data.agentic_tools ||
+      data.agentic_auth_methods ||
+      data.env_vars ||
+      data.env_var_scopes ||
+      data.default_agentic_config ||
+      data.default_agentic_selection ||
+      data.default_mcp_server_ids !== undefined
+    ) {
+      const current = await this.get(id, params);
+      const currentRow = await select(this.db)
+        .from(users)
+        .where(withTenantPredicate(params, eq(users.user_id, id)))
+        .one();
+      const currentData = currentRow?.data as {
+        avatar_url?: string;
+        avatar?: string;
+        avatar_source?: string;
+        avatar_source_id?: string;
+        avatar_synced_at?: string;
+        preferences?: Record<string, unknown>;
+        agentic_tools?: StoredAgenticTools;
+        agentic_auth_methods?: import('@disco/core/types').AgenticAuthMethods;
+        env_vars?: Record<string, StoredEnvVar>;
+        default_agentic_config?: import('@disco/core/types').DefaultAgenticConfig;
+        default_agentic_selection?: import('@disco/core/types').UserAgenticDefaultSelections;
+        default_mcp_server_ids?: string[];
+      };
+      const nextDefaultAgenticConfig = {
+        ...(data.default_agentic_config ?? current.default_agentic_config),
+      };
+      const nextDefaultAgenticSelection =
+        data.default_agentic_selection ?? current.default_agentic_selection;
+      const changedDefaultTools = AGENTIC_TOOL_NAMES.filter(
+        (tool) =>
+          (data.default_agentic_config !== undefined &&
+            JSON.stringify(current.default_agentic_config?.[tool]) !==
+              JSON.stringify(nextDefaultAgenticConfig[tool])) ||
+          (data.default_agentic_selection !== undefined &&
+            JSON.stringify(current.default_agentic_selection?.[tool]) !==
+              JSON.stringify(nextDefaultAgenticSelection?.[tool]))
+      );
+      for (const tool of changedDefaultTools) {
+        const selection = nextDefaultAgenticSelection?.[tool];
+        try {
+          if (selection?.source === 'preset' || selection?.source === 'workspace_default') {
+            await materializeAgenticToolConfiguration(this.db, {
+              tool,
+              source: {
+                reference:
+                  selection.source === 'preset'
+                    ? selection.preset_id
+                    : WORKSPACE_DEFAULT_AGENTIC_CONFIGURATION,
+              },
+              executionOwnerId: id,
+            });
+          } else {
+            await assertInlineAgenticConfigurationAllowed(this.db, tool);
+            const configuration = nextDefaultAgenticConfig[tool] ?? {};
+            const modelConfig = normalizeAgenticToolModelConfiguration(
+              tool,
+              configuration.modelConfig
+            );
+            nextDefaultAgenticConfig[tool] = {
+              ...configuration,
+              ...(modelConfig
+                ? {
+                    modelConfig: {
+                      mode: modelConfig.mode,
+                      model: modelConfig.model,
+                      ...(modelConfig.provider ? { provider: modelConfig.provider } : {}),
+                      ...(modelConfig.effort ? { effort: modelConfig.effort } : {}),
+                      ...(modelConfig.serviceTier
+                        ? { serviceTier: modelConfig.serviceTier }
+                        : {}),
+                      ...(modelConfig.advisorModel
+                        ? { advisorModel: modelConfig.advisorModel }
+                        : {}),
+                    },
+                  }
+                : {}),
+            };
+          }
+        } catch (error) {
+          if (isInvalidModelConfigError(error)) throw new BadRequest(error.message);
+          throw error;
+        }
+      }
+
+      // Handle per-tool credential patches (encrypt-on-write, drop-on-null).
+      const nextAgenticTools: StoredAgenticTools = data.agentic_tools
+        ? applyAgenticToolsPatch(currentData?.agentic_tools ?? {}, data.agentic_tools)
+        : (currentData?.agentic_tools ?? {});
+
+      // Handle env vars (encrypt before storage).
+      //
+      // Stored shape is `Record<name, StoredEnvVar>` where every record carries
+      // its encrypted value and supported scope.
+      const normalizedExisting = normalizeStoredEnvMap(currentData?.env_vars);
+      const nextEnvVars: Record<string, StoredEnvVar> = { ...normalizedExisting };
+
+      if (data.env_vars) {
+        for (const [key, value] of Object.entries(data.env_vars)) {
+          // Validate variable name
+          if (!isEnvVarAllowed(key)) {
+            const reason = getEnvVarBlockReason(key);
+            throw new Error(`Cannot set environment variable "${key}": ${reason}`);
+          }
+
+          // Git tokens are embedded into a git-credentials file and a clone URL
+          // at runtime. Reject at ingest anything that doesn't match the
+          // `isLikelyGitToken` shape so shell metacharacters / whitespace cannot
+          // smuggle in even if the credential-file path later regresses.
+          if ((key === 'GITHUB_TOKEN' || key === 'GH_TOKEN') && value) {
+            if (!isLikelyGitToken(value)) {
+              throw new Error(
+                `Invalid ${key}: must match [A-Za-z0-9_-]{20,255}. ` +
+                  `GitHub / GitLab tokens should not contain spaces, newlines, or special characters.`
+              );
+            }
+          }
+
+          if (value === null || value === undefined) {
+            // Clear variable
+            delete nextEnvVars[key];
+            console.log(`🗑️  Cleared user env var: ${key}`);
+          } else {
+            // Validate and encrypt
+            const errors = validateEnvVar(key, value);
+            if (errors.length > 0) {
+              const message = errors.map((e) => e.message).join('; ');
+              throw new Error(`Invalid environment variable: ${message}`);
+            }
+
+            try {
+              const prior = nextEnvVars[key];
+              nextEnvVars[key] = {
+                value_encrypted: encryptApiKey(value),
+                // Preserve existing scope if we're just rotating the value;
+                // default to 'global' for brand-new vars.
+                scope: prior?.scope ?? 'global',
+                extra_config: prior?.extra_config ?? null,
+              };
+              console.log(`🔐 Encrypted user env var: ${key}`);
+            } catch (err) {
+              console.error(`Failed to encrypt env var ${key}:`, err);
+              throw new Error(`Failed to encrypt environment variable: ${key}`);
+            }
+          }
+        }
+      }
+
+      // Apply per-var scope updates. Scopes are validated in the app layer
+      // (no SQL CHECK constraint) so new scope values don't require a migration.
+      if (data.env_var_scopes) {
+        for (const [key, scope] of Object.entries(data.env_var_scopes)) {
+          assertEnvVarScope(scope);
+          const existing = nextEnvVars[key];
+          if (!existing) {
+            // Scope update for a non-existent var — ignore silently; the UI
+            // should have created the var first.
+            console.warn(`[users] Ignoring scope update for unknown env var: ${key}`);
+            continue;
+          }
+          nextEnvVars[key] = { ...existing, scope };
+          console.log(`🔧 Updated scope for env var ${key}: ${scope}`);
+        }
+      }
+
+      const avatarUrlTouched = data.avatar_url !== undefined || data.avatar !== undefined;
+      const avatarCleared = data.avatar_url === null || data.avatar === null;
+      const inferredManualAvatarSource =
+        avatarUrlTouched && !avatarCleared && data.avatar_source === undefined;
+      const avatarSourceChanged =
+        data.avatar_source !== undefined &&
+        data.avatar_source !== null &&
+        data.avatar_source !== currentData.avatar_source;
+
+      updates.data = {
+        ...currentData,
+        avatar_url: avatarCleared
+          ? undefined
+          : (data.avatar_url ?? data.avatar ?? current.avatar_url),
+        // Deprecated legacy alias: read for back-compat, stop writing it on avatar updates.
+        avatar: undefined,
+        avatar_source:
+          data.avatar_source === null || avatarCleared
+            ? undefined
+            : data.avatar_source !== undefined
+              ? data.avatar_source
+              : inferredManualAvatarSource
+                ? 'manual'
+                : current.avatar_source,
+        avatar_source_id:
+          data.avatar_source_id === null ||
+          avatarCleared ||
+          inferredManualAvatarSource ||
+          (avatarSourceChanged && data.avatar_source_id === undefined)
+            ? undefined
+            : (data.avatar_source_id ?? current.avatar_source_id),
+        avatar_synced_at:
+          data.avatar_synced_at === null ||
+          avatarCleared ||
+          inferredManualAvatarSource ||
+          (avatarSourceChanged && data.avatar_synced_at === undefined)
+            ? undefined
+            : (data.avatar_synced_at ?? current.avatar_synced_at),
+        preferences: data.preferences ?? current.preferences,
+        agentic_tools: Object.keys(nextAgenticTools).length > 0 ? nextAgenticTools : undefined,
+        agentic_auth_methods:
+          data.agentic_auth_methods !== undefined
+            ? { ...current.agentic_auth_methods, ...data.agentic_auth_methods }
+            : current.agentic_auth_methods,
+        env_vars: Object.keys(nextEnvVars).length > 0 ? nextEnvVars : undefined,
+        default_agentic_config: nextDefaultAgenticConfig,
+        default_agentic_selection: nextDefaultAgenticSelection,
+        default_mcp_server_ids: data.default_mcp_server_ids ?? current.default_mcp_server_ids,
+      };
+    }
+
+    const row = await update(this.db, users)
+      .set(updates)
+      .where(eq(users.user_id, id))
+      .returning()
+      .one();
+
+    if (!row) {
+      throw new Error(`User not found: ${id}`);
+    }
+
+    const requesterId = (params as AuthenticatedParams | undefined)?.user?.user_id as
+      | UserID
+      | undefined;
+    return this.rowToUser(row, false, requesterId, shouldIncludeAuthMetadata(params));
+  }
+
+  /**
+   * Delete user
+   */
+  async remove(id: UserID, params?: Params): Promise<User> {
+    const user = await this.get(id, params);
+
+    await deleteFrom(this.db, users).where(eq(users.user_id, id)).run();
+
+    return user;
+  }
+
+  /**
+   * Find user by username (for authentication)
+   */
+  async findByUsername(value: string): Promise<User | null> {
+    const username = normalizeLoginIdentifier(value);
+    const row = await select(this.db)
+      .from(users)
+      .where(sql`LOWER(${users.username}) = ${username}`)
+      .one();
+
+    return row ? this.rowToUser(row) : null;
+  }
+
+  /**
+   * Verify password
+   */
+  async verifyPassword(user: User, password: string): Promise<boolean> {
+    // Need to fetch password from database (not in User type)
+    const row = await select(this.db).from(users).where(eq(users.user_id, user.user_id)).one();
+
+    if (!row) return false;
+
+    return compare(password, row.password);
+  }
+
+  /**
+   * Get a single decrypted credential field scoped to a specific agentic tool.
+   *
+   * Replaces the legacy flat-namespace `getApiKey(userId, 'ANTHROPIC_API_KEY')`
+   * call site with `(userId, 'claude-code', 'ANTHROPIC_API_KEY')` so an
+   * Anthropic key stored on the user can no longer leak into a Codex spawn.
+   */
+  async getToolConfigField<T extends AgenticToolName>(
+    userId: UserID,
+    tool: T,
+    field: keyof AgenticToolsConfig[T] & string
+  ): Promise<string | undefined> {
+    const row = await select(this.db).from(users).where(eq(users.user_id, userId)).one();
+    if (!row) return undefined;
+
+    const data = row.data as { agentic_tools?: StoredAgenticTools };
+    const encrypted = data.agentic_tools?.[tool]?.[field];
+    if (!encrypted) return undefined;
+
+    try {
+      return decryptApiKey(encrypted);
+    } catch (err) {
+      console.error(`Failed to decrypt agentic_tools.${tool}.${field} for user ${userId}:`, err);
+      return undefined;
+    }
+  }
+
+  /**
+   * Get the full decrypted credential bag for one tool. Used when spawning an
+   * SDK so the executor environment receives only that tool's env vars.
+   * Returns `null` if the user has no stored config for the tool.
+   */
+  async getToolConfig<T extends AgenticToolName>(
+    userId: UserID,
+    tool: T
+  ): Promise<AgenticToolsConfig[T] | null> {
+    const row = await select(this.db).from(users).where(eq(users.user_id, userId)).one();
+    if (!row) return null;
+
+    const data = row.data as { agentic_tools?: StoredAgenticTools };
+    const fields = data.agentic_tools?.[tool];
+    if (!fields || Object.keys(fields).length === 0) return null;
+
+    const out: Record<string, string> = {};
+    for (const [field, encrypted] of Object.entries(fields)) {
+      if (!encrypted) continue;
+      try {
+        out[field] = decryptApiKey(encrypted);
+      } catch (err) {
+        console.error(`Failed to decrypt agentic_tools.${tool}.${field} for user ${userId}:`, err);
+      }
+    }
+
+    return Object.keys(out).length > 0 ? (out as AgenticToolsConfig[T]) : null;
+  }
+
+  /**
+   * Get decrypted environment variables for a user (ALL scopes).
+   *
+   * Used by code paths that need the complete user environment. For Session
+   * spawning, prefer the scope-aware
+   * `resolveUserEnvironment(userId, db, { sessionId })` in core/config.
+   */
+  async getEnvironmentVariables(userId: UserID): Promise<Record<string, string>> {
+    const row = await select(this.db).from(users).where(eq(users.user_id, userId)).one();
+
+    if (!row) return {};
+
+    const data = row.data as { env_vars?: Record<string, StoredEnvVar> };
+    const stored = normalizeStoredEnvMap(data.env_vars);
+
+    const decryptedVars: Record<string, string> = {};
+    for (const [key, entry] of Object.entries(stored)) {
+      try {
+        decryptedVars[key] = decryptApiKey(entry.value_encrypted);
+      } catch (err) {
+        console.error(`Failed to decrypt env var ${key} for user ${userId}:`, err);
+        // Skip this variable (don't crash)
+      }
+    }
+
+    return decryptedVars;
+  }
+
+  /**
+   * Get the full resolved git environment for a user.
+   *
+   * Returns all user env vars (global scope) post-filterEnv, suitable for
+   * passing to git operations via `options.env`. The executor calls this via
+   * Feathers RPC so per-user credentials flow through the daemon's auth
+   * boundary instead of being baked into spawn payloads.
+   *
+   * Auth: service-account JWTs may fetch any user's env (executor is trusted).
+   * User JWTs may only fetch their own env.
+   */
+  async getGitEnvironment(
+    data: { userId: string },
+    params?: Params
+  ): Promise<Record<string, string>> {
+    const userId = data.userId as UserID;
+    const caller = (params as AuthenticatedParams | undefined)?.user;
+
+    // Auth check: service accounts can fetch any user's env;
+    // regular users can only fetch their own.
+    if (params?.provider) {
+      if (!caller) {
+        throw new NotAuthenticated('Authentication required');
+      }
+      const isService = !!(caller as { _isServiceAccount?: boolean })._isServiceAccount;
+      if (!isService && caller.user_id !== userId) {
+        throw new Forbidden("Cannot access another user's git environment");
+      }
+    }
+
+    return resolveUserEnvironment(userId, this.db);
+  }
+
+  /**
+   * Convert database row to User type
+   *
+   * @param row - Database row
+   * @param includePassword - Include password field (for authentication only)
+   * @param requesterId - Authenticated user making the request. When equal to
+   *   the row's `user_id`, the returned DTO includes `agentic_tools_public_values`
+   *   (decrypted plaintext for the whitelisted non-secret fields like
+   *   `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL`). For any other requester —
+   *   including admins viewing someone else's profile — public values are
+   *   omitted, since base URLs can leak internal hostnames.
+   */
+  private rowToUser(
+    row: typeof users.$inferSelect,
+    includePassword = false,
+    requesterId?: UserID,
+    includeAuthMetadata = true
+  ): (User | InternalUser) & { password?: string } {
+    const data = row.data as {
+      avatar_url?: string;
+      avatar?: string;
+      avatar_source?: string;
+      avatar_source_id?: string;
+      avatar_synced_at?: string;
+      preferences?: Record<string, unknown>;
+      agentic_tools?: StoredAgenticTools; // Encrypted per-tool credential blobs
+      agentic_auth_methods?: import('@disco/core/types').AgenticAuthMethods;
+      env_vars?: Record<string, StoredEnvVar>;
+      default_agentic_config?: import('@disco/core/types').DefaultAgenticConfig;
+      default_agentic_selection?: import('@disco/core/types').UserAgenticDefaultSelections;
+      default_mcp_server_ids?: string[];
+    };
+
+    const normalizedEnvVars = normalizeStoredEnvMap(data.env_vars);
+    const envVarMetadata: Record<string, EnvVarMetadata> | undefined =
+      Object.keys(normalizedEnvVars).length > 0
+        ? Object.fromEntries(
+            Object.entries(normalizedEnvVars).map(([name, entry]) => [
+              name,
+              { set: true, scope: entry.scope },
+            ])
+          )
+        : undefined;
+
+    const user: (User | InternalUser) & { password?: string } = {
+      user_id: row.user_id as UserID,
+      username: row.username,
+      name: row.name ?? undefined,
+      emoji: row.emoji ?? undefined,
+      role: normalizeRole(row.role ?? undefined),
+      unix_username: row.unix_username ?? undefined,
+      avatar_url: data.avatar_url ?? data.avatar,
+      avatar: data.avatar,
+      avatar_source: data.avatar_source,
+      avatar_source_id: data.avatar_source_id,
+      avatar_synced_at: data.avatar_synced_at,
+      preferences: data.preferences,
+      onboarding_completed: !!row.onboarding_completed,
+      must_change_password: !!row.must_change_password,
+      created_at: row.created_at,
+      updated_at: row.updated_at ?? undefined,
+      // Per-tool credential presence (boolean only — never expose decrypted values).
+      agentic_tools: toAgenticToolsStatus(data.agentic_tools),
+      agentic_auth_methods: data.agentic_auth_methods,
+      // Self-only: return plaintext for whitelisted non-secret fields
+      // (base URLs) so the UI can render the saved value back. Field-level
+      // secrets are NEVER on the whitelist; see `AGENTIC_TOOLS_PUBLIC_FIELDS`.
+      agentic_tools_public_values:
+        requesterId === row.user_id
+          ? extractAgenticToolsPublicValues(data.agentic_tools, decryptApiKey)
+          : undefined,
+      // Return env var metadata (presence + scope), NOT actual values
+      env_vars: envVarMetadata,
+      // Return default agentic config
+      default_agentic_config: data.default_agentic_config,
+      default_agentic_selection: data.default_agentic_selection,
+      default_mcp_server_ids: data.default_mcp_server_ids,
+    };
+
+    if (includeAuthMetadata && row.tokens_valid_after) {
+      (user as InternalUser).tokens_valid_after = new Date(row.tokens_valid_after);
+    }
+    if (includeAuthMetadata && 'tenant_id' in row) {
+      (user as InternalUser).tenant_id = row.tenant_id;
+    }
+
+    // Include password for authentication (FeathersJS LocalStrategy needs this)
+    if (includePassword) {
+      user.password = row.password;
+    }
+
+    return user;
+  }
+}
+
+/**
+ * User service with password field for authentication
+ * This version includes the password field for FeathersJS local strategy
+ */
+interface UserWithPassword extends InternalUser {
+  password: string;
+}
+
+/**
+ * Users service with authentication support
+ */
+class UsersServiceWithAuth extends UsersService {
+  /**
+   * Override get to include password for authentication
+   * (FeathersJS LocalStrategy needs this)
+   */
+  async getWithPassword(id: UserID): Promise<UserWithPassword> {
+    const row = await select(this.db).from(users).where(eq(users.user_id, id)).one();
+
+    if (!row) {
+      throw new Error(`User not found: ${id}`);
+    }
+
+    const data = row.data as {
+      avatar_url?: string;
+      avatar?: string;
+      avatar_source?: string;
+      avatar_source_id?: string;
+      avatar_synced_at?: string;
+      preferences?: Record<string, unknown>;
+      agentic_tools?: StoredAgenticTools;
+      env_vars?: Record<string, StoredEnvVar>;
+    };
+
+    const normalizedEnvVars = normalizeStoredEnvMap(data.env_vars);
+    const envVarMetadata: Record<string, EnvVarMetadata> | undefined =
+      Object.keys(normalizedEnvVars).length > 0
+        ? Object.fromEntries(
+            Object.entries(normalizedEnvVars).map(([name, entry]) => [
+              name,
+              { set: true, scope: entry.scope },
+            ])
+          )
+        : undefined;
+
+    return {
+      user_id: row.user_id as UserID,
+      username: row.username,
+      password: row.password, // Include for authentication
+      name: row.name ?? undefined,
+      emoji: row.emoji ?? undefined,
+      role: normalizeRole(row.role ?? undefined),
+      avatar_url: data.avatar_url ?? data.avatar,
+      avatar: data.avatar,
+      avatar_source: data.avatar_source,
+      avatar_source_id: data.avatar_source_id,
+      avatar_synced_at: data.avatar_synced_at,
+      preferences: data.preferences,
+      onboarding_completed: !!row.onboarding_completed,
+      must_change_password: !!row.must_change_password,
+      tokens_valid_after: row.tokens_valid_after ? new Date(row.tokens_valid_after) : undefined,
+      created_at: row.created_at,
+      updated_at: row.updated_at ?? undefined,
+      agentic_tools: toAgenticToolsStatus(data.agentic_tools),
+      env_vars: envVarMetadata,
+    };
+  }
+}
+
+/**
+ * Create users service
+ */
+export function createUsersService(
+  db: TenantScopeAwareDatabase,
+  app?: Application
+): UsersServiceWithAuth {
+  return new UsersServiceWithAuth(db, app);
+}

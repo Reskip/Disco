@@ -1,0 +1,47 @@
+import { Tabs } from 'nextra/components';
+
+<Tabs items={['npm (Recommended)', 'Docker Compose']} defaultIndex={0}>
+  <Tabs.Tab>
+    Most users should start here. It's the most universal path, and it's the one the rest of the docs assume.
+
+    Requires **Node.js ≥ 22.12** ([install](https://nodejs.org)) and **Git** on `PATH`. HTTPS remotes also require a working system CA trust store; SSH remotes require an SSH client and configured keys or agent access. Run `git --version` before `disco init`.
+
+    ```bash
+    # Install Disco
+    npm install -g disco-live
+
+    # First run
+    disco init
+    disco daemon start
+    disco open
+    ```
+
+  </Tabs.Tab>
+
+  <Tabs.Tab>
+    Evaluate Disco in a container — no Node install required. Runs the daemon (serving both the API and the UI) from the published `disco-live` npm package.
+
+    Requires **Docker** and **Docker Compose** ([install Docker](https://docs.docker.com/get-docker/)).
+
+    ```bash
+    git clone https://github.com/preset-io/disco.git
+    cd disco
+
+    # Set an admin password before first boot.
+    # Start from docker/.env.prod.example for the full list of options.
+    cp docker/.env.prod.example .env.prod
+    # Edit DISCO_ADMIN_PASSWORD and choose DISCO_AGENTIC_TOOLS before first boot.
+
+    docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+    ```
+
+    Open [http://localhost:3030](http://localhost:3030) and log in as `admin@disco.live` (health check: `curl http://localhost:3030/health`).
+
+    > **Skipped the password?** Disco generates one on first boot and writes it to `/home/disco/.disco/admin-credentials` inside the container — retrieve it with `docker compose -f docker-compose.prod.yml exec disco-prod cat /home/disco/.disco/admin-credentials`. Either way, this bootstrap only runs once, against an empty database; setting `DISCO_ADMIN_PASSWORD` later won't reset an existing user's password.
+
+    > `DISCO_AGENTIC_TOOLS` is the immutable fresh-install package policy. Set a comma-separated list, `all`, or `none`; the container defaults to the explicit safe value `none` when it is omitted. Changing the environment variable later does not rewrite existing config — edit `agentic_tools.installed` deliberately and run `disco install --sync` inside the container.
+
+    > For hot-reload dev environments, multi-branch setups, and PostgreSQL, see `docker/README.md` and the [Development Guide](/guide/development). For Kubernetes-style executor isolation, see [Containerized Execution](/guide/containerized-execution).
+
+  </Tabs.Tab>
+</Tabs>

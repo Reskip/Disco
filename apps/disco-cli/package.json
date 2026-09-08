@@ -1,0 +1,83 @@
+{
+  "name": "@disco/cli",
+  "version": "0.25.2",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "disco": "./bin/run.js"
+  },
+  "scripts": {
+    "build": "tsup && tsc --emitDeclarationOnly --declaration --declarationMap --noEmit false --incremental false",
+    "dev": "NODE_NO_WARNINGS=1 NODE_OPTIONS=\"${NODE_OPTIONS:+$NODE_OPTIONS }--conditions=source\" tsx bin/dev.ts",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@disco-live/client": "workspace:*",
+    "@disco/agentic-tool-opencode": "workspace:*",
+    "@disco/core": "workspace:*",
+    "@disco/git": "workspace:*",
+    "@disco/daemon": "workspace:*",
+    "@oclif/core": "^4.13.3",
+    "@oclif/plugin-help": "^6.2.56",
+    "chalk": "^5.6.2",
+    "cli-table3": "^0.6.5",
+    "inquirer": "^12.10.0",
+    "proper-lockfile": "4.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.6.0",
+    "@types/proper-lockfile": "4.1.4",
+    "@lydell/node-pty": "1.2.0-beta.15",
+    "glob": "^11.1.0",
+    "oclif": "^4.23.30",
+    "tsup": "^8.5.1",
+    "tsx": "4.23.11",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.10"
+  },
+  "oclif": {
+    "bin": "disco",
+    "dirname": "disco",
+    "commands": "./dist/commands",
+    "topicSeparator": " ",
+    "helpClass": "./dist/lib/help.js",
+    "hooks": {
+      "command_not_found": "./dist/hooks/command-not-found.js",
+      "prerun": "./dist/hooks/prerun.js"
+    },
+    "topics": {
+      "daemon": {
+        "description": "Manage the local daemon lifecycle"
+      },
+      "db": {
+        "description": "Manage local database migrations"
+      },
+      "local": {
+        "description": "Run local filesystem operations"
+      },
+      "mcp": {
+        "description": "Manage MCP servers"
+      },
+      "session": {
+        "description": "Inspect agent sessions"
+      },
+      "telemetry": {
+        "description": "Manage community telemetry"
+      },
+      "tenant": {
+        "description": "Manage local tenant data operations",
+        "subtopics": {
+          "gate": {
+            "description": "Manage tenant write gates"
+          }
+        }
+      },
+      "user": {
+        "description": "Manage user accounts"
+      }
+    }
+  }
+}

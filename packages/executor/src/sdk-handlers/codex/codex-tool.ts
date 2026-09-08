@@ -1,0 +1,1238 @@
+/**
+ * Codex Tool Implementation
+ *
+ * Current capabilities:
+ * - ✅ Live execution via OpenAI Codex SDK
+ * - ❌ Import sessions (deferred - need real session JSONL format)
+ * - ❌ Session creation (handled via live execution)
+ */
+
+import { execSync } from 'node:child_process';
+import { generateId, shortId } from '@disco/core/db';
+import type {
+  AgentRepository,
+  MCPOAuthAuthHeadersRepository,
+  MCPServerRepository,
+  MessagesRepository,
+  SessionMCPServerRepository,
+  SessionRepository,
+  UsersRepository,
+} from '../../db/feathers-repositories.js';
+import { truncateContentIfNeeded } from '../../services/tool-result-truncator.js';
+import type { NormalizedSdkResponse, RawSdkResponse } from '../../types/sdk-response.js';
+import type { TokenUsage } from '../../types/token-usage.js';
+import {
+  type ContextUsageSnapshot,
+  type Message,
+  type MessageID,
+  MessageRole,
+  type MessageSource,
+  type PermissionMode,
+  type SessionID,
+  type TaskID,
+  type TaskSteeringHint,
+} from '../../types.js';
+import {
+  clearEditFilesTurnBaseline,
+  clearToolInvocationState,
+  enrichContentBlocks,
+  refreshEditFilesTurnBaseline,
+  registerEditFilesTurnBaseline,
+  registerToolInvocationStart,
+} from '../base/diff-enrichment.js';
+import type {
+  ITool,
+  MessagesService,
+  StreamingCallbacks,
+  TasksService,
+  TasksStreamingService,
+  ToolCapabilities,
+} from '../base/index.js';
+import { buildAssistantMessageMetadata, patchTaskModelIfKnown } from '../base/model-recording.js';
+import type { NormalizedTokenUsageSample } from '../base/normalizer.interface.js';
+import { createSystemMessage, createUserMessage } from '../claude/message-builder.js';
+import { normalizeRawSdkResponse } from '../normalizer-factory.js';
+import { CodexPromptService } from './prompt-service.js';
+import { extractCodexContextSnapshotFromEvent, extractCodexContextWindowUsage } from './usage.js';
+
+interface CodexExecutionResult {
+  userMessageId: MessageID;
+  assistantMessageIds: MessageID[];
+  tokenUsage?: TokenUsage;
+  contextWindow?: number;
+  contextWindowLimit?: number;
+  model?: string;
+  rawSdkResponse?: unknown; // Raw SDK event from Codex
+  rawContextUsage?: ContextUsageSnapshot;
+  wasStopped?: boolean; // True if execution was stopped early via stopTask()
+}
+
+function shouldRefreshEditFilesBaselineAfterTool(toolName: string): boolean {
+  const normalized = toolName.toLowerCase();
+  if (normalized === 'edit_files') return false;
+
+  // Codex-native command execution is normalized to Bash. MCP tools are
+  // represented as "server.tool"; keep those conservative because an MCP can
+  // mutate the branch filesystem.
+  return normalized === 'bash' || toolName.includes('.');
+}
+
+const LIVE_TOKEN_USAGE_PATCH_INTERVAL_MS = 30_000;
+
+function tokenUsageSample(usage: TokenUsage, observedAt: string): NormalizedTokenUsageSample {
+  const inputTokens = Math.max(0, usage.input_tokens ?? 0);
+  const outputTokens = Math.max(0, usage.output_tokens ?? 0);
+  return {
+    observedAt,
+    inputTokens,
+    outputTokens,
+    totalTokens: Math.max(0, usage.total_tokens ?? inputTokens + outputTokens),
+    ...(usage.cache_read_tokens !== undefined
+      ? { cacheReadTokens: Math.max(0, usage.cache_read_tokens) }
+      : {}),
+    ...(usage.cache_creation_tokens !== undefined
+      ? { cacheCreationTokens: Math.max(0, usage.cache_creation_tokens) }
+      : {}),
+  };
+}
+
+/** Coalesce cumulative rollout checkpoints to at most one sample per 30-second bucket. */
+export function appendCodexTokenUsageSample(
+  samples: NormalizedTokenUsageSample[],
+  usage: TokenUsage,
+  observedAt: string
+): void {
+  const observedAtMs = Date.parse(observedAt);
+  if (!Number.isFinite(observedAtMs)) return;
+
+  const previous = samples.at(-1);
+  const next = tokenUsageSample(usage, new Date(observedAtMs).toISOString());
+  if (previous) {
+    const previousMs = Date.parse(previous.observedAt);
+    const previousBucket = Math.floor(previousMs / LIVE_TOKEN_USAGE_PATCH_INTERVAL_MS);
+    const nextBucket = Math.floor(observedAtMs / LIVE_TOKEN_USAGE_PATCH_INTERVAL_MS);
+    if (nextBucket < previousBucket) return;
+
+    next.inputTokens = Math.max(previous.inputTokens, next.inputTokens);
+    next.outputTokens = Math.max(previous.outputTokens, next.outputTokens);
+    next.totalTokens = Math.max(previous.totalTokens, next.totalTokens);
+    if (previous.cacheReadTokens !== undefined || next.cacheReadTokens !== undefined) {
+      next.cacheReadTokens = Math.max(previous.cacheReadTokens ?? 0, next.cacheReadTokens ?? 0);
+    }
+    if (previous.cacheCreationTokens !== undefined || next.cacheCreationTokens !== undefined) {
+      next.cacheCreationTokens = Math.max(
+        previous.cacheCreationTokens ?? 0,
+        next.cacheCreationTokens ?? 0
+      );
+    }
+
+    if (nextBucket === previousBucket) {
+      samples[samples.length - 1] = next;
+      return;
+    }
+  }
+  samples.push(next);
+}
+
+export class CodexTool implements ITool {
+  readonly toolType = 'codex' as const;
+  readonly name = 'OpenAI Codex';
+
+  private promptService?: CodexPromptService;
+  private messagesRepo?: MessagesRepository;
+  private sessionsRepo?: SessionRepository;
+  private messagesService?: MessagesService;
+  private tasksService?: TasksService;
+  private tasksStreamingService?: TasksStreamingService;
+  private activeSteerHandlers = new Map<SessionID, (hint: TaskSteeringHint) => Promise<void>>();
+
+  constructor(
+    messagesRepo?: MessagesRepository,
+    sessionsRepo?: SessionRepository,
+    sessionMCPServerRepo?: SessionMCPServerRepository,
+    apiKey?: string,
+    messagesService?: MessagesService,
+    tasksService?: TasksService,
+    tasksStreamingService?: TasksStreamingService,
+    useNativeAuth?: boolean,
+    mcpServerRepo?: MCPServerRepository,
+    usersRepo?: UsersRepository,
+    mcpOAuthAuthHeadersRepo?: MCPOAuthAuthHeadersRepository,
+    executorSessionToken?: string,
+    agentsRepo?: AgentRepository
+  ) {
+    this.messagesRepo = messagesRepo;
+    this.sessionsRepo = sessionsRepo;
+    this.messagesService = messagesService;
+    this.tasksService = tasksService;
+    this.tasksStreamingService = tasksStreamingService;
+
+    if (messagesRepo && sessionsRepo) {
+      this.promptService = new CodexPromptService(
+        messagesRepo,
+        sessionsRepo,
+        sessionMCPServerRepo,
+        apiKey,
+        mcpServerRepo,
+        usersRepo,
+        useNativeAuth ?? false,
+        tasksService,
+        mcpOAuthAuthHeadersRepo,
+        executorSessionToken,
+        agentsRepo
+      );
+    }
+  }
+
+  getCapabilities(): ToolCapabilities {
+    return {
+      supportsSessionCreate: false, // ❌ Not exposed (handled via executeTask)
+      supportsLiveExecution: true, // ✅ Via Codex SDK
+      supportsSessionFork: true,
+      supportsChildSpawn: false,
+      supportsGitState: false, // Disco manages git state
+      supportsStreaming: true, // ✅ Via runStreamed()
+    };
+  }
+
+  async checkInstalled(): Promise<boolean> {
+    try {
+      // Check if codex CLI is installed
+      execSync('which codex', { encoding: 'utf-8', windowsHide: true });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async emitTaskEvent(
+    event: 'tool:start' | 'tool:complete' | 'thinking:chunk',
+    data: Record<string, unknown>
+  ): Promise<void> {
+    if (this.tasksStreamingService) {
+      await this.tasksStreamingService.create({ event, data });
+      return;
+    }
+
+    // Fallback for environments that don't expose /tasks/streaming.
+    this.tasksService?.emit(event, data);
+  }
+
+  /** Persist an in-flight accounting snapshot for the 30-second usage dashboard. */
+  private async patchLiveTokenUsage(
+    taskId: TaskID,
+    usage: TokenUsage,
+    resolvedModel?: string,
+    contextUsage?: ContextUsageSnapshot,
+    samples?: readonly NormalizedTokenUsageSample[]
+  ): Promise<boolean> {
+    if (!this.tasksService) return false;
+    const normalized = normalizeRawSdkResponse(
+      'codex',
+      {
+        type: 'turn.completed',
+        usage: {
+          input_tokens: usage.input_tokens ?? 0,
+          cached_input_tokens: usage.cache_read_tokens ?? 0,
+          output_tokens: usage.output_tokens ?? 0,
+        },
+      },
+      { modelHint: resolvedModel }
+    );
+    if (!normalized) return false;
+    // Some protocol versions expose only total_tokens on an early snapshot.
+    // Preserve that authoritative total instead of replacing it with 0 + 0.
+    if (usage.total_tokens !== undefined) {
+      normalized.tokenUsage.totalTokens = usage.total_tokens;
+    }
+    if (contextUsage) {
+      normalized.contextWindowLimit = contextUsage.maxTokens;
+      normalized.contextUsageSnapshot = contextUsage;
+    }
+    if (samples && samples.length > 0) {
+      normalized.tokenUsageSamples = [...samples];
+    }
+
+    try {
+      await this.tasksService.patch(taskId, {
+        normalized_sdk_response: normalized,
+        ...(resolvedModel ? { model: resolvedModel } : {}),
+        ...(contextUsage ? { computed_context_window: contextUsage.totalTokens } : {}),
+      });
+      return true;
+    } catch (error) {
+      console.warn(
+        `[Codex] Live token usage snapshot failed for task ${shortId(taskId)}: ${error instanceof Error ? error.message : String(error)}`
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Execute a prompt against a session WITH real-time streaming
+   *
+   * Creates user message, streams response chunks from Codex, then creates complete assistant messages.
+   * Calls streamingCallbacks during message generation for real-time UI updates.
+   *
+   * @param sessionId - Session to execute prompt in
+   * @param prompt - User prompt text
+   * @param taskId - Optional task ID for linking messages
+   * @param permissionMode - Permission mode for tool execution ('ask' | 'auto' | 'allow-all')
+   * @param streamingCallbacks - Optional callbacks for real-time streaming (enables typewriter effect)
+   * @param abortController - Optional AbortController for cancellation support
+   * @returns User message ID and array of assistant message IDs
+   */
+  async executePromptWithStreaming(
+    sessionId: SessionID,
+    prompt: string,
+    taskId?: TaskID,
+    permissionMode?: PermissionMode,
+    streamingCallbacks?: StreamingCallbacks,
+    abortController?: AbortController,
+    messageSource?: MessageSource
+  ): Promise<CodexExecutionResult> {
+    if (!this.promptService || !this.messagesRepo) {
+      throw new Error('CodexTool not initialized with repositories for live execution');
+    }
+
+    if (!this.messagesService) {
+      throw new Error('CodexTool not initialized with messagesService for live execution');
+    }
+
+    // Hydrate only this Task while deriving the append position from one row.
+    const [existingMessages, sessionNextIndex] = await Promise.all([
+      taskId ? this.messagesRepo.findInitialUserMessagesByTaskId(taskId) : Promise.resolve([]),
+      this.messagesRepo.getNextIndexBySessionId(sessionId),
+    ]);
+    let nextIndex = sessionNextIndex;
+
+    // Create user message (or reuse the daemon's pre-write — see Alt D in
+    // docs/never-lose-prompt-design.md).
+    const userMessage = await createUserMessage(
+      sessionId,
+      prompt,
+      taskId,
+      nextIndex,
+      this.messagesService!,
+      { messageSource, existingMessages }
+    );
+    nextIndex = Math.max(nextIndex, userMessage.index + 1);
+
+    // Execute prompt via Codex SDK with streaming
+    const assistantMessageIds: MessageID[] = [];
+    let capturedThreadId: string | undefined;
+    let resolvedModel: string | undefined;
+    let currentMessageId: MessageID | null = null;
+    let tokenUsage: TokenUsage | undefined;
+    let rawContextUsage: ContextUsageSnapshot | undefined;
+    let _streamStartTime = Date.now();
+    let _firstTokenTime: number | null = null;
+    let rawSdkResponse: unknown;
+    let lastLiveUsagePatchAt = Number.NEGATIVE_INFINITY;
+    const tokenUsageSamples: NormalizedTokenUsageSample[] = [];
+    let lastPersistedUsageSampleKey: string | undefined;
+    let streamStarted = false; // tracks whether onStreamStart succeeded (for safe onStreamEnd)
+    let wasStopped = false;
+    let workingDirectory: string | undefined;
+    const pendingToolMessageIds = new Map<string, MessageID>();
+    const pendingSnapshotToolIds = new Set<string>();
+    let capacityRetryMessageId: MessageID | null = null;
+    const snapshotContext = { snapshotScope: sessionId };
+
+    const clearCapacityRetryStatus = async () => {
+      const messageId = capacityRetryMessageId;
+      capacityRetryMessageId = null;
+      if (!messageId) return;
+      try {
+        if (this.messagesService?.remove) {
+          await this.messagesService.remove(messageId);
+        } else {
+          await this.messagesService?.patch(messageId, {
+            content: [{ type: 'thinking', text: '模型已恢复，继续处理' }],
+            content_preview: '模型已恢复，继续处理',
+          });
+        }
+      } catch (error) {
+        console.warn('[Codex] Failed to clear capacity retry status:', error);
+      }
+    };
+
+    if (this.sessionsRepo) {
+      const session = await this.sessionsRepo.findById(sessionId);
+      workingDirectory = session?.working_directory ?? undefined;
+    }
+
+    await registerEditFilesTurnBaseline({
+      ...(workingDirectory ? { workingDirectory } : {}),
+      ...snapshotContext,
+    });
+
+    const steerHandler = async (hint: TaskSteeringHint) => {
+      // Reserve transcript order before awaiting the provider RPC. Assistant
+      // deltas can arrive immediately after turn/steer is accepted.
+      const hintIndex = nextIndex++;
+      const persistHint = async (failed: boolean) => {
+        await this.messagesService!.create({
+          message_id: hint.message_id,
+          session_id: sessionId,
+          task_id: taskId,
+          type: 'user',
+          role: MessageRole.USER,
+          index: hintIndex,
+          timestamp: hint.created_at,
+          content: hint.prompt,
+          content_preview: hint.prompt.substring(0, 200),
+          metadata: {
+            source: 'disco',
+            is_steering_hint: true,
+            ...(failed ? { steering_failed: true } : {}),
+          },
+        });
+      };
+
+      try {
+        await this.promptService!.steerTask(sessionId, hint.prompt);
+      } catch (error) {
+        try {
+          await persistHint(true);
+        } catch (persistError) {
+          console.error('[Codex] Failed to persist rejected supplemental guidance:', persistError);
+        }
+        throw error;
+      }
+
+      try {
+        await persistHint(false);
+      } catch (error) {
+        // The provider already accepted the guidance. Do not turn a transcript
+        // persistence issue into a false task failure.
+        console.error('[Codex] Failed to persist accepted supplemental guidance:', error);
+      }
+    };
+    this.activeSteerHandlers.set(sessionId, steerHandler);
+
+    try {
+      for await (const event of this.promptService.promptSessionStreaming(
+        sessionId,
+        prompt,
+        taskId,
+        permissionMode,
+        abortController,
+        streamingCallbacks?.onPulse
+      )) {
+        if (event.type === 'capacity_retry') {
+          const statusText = `模型繁忙，正在重试 ${event.attempt}/${event.maxAttempts}`;
+          if (capacityRetryMessageId) {
+            await this.messagesService.patch(capacityRetryMessageId, {
+              content: [{ type: 'thinking', text: statusText }],
+              content_preview: statusText,
+            });
+          } else {
+            capacityRetryMessageId = generateId() as MessageID;
+            await this.createAssistantMessage(
+              sessionId,
+              capacityRetryMessageId,
+              [{ type: 'thinking', text: statusText }],
+              undefined,
+              taskId,
+              nextIndex++,
+              resolvedModel
+            );
+          }
+          continue;
+        }
+
+        if (event.type === 'capacity_recovered') {
+          await clearCapacityRetryStatus();
+          continue;
+        }
+
+        if (event.type === 'usage_snapshot') {
+          tokenUsage = event.usage;
+          rawContextUsage = event.rawContextUsage ?? rawContextUsage;
+          resolvedModel = event.resolvedModel ?? resolvedModel;
+          appendCodexTokenUsageSample(
+            tokenUsageSamples,
+            event.usage,
+            event.observedAt ?? new Date().toISOString()
+          );
+          const now = Date.now();
+          if (
+            taskId &&
+            now - lastLiveUsagePatchAt >= LIVE_TOKEN_USAGE_PATCH_INTERVAL_MS &&
+            (await this.patchLiveTokenUsage(
+              taskId,
+              event.usage,
+              resolvedModel,
+              event.rawContextUsage,
+              tokenUsageSamples
+            ))
+          ) {
+            lastLiveUsagePatchAt = now;
+            lastPersistedUsageSampleKey = JSON.stringify(tokenUsageSamples.at(-1));
+          }
+          continue;
+        }
+
+        if (event.type === 'context_compacted') {
+          const compactionMessageId = generateId() as MessageID;
+          await createSystemMessage(
+            sessionId,
+            compactionMessageId,
+            [
+              {
+                type: 'system_complete',
+                systemType: 'compaction',
+                text: '上下文已自动压缩',
+              },
+            ],
+            taskId,
+            nextIndex++,
+            resolvedModel,
+            this.messagesService
+          );
+          continue;
+        }
+
+        // Detect if execution was stopped early
+        if (event.type === 'stopped') {
+          wasStopped = true;
+          console.log(`🛑 Codex execution was stopped for session ${sessionId}`);
+          for (const toolUseId of pendingSnapshotToolIds) {
+            clearToolInvocationState(toolUseId, snapshotContext);
+          }
+          pendingSnapshotToolIds.clear();
+          continue; // Skip processing this event
+        }
+        // Capture resolved model from partial/complete events
+        if (!resolvedModel) {
+          if (event.type === 'partial') {
+            resolvedModel = event.resolvedModel;
+          } else if (event.type === 'complete') {
+            resolvedModel = event.resolvedModel;
+          }
+        }
+
+        // Handle tool execution start (live UI indicator)
+        if (event.type === 'tool_start') {
+          registerToolInvocationStart(event.toolUse.id, event.toolUse.name, event.toolUse.input, {
+            ...(workingDirectory ? { workingDirectory } : {}),
+            ...snapshotContext,
+          });
+          pendingSnapshotToolIds.add(event.toolUse.id);
+
+          if (taskId) {
+            await this.emitTaskEvent('tool:start', {
+              task_id: taskId,
+              session_id: sessionId,
+              tool_use_id: event.toolUse.id,
+              tool_name: event.toolUse.name,
+            });
+          }
+
+          // Create tool row immediately so UI shows "running" state.
+          const toolMessageId = generateId() as MessageID;
+          await this.createAssistantMessage(
+            sessionId,
+            toolMessageId,
+            [
+              {
+                type: 'tool_use',
+                id: event.toolUse.id,
+                name: event.toolUse.name,
+                input: event.toolUse.input,
+              },
+            ],
+            [
+              {
+                id: event.toolUse.id,
+                name: event.toolUse.name,
+                input: event.toolUse.input,
+              },
+            ],
+            taskId,
+            nextIndex++,
+            resolvedModel
+          );
+          assistantMessageIds.push(toolMessageId);
+          pendingToolMessageIds.set(event.toolUse.id, toolMessageId);
+        }
+
+        if (event.type === 'complete' && event.usage) {
+          tokenUsage = event.usage;
+          appendCodexTokenUsageSample(tokenUsageSamples, event.usage, new Date().toISOString());
+        }
+
+        if (event.type === 'complete' && event.rawContextUsage) {
+          rawContextUsage = event.rawContextUsage;
+        }
+
+        // Capture raw SDK response for token accounting
+        if (event.type === 'complete' && event.rawSdkEvent) {
+          rawSdkResponse = event.rawSdkEvent;
+        }
+
+        // Capture Codex thread ID
+        if (!capturedThreadId && event.threadId) {
+          capturedThreadId = event.threadId;
+          await this.captureThreadId(sessionId, capturedThreadId);
+        }
+
+        // Handle app-server assistant deltas as they arrive from the HTTPS
+        // Responses stream. The SDK rollback transport still falls through to
+        // the completed-message path below.
+        if (event.type === 'partial' && event.textChunk) {
+          // Start new message if needed
+          if (!currentMessageId) {
+            const newMessageId = generateId() as MessageID;
+            _firstTokenTime = Date.now();
+
+            if (streamingCallbacks) {
+              try {
+                await streamingCallbacks.onStreamStart(newMessageId, {
+                  session_id: sessionId,
+                  task_id: taskId,
+                  role: MessageRole.ASSISTANT,
+                  timestamp: new Date().toISOString(),
+                });
+                // Only track message ID after successful start
+                currentMessageId = newMessageId;
+                streamStarted = true;
+              } catch (err) {
+                console.error(`[Codex] Streaming start failed for ${newMessageId}:`, err);
+                try {
+                  await streamingCallbacks.onStreamError(
+                    newMessageId,
+                    err instanceof Error ? err : new Error(String(err))
+                  );
+                } catch {
+                  /* best-effort */
+                }
+              }
+            } else {
+              currentMessageId = newMessageId;
+            }
+          }
+
+          // Emit chunk immediately
+          if (streamingCallbacks && currentMessageId) {
+            try {
+              await streamingCallbacks.onStreamChunk(currentMessageId, event.textChunk);
+            } catch (err) {
+              console.error(`[Codex] Streaming chunk failed for ${currentMessageId}:`, err);
+              try {
+                await streamingCallbacks.onStreamError(
+                  currentMessageId,
+                  err instanceof Error ? err : new Error(String(err))
+                );
+              } catch {
+                /* best-effort */
+              }
+            }
+          }
+        }
+        // Handle tool completion (create message immediately for live updates)
+        else if (event.type === 'tool_complete') {
+          if (taskId) {
+            await this.emitTaskEvent('tool:complete', {
+              task_id: taskId,
+              session_id: sessionId,
+              tool_use_id: event.toolUse.id,
+            });
+          }
+
+          const toolResultContent =
+            event.toolUse.output !== undefined
+              ? event.toolUse.output
+              : event.toolUse.status
+                ? `[${event.toolUse.status}]`
+                : '';
+          const toolContent = [
+            {
+              type: 'tool_use',
+              id: event.toolUse.id,
+              name: event.toolUse.name,
+              input: event.toolUse.input,
+            },
+            ...(event.toolUse.output !== undefined || event.toolUse.status
+              ? [
+                  {
+                    type: 'tool_result',
+                    tool_use_id: event.toolUse.id,
+                    content: toolResultContent,
+                    is_error: event.toolUse.status === 'failed' || event.toolUse.status === 'error',
+                  },
+                ]
+              : []),
+          ];
+
+          // Best-effort diff enrichment for Edit/Write tool results
+          enrichContentBlocks(toolContent, {
+            ...(workingDirectory ? { workingDirectory } : {}),
+            ...snapshotContext,
+          });
+          if (shouldRefreshEditFilesBaselineAfterTool(event.toolUse.name)) {
+            await refreshEditFilesTurnBaseline({
+              ...(workingDirectory ? { workingDirectory } : {}),
+              ...snapshotContext,
+            });
+          }
+          clearToolInvocationState(event.toolUse.id, snapshotContext);
+          pendingSnapshotToolIds.delete(event.toolUse.id);
+
+          // Truncate oversized tool results before persisting
+          const toolUseRefs = [
+            { id: event.toolUse.id, name: event.toolUse.name, input: event.toolUse.input },
+          ];
+          const { blocks: safeToolContent } = truncateContentIfNeeded(toolContent, toolUseRefs);
+
+          const existingToolMessageId = pendingToolMessageIds.get(event.toolUse.id);
+          if (existingToolMessageId) {
+            await this.messagesService?.patch(existingToolMessageId, {
+              content: safeToolContent as Message['content'],
+              content_preview:
+                typeof toolResultContent === 'string' ? toolResultContent.substring(0, 200) : '',
+            });
+            pendingToolMessageIds.delete(event.toolUse.id);
+          } else {
+            // Fallback path if start event wasn't observed.
+            const toolMessageId = generateId() as MessageID;
+            await this.createAssistantMessage(
+              sessionId,
+              toolMessageId,
+              safeToolContent as Array<{
+                type: string;
+                text?: string;
+                id?: string;
+                name?: string;
+                input?: Record<string, unknown>;
+              }>,
+              [
+                {
+                  id: event.toolUse.id,
+                  name: event.toolUse.name,
+                  input: event.toolUse.input,
+                },
+              ],
+              taskId,
+              nextIndex++,
+              resolvedModel
+            );
+            assistantMessageIds.push(toolMessageId);
+          }
+        }
+        // Handle complete message (save to database)
+        else if (event.type === 'complete' && event.content) {
+          const usageForMessage = event.usage ?? tokenUsage;
+          // Filter out tool_use and tool_result blocks (already saved via tool_complete events),
+          // but keep text + thinking blocks so Codex reasoning is visible in the UI.
+          const nonToolContent = event.content.filter(
+            block =>
+              block.type === 'text' || block.type === 'thinking' || block.type === 'file_citation'
+          );
+
+          // Only create message if there's non-tool content (not just tools)
+          if (nonToolContent.length > 0) {
+            // Extract full text for streaming callback
+            const fullText = nonToolContent
+              .filter(block => block.type === 'text')
+              .map(block => (block as { text?: string }).text || '')
+              .join('');
+            const fullThinking = nonToolContent
+              .filter(block => block.type === 'thinking')
+              .map(block => (block as { text?: string }).text || '')
+              .join('');
+
+            // Use existing message ID from streaming (if any) or generate new
+            const assistantMessageId = currentMessageId || (generateId() as MessageID);
+
+            // App-server normally opened this message through partial events.
+            // The complete-only fallback still sends one full chunk (for the
+            // operator-selectable SDK rollback transport and legacy events).
+            if (streamingCallbacks && fullText) {
+              try {
+                if (!currentMessageId) {
+                  // No partial path — send full start/chunk/end sequence
+                  await streamingCallbacks.onStreamStart(assistantMessageId, {
+                    session_id: sessionId,
+                    task_id: taskId,
+                    role: MessageRole.ASSISTANT,
+                    timestamp: new Date().toISOString(),
+                  });
+                  streamStarted = true;
+                  await streamingCallbacks.onStreamChunk(assistantMessageId, fullText);
+                }
+                // Only close stream if one was successfully started
+                if (streamStarted) {
+                  await streamingCallbacks.onStreamEnd(assistantMessageId);
+                }
+              } catch (err) {
+                console.error(`[Codex] Streaming callback failed for ${assistantMessageId}:`, err);
+                // Notify UI so it can clear spinner/pending state
+                try {
+                  await streamingCallbacks.onStreamError(
+                    assistantMessageId,
+                    err instanceof Error ? err : new Error(String(err))
+                  );
+                } catch {
+                  /* best-effort */
+                }
+              }
+            }
+
+            // Reasoning summaries still arrive as completed blocks here. Emit a
+            // synthetic thinking chunk until their delta path is wired separately.
+            if (streamingCallbacks && fullThinking && !fullText) {
+              try {
+                if (streamingCallbacks.onThinkingStart) {
+                  await streamingCallbacks.onThinkingStart(assistantMessageId, {});
+                }
+                if (streamingCallbacks.onThinkingChunk) {
+                  await streamingCallbacks.onThinkingChunk(assistantMessageId, fullThinking);
+                }
+                if (streamingCallbacks.onThinkingEnd) {
+                  await streamingCallbacks.onThinkingEnd(assistantMessageId);
+                }
+              } catch (err) {
+                console.error(`[Codex] Thinking callback failed for ${assistantMessageId}:`, err);
+              }
+            }
+
+            // Create complete message in DB (non-tool content only, tools already saved)
+            await this.createAssistantMessage(
+              sessionId,
+              assistantMessageId,
+              nonToolContent,
+              undefined, // No tool uses in this message (already saved separately)
+              taskId,
+              nextIndex++,
+              resolvedModel,
+              usageForMessage
+            );
+            assistantMessageIds.push(assistantMessageId);
+
+            // Reset for next message
+            currentMessageId = null;
+            streamStarted = false;
+          }
+
+          _streamStartTime = Date.now();
+          _firstTokenTime = null;
+        }
+      }
+    } finally {
+      await clearCapacityRetryStatus();
+      if (this.activeSteerHandlers.get(sessionId) === steerHandler) {
+        this.activeSteerHandlers.delete(sessionId);
+      }
+      for (const toolUseId of pendingSnapshotToolIds) {
+        clearToolInvocationState(toolUseId, snapshotContext);
+      }
+      pendingSnapshotToolIds.clear();
+      clearEditFilesTurnBaseline(snapshotContext);
+    }
+
+    // Always persist the terminal checkpoint, even when it lands less than 30
+    // seconds after the previous write. This prevents the last interval from
+    // disappearing when the base executor finalizes the task immediately.
+    if (
+      taskId &&
+      tokenUsage &&
+      tokenUsageSamples.length > 0 &&
+      JSON.stringify(tokenUsageSamples.at(-1)) !== lastPersistedUsageSampleKey
+    ) {
+      await this.patchLiveTokenUsage(
+        taskId,
+        tokenUsage,
+        resolvedModel,
+        rawContextUsage,
+        tokenUsageSamples
+      );
+    }
+
+    return {
+      userMessageId: userMessage.message_id,
+      assistantMessageIds,
+      tokenUsage,
+      // Codex SDK doesn't provide contextWindow/contextWindowLimit
+      contextWindow: undefined,
+      contextWindowLimit: undefined,
+      model: resolvedModel,
+      rawSdkResponse,
+      rawContextUsage,
+      wasStopped,
+    };
+  }
+
+  async steerTask(sessionId: SessionID, hint: TaskSteeringHint): Promise<void> {
+    const deadline = Date.now() + 15_000;
+    let handler = this.activeSteerHandlers.get(sessionId);
+    while (!handler && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 25));
+      handler = this.activeSteerHandlers.get(sessionId);
+    }
+    if (!handler) throw new Error('Codex turn is not ready to receive supplemental guidance');
+    await handler(hint);
+  }
+
+  /**
+   * Capture and store Codex thread ID for conversation continuity.
+   * Throws if the Codex CLI returned a different thread than the one we asked to resume,
+   * which means the original thread file was lost (e.g. container rebuild wiped /tmp).
+   * @private
+   */
+  private async captureThreadId(sessionId: SessionID, threadId: string): Promise<void> {
+    console.log(`🔑 Captured Codex thread ID for Disco session ${sessionId}: ${threadId}`);
+
+    if (this.sessionsRepo) {
+      const existingSession = await this.sessionsRepo.findById(sessionId);
+      if (existingSession?.sdk_session_id) {
+        if (existingSession.sdk_session_id !== threadId) {
+          const msg =
+            `Codex thread lost: asked to resume ${shortId(existingSession.sdk_session_id)} ` +
+            `but Codex started a new thread ${shortId(threadId)}. ` +
+            `The previous conversation history is no longer available (the thread file was likely deleted when the environment was rebuilt). ` +
+            `Please start a new session to continue.`;
+          console.error(`❌ ${msg}`);
+          throw new Error(msg);
+        }
+        return;
+      }
+      await this.sessionsRepo.update(sessionId, { sdk_session_id: threadId });
+      console.log(`💾 Stored Codex thread ID in Disco session`);
+    }
+  }
+
+  /**
+   * Create complete assistant message in database
+   * @private
+   */
+  private async createAssistantMessage(
+    sessionId: SessionID,
+    messageId: MessageID,
+    content: Array<{
+      type: string;
+      text?: string;
+      id?: string;
+      name?: string;
+      input?: Record<string, unknown>;
+      [key: string]: unknown;
+    }>,
+    toolUses: Array<{ id: string; name: string; input: Record<string, unknown> }> | undefined,
+    taskId: TaskID | undefined,
+    nextIndex: number,
+    resolvedModel?: string,
+    tokenUsage?: TokenUsage
+  ): Promise<Message> {
+    // Extract preview text (prefer normal text, then thinking text)
+    const textBlocks = content.filter(b => b.type === 'text').map(b => b.text || '');
+    const fullTextContent = textBlocks.join('');
+    const fallbackThinking = content
+      .filter(b => b.type === 'thinking')
+      .map(b => b.text || '')
+      .join('');
+    const contentPreview = (fullTextContent || fallbackThinking).substring(0, 200);
+
+    const message: Message = {
+      message_id: messageId,
+      session_id: sessionId,
+      type: 'assistant',
+      role: MessageRole.ASSISTANT,
+      index: nextIndex,
+      timestamp: new Date().toISOString(),
+      content_preview: contentPreview,
+      content: content as Message['content'],
+      tool_uses: toolUses,
+      task_id: taskId,
+      metadata: buildAssistantMessageMetadata({ model: resolvedModel, tokenUsage }),
+    };
+
+    await this.messagesService?.create(message);
+    await patchTaskModelIfKnown(this.tasksService, taskId, resolvedModel);
+
+    return message;
+  }
+
+  /**
+   * Execute a prompt against a session (non-streaming version)
+   *
+   * Creates user message, collects response from Codex, creates assistant messages.
+   * Returns user message ID and array of assistant message IDs.
+   *
+   * @param sessionId - Session to execute prompt in
+   * @param prompt - User prompt text
+   * @param taskId - Optional task ID for linking messages
+   * @param permissionMode - Permission mode for tool execution ('ask' | 'auto' | 'allow-all')
+   */
+  async executePrompt(
+    sessionId: SessionID,
+    prompt: string,
+    taskId?: TaskID,
+    permissionMode?: PermissionMode,
+    messageSource?: MessageSource
+  ): Promise<CodexExecutionResult> {
+    if (!this.promptService || !this.messagesRepo) {
+      throw new Error('CodexTool not initialized with repositories for live execution');
+    }
+
+    if (!this.messagesService) {
+      throw new Error('CodexTool not initialized with messagesService for live execution');
+    }
+
+    // Hydrate only this Task while deriving the append position from one row.
+    const [existingMessages, sessionNextIndex] = await Promise.all([
+      taskId ? this.messagesRepo.findInitialUserMessagesByTaskId(taskId) : Promise.resolve([]),
+      this.messagesRepo.getNextIndexBySessionId(sessionId),
+    ]);
+    let nextIndex = sessionNextIndex;
+
+    // Create user message (or reuse the daemon's pre-write — see Alt D in
+    // docs/never-lose-prompt-design.md).
+    const userMessage = await createUserMessage(
+      sessionId,
+      prompt,
+      taskId,
+      nextIndex,
+      this.messagesService!,
+      { messageSource, existingMessages }
+    );
+    nextIndex = Math.max(nextIndex, userMessage.index + 1);
+
+    // Execute prompt via Codex SDK
+    const assistantMessageIds: MessageID[] = [];
+    let capturedThreadId: string | undefined;
+    let resolvedModel: string | undefined;
+    let tokenUsage: TokenUsage | undefined;
+    let _contextWindow: number | undefined;
+    let _contextWindowLimit: number | undefined;
+    let rawSdkResponse: unknown;
+    let rawContextUsage: ContextUsageSnapshot | undefined;
+    let wasStopped = false;
+    let workingDirectory: string | undefined;
+    const snapshotContext = { snapshotScope: sessionId };
+
+    if (this.sessionsRepo) {
+      const session = await this.sessionsRepo.findById(sessionId);
+      workingDirectory = session?.working_directory ?? undefined;
+    }
+
+    await registerEditFilesTurnBaseline({
+      ...(workingDirectory ? { workingDirectory } : {}),
+      ...snapshotContext,
+    });
+
+    try {
+      for await (const event of this.promptService.promptSessionStreaming(
+        sessionId,
+        prompt,
+        taskId,
+        permissionMode
+      )) {
+        // Detect if execution was stopped early
+        if (event.type === 'stopped') {
+          wasStopped = true;
+          console.log(`🛑 Codex execution was stopped for session ${sessionId}`);
+          continue; // Skip processing this event
+        }
+
+        // Capture resolved model from partial/complete events
+        if (!resolvedModel) {
+          if (event.type === 'partial') {
+            resolvedModel = event.resolvedModel;
+          } else if (event.type === 'complete') {
+            resolvedModel = event.resolvedModel;
+          }
+        }
+
+        if (event.type === 'complete' && event.usage) {
+          tokenUsage = event.usage;
+        }
+
+        if (event.type === 'complete' && event.rawContextUsage) {
+          rawContextUsage = event.rawContextUsage;
+        }
+
+        // Capture raw SDK response for token accounting
+        if (event.type === 'complete' && event.rawSdkEvent) {
+          rawSdkResponse = event.rawSdkEvent;
+        }
+
+        // Capture Codex thread ID
+        if (!capturedThreadId && event.threadId) {
+          capturedThreadId = event.threadId;
+          await this.captureThreadId(sessionId, capturedThreadId);
+        }
+
+        // Skip partial and tool events in non-streaming mode
+        if (event.type === 'tool_complete') {
+          if (shouldRefreshEditFilesBaselineAfterTool(event.toolUse.name)) {
+            await refreshEditFilesTurnBaseline({
+              ...(workingDirectory ? { workingDirectory } : {}),
+              ...snapshotContext,
+            });
+          }
+          continue;
+        }
+
+        if (event.type === 'partial' || event.type === 'tool_start') {
+          continue;
+        }
+
+        // Handle complete messages only
+        if (event.type === 'complete' && event.content) {
+          enrichContentBlocks(event.content, {
+            ...(workingDirectory ? { workingDirectory } : {}),
+            ...snapshotContext,
+          });
+
+          const messageId = generateId() as MessageID;
+          const usageForMessage = event.usage ?? tokenUsage;
+          await this.createAssistantMessage(
+            sessionId,
+            messageId,
+            event.content,
+            event.toolUses,
+            taskId,
+            nextIndex++,
+            resolvedModel,
+            usageForMessage
+          );
+          assistantMessageIds.push(messageId);
+        }
+      }
+    } finally {
+      clearEditFilesTurnBaseline(snapshotContext);
+    }
+
+    return {
+      userMessageId: userMessage.message_id,
+      assistantMessageIds,
+      tokenUsage,
+      // Codex SDK doesn't provide contextWindow/contextWindowLimit
+      contextWindow: undefined,
+      contextWindowLimit: undefined,
+      model: resolvedModel,
+      rawSdkResponse,
+      rawContextUsage,
+      wasStopped,
+    };
+  }
+
+  /**
+   * Stop currently executing task in session
+   *
+   * Uses a flag-based approach to break the event loop on the next iteration.
+   *
+   * @param sessionId - Session identifier
+   * @param taskId - Optional task ID (not used for Codex, session-level stop)
+   * @returns Success status and reason if failed
+   */
+  async stopTask(
+    sessionId: string,
+    taskId?: string
+  ): Promise<{
+    success: boolean;
+    partialResult?: Partial<{ taskId: string; status: 'completed' | 'failed' | 'cancelled' }>;
+    reason?: string;
+  }> {
+    if (!this.promptService) {
+      return {
+        success: false,
+        reason: 'CodexTool not initialized with prompt service',
+      };
+    }
+
+    const result = this.promptService.stopTask(sessionId as SessionID);
+
+    if (result.success) {
+      return {
+        success: true,
+        partialResult: {
+          taskId: taskId || 'unknown',
+          status: 'cancelled',
+        },
+      };
+    }
+
+    return result;
+  }
+
+  // ============================================================
+  // Token Accounting (NEW)
+  // ============================================================
+
+  /**
+   * Normalize Codex SDK response to common format
+   *
+   * @deprecated This method is deprecated - use normalizeRawSdkResponse() from utils/sdk-normalizer instead
+   * This stub remains for API compatibility but should not be used.
+   */
+  normalizedSdkResponse(_rawResponse: RawSdkResponse): NormalizedSdkResponse {
+    throw new Error(
+      'normalizedSdkResponse() is deprecated - use normalizeRawSdkResponse() from utils/sdk-normalizer instead'
+    );
+  }
+
+  /**
+   * Last-resort context-window computation for Codex.
+   *
+   * The authoritative path is `rawContextUsage` (extracted from Codex CLI's
+   * `event_msg/token_count.last_token_usage` during the turn — see
+   * extractCodexContextSnapshotFromEvent). When that snapshot is present,
+   * base-executor uses it directly and this method is never called.
+   *
+   * This method only runs when no token_count events were captured (legacy
+   * Codex CLI versions, stream omissions, or stream errors). In that case we
+   * only trust explicit context-token fields. We deliberately DO NOT fall back
+   * to `turn.completed.usage.input_tokens`: observed Codex events can report
+   * >1M input tokens with most of them cached on a first visible prompt, and
+   * the SDK/CLI does not document that value as current context occupancy.
+   *
+   * @param sessionId - Session ID to compute context for
+   * @param currentTaskId - Unused; kept for interface consistency
+   * @param currentRawSdkResponse - Raw SDK response (turn.completed event)
+   * @returns Context usage in tokens; 0 if no usable signal
+   */
+  async computeContextWindow(
+    sessionId: string,
+    _currentTaskId?: string,
+    currentRawSdkResponse?: unknown
+  ): Promise<number> {
+    if (!currentRawSdkResponse) {
+      // Caller must always pass the current turn's raw response — querying the
+      // DB here can deadlock the pending task UPDATE on Postgres.
+      console.warn(
+        `⚠️  computeContextWindow called without currentRawSdkResponse for session ${sessionId}. ` +
+          'This should not happen during task completion. Returning 0 to avoid database deadlock.'
+      );
+      return 0;
+    }
+
+    // Best effort: if the raw response is a token_count event, lift the
+    // authoritative last_token_usage figure straight out of it.
+    const snapshot = extractCodexContextSnapshotFromEvent(currentRawSdkResponse);
+    if (snapshot) {
+      console.log(
+        `✅ Codex context window for session ${sessionId}: ${snapshot.totalTokens}/${snapshot.maxTokens} tokens (${snapshot.percentage}% used)`
+      );
+      return snapshot.totalTokens;
+    }
+
+    // Future/legacy explicit context-token payloads are OK. Plain
+    // turn.completed.usage.input_tokens is intentionally ignored by
+    // extractCodexContextWindowUsage().
+    const contextWindow = extractCodexContextWindowUsage(currentRawSdkResponse);
+    if (contextWindow !== undefined) {
+      console.warn(
+        `⚠️  Codex context window for session ${sessionId} came from an explicit context token field (${contextWindow}), ` +
+          'not from the authoritative token_count event_msg.'
+      );
+      return contextWindow;
+    }
+
+    console.warn(
+      `⚠️  Codex context window unavailable for session ${sessionId}: no token_count event_msg or explicit context-token field. Returning 0 so Disco hides context percentage instead of showing per-turn usage as context.`
+    );
+    return 0;
+  }
+}

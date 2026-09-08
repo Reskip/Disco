@@ -1,0 +1,120 @@
+/* biome-ignore-all lint/plugin/noFirstPartyCss: responsive agent avatar and emoji modal layout requires media-query selectors. */
+
+.disco-agent-avatar-editor {
+  margin-bottom: 20px;
+  padding: 14px;
+  border: 1px solid var(--ant-color-border-secondary);
+  border-radius: 12px;
+  background: var(--ant-color-fill-quaternary);
+}
+
+.disco-agent-avatar-preview {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 12px;
+}
+
+.disco-agent-avatar-circle {
+  flex: 0 0 auto;
+  border: 1px solid var(--ant-color-border-secondary);
+  background: var(--ant-color-bg-container);
+  color: var(--ant-color-text);
+  font-size: 32px;
+}
+
+.disco-agent-avatar-caption {
+  display: block;
+  margin-top: 2px;
+}
+
+.disco-agent-emoji-grid {
+  display: grid;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.disco-agent-emoji-grid > li {
+  display: flex;
+  min-width: 0;
+}
+
+.disco-agent-emoji-modal .ant-modal-body {
+  max-height: min(430px, calc(var(--disco-effective-vh, 100vh) - 170px));
+  overflow-y: auto;
+  padding-right: 10px;
+  scrollbar-width: thin;
+}
+
+.disco-agent-emoji-option {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  aspect-ratio: 1;
+  min-width: 0;
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 21px;
+  cursor: pointer;
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease,
+    transform 120ms ease;
+}
+
+.disco-agent-emoji-option:hover {
+  border-color: var(--ant-color-border);
+  background: var(--ant-color-fill-secondary);
+}
+
+.disco-agent-emoji-option.is-selected {
+  border-color: var(--ant-color-primary-border);
+  background: var(--ant-color-primary-bg);
+}
+
+.disco-agent-emoji-option:active {
+  transform: scale(0.94);
+}
+
+.disco-agent-avatar-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+@media (max-width: 520px), (max-width: 960px) and (max-height: 500px) {
+  .disco-agent-emoji-grid {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+  }
+
+  .disco-agent-avatar-preview {
+    align-items: flex-start;
+  }
+
+  .disco-agent-avatar-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .disco-agent-avatar-actions .ant-btn {
+    width: 100%;
+    min-height: 44px;
+  }
+
+  .disco-agent-avatar-actions > .ant-typography {
+    grid-column: 1 / -1;
+  }
+
+  .disco-agent-emoji-option {
+    min-height: 44px;
+  }
+}

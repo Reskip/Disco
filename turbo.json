@@ -1,0 +1,57 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalDependencies": ["**/.env.*local", "pnpm-lock.yaml"],
+  "globalPassThroughEnv": [
+    "DISCO_ADMIN_PASSWORD",
+    "DISCO_ALLOW_DEVELOPMENT_DEFAULT_ADMIN",
+    "DISCO_DB_DIALECT",
+    "DISCO_HA_INTEGRATION",
+    "DISCO_HA_INTEGRATION_FAILURES",
+    "DISCO_HA_INTEGRATION_START",
+    "DISCO_HA_NODE_ENV",
+    "DISCO_HA_PUBLIC_ORIGIN",
+    "DISCO_POSTGRES_TEST_CONCURRENCY",
+    "DISCO_POSTGRES_TEST_RUN_ID",
+    "DISCO_TEST_POSTGRES_ADMIN_URL",
+    "DISCO_TEST_POSTGRES_URL",
+    "BIOME_BIN",
+    "COMPOSE_PROJECT_NAME",
+    "DATABASE_URL",
+    "HA_DAEMON_A_PORT",
+    "HA_DAEMON_B_PORT",
+    "HA_PORT",
+    "HA_URL"
+  ],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", ".next/**", "build/**"]
+    },
+    "@disco/daemon#build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", ".next/**", "build/**"],
+      "env": ["DISCO_BUILD_SHA", "DISCO_BUILT_AT"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "lint": {
+      "dependsOn": ["^build"]
+    },
+    "typecheck": {
+      "cache": true,
+      "dependsOn": ["^build"],
+      "inputs": ["src/**/*.ts", "src/**/*.tsx", "tsconfig*.json", "package.json"]
+    },
+    "test": {
+      "dependsOn": ["^build"]
+    },
+    "@disco/executor#test": {
+      "dependsOn": ["build"]
+    },
+    "clean": {
+      "cache": false
+    }
+  }
+}

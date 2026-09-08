@@ -1,0 +1,46 @@
+{
+  "name": "@disco/executor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Disco executor process - isolated execution environment",
+  "license": "BUSL-1.1",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "disco-executor": "./bin/disco-executor"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test:runtime": "node scripts/runtime-smoke.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run && pnpm test:runtime",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@disco/agentic-tool-opencode": "workspace:*",
+    "@disco/agentic-tools": "workspace:*",
+    "@disco/core": "workspace:*",
+    "@disco/git": "workspace:*",
+    "diff": "^8.0.3",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@cursor/sdk": "^1.0.26",
+    "@google/gemini-cli-core": "^0.40.0",
+    "@google/genai": "^1.43.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@types/diff": "^6.0.0",
+    "@types/node": "^24.6.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.10",
+    "@github/copilot-sdk": "^0.2.2",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.197",
+    "@openai/codex-sdk": "^0.153.4"
+  },
+  "files": [
+    "dist",
+    "bin"
+  ]
+}

@@ -1,0 +1,211 @@
+import type { DiscoClient, Branch, Session, Task } from '@disco-live/client';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { App as AntApp } from 'antd';
+import type { ReactNode } from 'react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { AppActionsProvider } from '../../contexts/AppActionsContext';
+import { ConnectionProvider } from '../../contexts/ConnectionContext';
+import SessionPanel from './SessionPanel';
+
+vi.mock('../AutocompleteTextarea', () => ({
+  AutocompleteTextarea: () => <textarea aria-label="Prompt" />,
+}));
+
+vi.mock('../FileUpload', () => ({
+  FileUpload: () => null,
+  FileUploadButton: (props: { onClick?: () => void; disabled?: boolean }) => (
+    <button type="button" disabled={props.disabled} onClick={props.onClick}>
+      Upload Files
+    </button>
+  ),
+}));
+
+vi.mock('../ForkSpawnModal/ForkSpawnModal', () => ({
+  ForkSpawnModal: () => null,
+}));
+
+vi.mock('../MCPServer', () => ({
+  MCPServerPill: () => <span>MCP server</span>,
+}));
+
+vi.mock('../metadata', () => ({
+  CreatedByTag: () => <span>Created by test user</span>,
+}));
+
+vi.mock('../Pill', () => ({
+  ContextWindowPill: () => <span>Context window</span>,
+  TimerPill: () => <span>Timer</span>,
+  TokenCountPill: () => <span>Tokens</span>,
+}));
+
+vi.mock('../SessionIds', () => ({
+  SessionIdsButton: () => <span>Session IDs</span>,
+  SessionIdsList: () => <span>Session IDs List</span>,
+}));
+
+vi.mock('../ToolIcon', () => ({
+  ToolIcon: () => <span>Tool icon</span>,
+}));
+
+vi.mock('./SessionAttachmentsDropdown', () => ({
+  SessionAttachmentsDropdown: () => null,
+}));
+
+vi.mock('./SessionMcpFooterControl', () => ({
+  SessionMcpFooterControl: () => null,
+}));
+
+vi.mock('./SessionPanelContent', () => ({
+  SessionPanelContent: ({ footerSlot }: { footerSlot?: ReactNode }) => (
+    <>
+      <div>Session content</div>
+      {footerSlot}
+    </>
+  ),
+}));
+
+vi.mock('./SessionRunSettingsPopover', () => ({
+  SessionRunSettingsPopover: () => null,
+}));
+
+const reactive = vi.hoisted(() => ({ tasks: [] as Task[] }));
+vi.mock('../../hooks/useSharedReactiveSession', () => ({
+  useSharedReactiveSession: () => ({ state: { tasks: reactive.tasks } }),
+}));
+
+const connected = {
+  connected: true,
+  connecting: false,
+  outOfSync: false,
+  capturedSha: null,
+  currentSha: null,
+};
+
+const session = {
+  session_id: 'session-1',
+  branch_id: 'branch-1',
+  title: 'Terminal routing session',
+  agentic_tool: 'claude-code-cli',
+  status: 'idle',
+  archived: false,
+  created_at: '2026-06-24T00:00:00.000Z',
+  last_updated: '2026-06-24T00:00:00.000Z',
+} as unknown as Session;
+
+const branch = {
+  branch_id: 'branch-1',
+  board_id: 'board-1',
+  name: 'feature/same-name',
+  path: '/tmp/feature-same-name',
+  filesystem_status: 'ready',
+  archived: false,
+} as unknown as Branch;
+
+function renderPanel({
+  onOpenTerminal = vi.fn(),
+  client = null,
+  activeSession = session,
+}: {
+  onOpenTerminal?: ReturnType<typeof vi.fn>;
+  client?: DiscoClient | null;
+  activeSession?: Session;
+} = {}) {
+  render(
+    <ConnectionProvider value={connected}>
+      <AppActionsProvider value={{ onOpenTerminal }}>
+        <AntApp>
+          <SessionPanel
+            client={client}
+            session={activeSession}
+            branch={branch}
+            open
+            onClose={vi.fn()}
+          />
+        </AntApp>
+      </AppActionsProvider>
+    </ConnectionProvider>
+  );
+  return { onOpenTerminal };
+}
+
+describe('SessionPanel historical runtime handling and terminal actions', () => {
+  afterEach(() => {
+    reactive.tasks = [];
+    vi.restoreAllMocks();
+  });
+
+  it('keeps removed-runtime history visible without a prompt composer', () => {
+    renderPanel();
+
+    expect(screen.getByText('历史会话：原执行环境已移除')).toBeVisible();
+    expect(screen.getByText(/历史内容仍可阅读/)).toBeVisible();
+    expect(screen.queryByLabelText('Prompt')).not.toBeInTheDocument();
+    expect(screen.getByText('Session content')).toBeVisible();
+  });
+
+  it('does not expose branch terminal actions in the conversation interface', () => {
+    const { onOpenTerminal } = renderPanel();
+
+    expect(screen.queryByRole('img', { name: 'ellipsis' })).not.toBeInTheDocument();
+    expect(screen.queryByText('Open terminal')).not.toBeInTheDocument();
+    expect(onOpenTerminal).not.toHaveBeenCalled();
+  });
+
+  it('surfaces force-fail errors', async () => {
+    reactive.tasks = [
+      {
+        task_id: '018f0000-0000-7000-8000-000000000001',
+        status: 'stopping',
+        sdk_failure: { termination: 'unverified' },
+        termination_request: {
+          cause: 'user_stop',
+          requested_at: '2026-06-24T00:00:01.000Z',
+        },
+      } as Task,
+    ];
+    const create = vi.fn().mockRejectedValue(new Error('denied'));
+    const nativePrompt = vi.spyOn(window, 'prompt');
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    renderPanel({
+      client: {
+        service: () => ({ create, on: vi.fn(), off: vi.fn() }),
+      } as unknown as DiscoClient,
+      activeSession: { ...session, status: 'stopping', agentic_tool: 'codex' },
+    });
+
+    fireEvent.click(await screen.findByRole('button', { name: '停止' }));
+
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    expect(screen.getByText('确定强制结束任务吗？')).toBeInTheDocument();
+    expect(screen.getByText('执行器是否已经停止无法确认')).toBeInTheDocument();
+    expect(screen.getByText(/无法保证系统进程已经终止/)).toBeInTheDocument();
+    const forceFail = screen.getByRole('button', { name: '强制结束' });
+    expect(forceFail).toBeDisabled();
+    const confirmation = screen.getByRole('textbox', {
+      name: '输入 STOP 确认强制结束',
+    });
+    await waitFor(() => expect(confirmation).toHaveFocus());
+    fireEvent.click(screen.getByRole('button', { name: /取\s*消/ }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: '停止' }));
+    const reopenedConfirmation = await screen.findByRole('textbox', {
+      name: '输入 STOP 确认强制结束',
+    });
+    const reopenedForceFail = screen.getByRole('button', { name: '强制结束' });
+    expect(reopenedForceFail).toBeDisabled();
+    fireEvent.change(reopenedConfirmation, { target: { value: 'STOP' } });
+    expect(reopenedForceFail).toBeEnabled();
+    fireEvent.keyDown(reopenedConfirmation, { key: 'Enter', code: 'Enter' });
+
+    await waitFor(() => expect(create).toHaveBeenCalledOnce());
+    expect(create).toHaveBeenCalledWith({
+      force_unverified: true,
+      confirmation: 'STOP',
+      task_id: '018f0000-0000-7000-8000-000000000001',
+      termination_requested_at: '2026-06-24T00:00:01.000Z',
+    });
+    expect(nativePrompt).not.toHaveBeenCalled();
+    expect(await screen.findByText('强制结束失败，可以再试一次。')).toBeVisible();
+  });
+});

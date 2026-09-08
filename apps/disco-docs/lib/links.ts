@@ -1,0 +1,42 @@
+/**
+ * Centralized external links for disco-docs.
+ *
+ * Update DISCORD_INVITE_URL here when the invite link changes.
+ * NOTE: Markdown files (*.md, *.mdx) also reference this URL
+ * and must be updated separately via find-replace.
+ */
+
+export const DISCORD_INVITE_URL = 'https://discord.gg/Qh4TrFQZpd';
+export const GITHUB_REPO_URL = 'https://github.com/preset-io/disco';
+
+// UTM suffix for links into preset.io, so Preset's Google Analytics can
+// attribute traffic coming from Disco surfaces. Append per placement via
+// `presetUtm(<placement>)`; utm_content carries the placement slug.
+// JSON-LD organization URLs deliberately stay clean — schema.org URLs are
+// entity identifiers, not navigation.
+const PRESET_UTM_BASE = 'utm_source=disco.live&utm_medium=referral&utm_campaign=disco-docs';
+export const presetUtm = (content: string, hasQuery = false): string =>
+  `${hasQuery ? '&' : '?'}${PRESET_UTM_BASE}&utm_content=${content}`;
+
+// Preset home — used by the footer credit (logo + text link).
+export const PRESET_URL = 'https://preset.io';
+
+// Disco Cloud private beta interest form (Preset landing page, replaces
+// the legacy Google Forms link). Consumed by CloudInviteCTA in the
+// disco-cloud blog post. Note: disco-openclaw.mdx still has an inline
+// link to the legacy Google Forms URL and is not updated here.
+export const DISCO_CLOUD_INVITE_URL = `https://preset.io/contact-us-about-disco/${presetUtm('cloud-invite-cta')}`;
+
+// Disco Cloud demo / contact link (HubSpot meetings scheduler).
+export const DISCO_CLOUD_DEMO_URL = 'https://meetings-na2.hubspot.com/zane-aitken/disco-demo';
+
+// HubSpot contact form GUID (portal 246818610, region na2). Shared between
+// HubSpotForm (which renders it) and the GTM form-submission tracking script
+// in app/layout.tsx (which matches on it), so there's one source of truth
+// for the ID both sides need to agree on. Edit the form itself at
+// https://app-na2.hubspot.com/forms/246818610/editor/56f5b614-72f0-4412-9247-33b53715fda4/edit
+export const HUBSPOT_FORM_ID = '56f5b614-72f0-4412-9247-33b53715fda4';
+
+// Preset blog post defining the AI Enablement Engineer — Disco's target
+// persona. Linked from landing-page copy.
+export const AI_ENABLEMENT_POST_URL = `https://preset.io/blog/ai-enablement-engineer/${presetUtm('ai-enablement-post')}`;

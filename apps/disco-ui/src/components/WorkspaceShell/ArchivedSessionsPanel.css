@@ -1,0 +1,221 @@
+/* biome-ignore-all lint/plugin/noFirstPartyCss: archive management is a dense desktop settings surface. */
+
+.disco-archives-panel {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.disco-archives-heading,
+.disco-archives-preview-toolbar,
+.disco-archives-preview-actions,
+.disco-archives-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.disco-archives-heading,
+.disco-archives-preview-toolbar,
+.disco-archives-summary {
+  justify-content: space-between;
+}
+
+.disco-archives-heading .ant-typography {
+  margin: 0;
+}
+
+.disco-archives-filters {
+  display: grid;
+  grid-template-columns: minmax(210px, 1fr) minmax(320px, 1.3fr) 128px 122px;
+  gap: 8px;
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.disco-archives-date-range {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: var(--ant-color-text-secondary);
+}
+
+.disco-archives-date-range .ant-input {
+  min-width: 0;
+  font-size: 12px;
+}
+
+.disco-archives-summary {
+  min-height: 24px;
+}
+
+.disco-archives-summary .ant-btn {
+  height: 24px;
+  padding-block: 0;
+}
+
+.disco-archives-list {
+  min-height: 180px;
+  flex: 1;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+  border: 1px solid var(--ant-color-border-secondary);
+  border-radius: 12px;
+  background: var(--ant-color-bg-container);
+}
+
+.disco-archives-list > .ant-empty {
+  margin-block: 64px;
+}
+
+.disco-archives-list-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  border-bottom: 1px solid var(--ant-color-border-secondary);
+}
+
+.disco-archives-list-item:last-child {
+  border-bottom: 0;
+}
+
+.disco-archives-list-item:hover {
+  background: var(--ant-color-fill-quaternary);
+}
+
+.disco-archives-list-main {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) minmax(160px, 0.45fr);
+  align-items: center;
+  min-width: 0;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.disco-archives-list-main:focus-visible {
+  outline: 2px solid var(--ant-color-primary-border);
+  outline-offset: -2px;
+}
+
+.disco-archives-list-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: var(--ant-color-fill-secondary);
+  color: var(--ant-color-text-secondary);
+}
+
+.disco-archives-list-copy,
+.disco-archives-list-meta {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.disco-archives-list-copy .ant-typography,
+.disco-archives-list-meta .ant-typography {
+  min-width: 0;
+  margin: 0;
+}
+
+.disco-archives-list-copy > .ant-typography + .ant-typography {
+  font-size: 12px;
+}
+
+.disco-archives-list-meta {
+  justify-items: end;
+  font-size: 12px;
+}
+
+.disco-archives-list-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-right: 8px;
+}
+
+.disco-archives-pagination {
+  align-self: flex-end;
+}
+
+.disco-archives-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 110px;
+  color: var(--ant-color-text-secondary);
+}
+
+.disco-archives-preview-toolbar {
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--ant-color-border-secondary);
+}
+
+.disco-archives-preview-meta {
+  display: grid;
+  justify-items: start;
+  gap: 5px;
+  min-width: 0;
+}
+
+.disco-archives-transcript {
+  padding-top: 14px;
+}
+
+.disco-archives-message {
+  max-width: 94%;
+  margin-bottom: 12px;
+}
+
+.disco-archives-message.is-user {
+  margin-left: auto;
+  padding: 8px 10px;
+  border-radius: 11px;
+  background: var(--ant-color-fill-secondary);
+}
+
+.disco-archives-message .ant-typography {
+  margin-bottom: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.disco-archives-preview-limit {
+  display: block;
+  padding: 8px 0;
+  text-align: center;
+}
+
+@media (max-width: 1100px) {
+  .disco-archives-filters {
+    grid-template-columns: minmax(220px, 1fr) minmax(300px, 1.25fr);
+  }
+
+  .disco-archives-list-main {
+    grid-template-columns: 32px minmax(0, 1fr);
+  }
+
+  .disco-archives-list-meta {
+    display: none;
+  }
+}

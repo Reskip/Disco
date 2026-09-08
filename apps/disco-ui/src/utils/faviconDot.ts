@@ -1,0 +1,78 @@
+/**
+ * Create a favicon with status dot overlays
+ *
+ * @param baseFaviconUrl - Path to base favicon image
+ * @param runningDot - If true, show white dot on lower-left (agent working)
+ * @param readyDot - If true, show green dot on lower-right (ready for prompt)
+ * @param dotColors - Theme-derived running, ready, and contrast-border colors
+ * @returns Promise resolving to data URL for the modified favicon
+ */
+export function createFaviconWithDot(
+  baseFaviconUrl: string,
+  runningDot: boolean,
+  readyDot: boolean,
+  dotColors: { running: string; ready: string; border: string }
+): Promise<string> {
+  // Keep the canonical SVG as the favicon whenever no status overlay is
+  // needed. Rasterization is reserved for the canvas-composited dot variants.
+  if (!runningDot && !readyDot) {
+    return Promise.resolve(baseFaviconUrl);
+  }
+
+  return new Promise((resolve, reject) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 32;
+    canvas.height = 32;
+    const ctx = canvas.getContext('2d')!;
+
+    const img = new Image();
+    img.onload = () => {
+      // Draw base favicon
+      ctx.drawImage(img, 0, 0, 32, 32);
+
+      const dotSize = 10;
+
+      // Draw white dot on lower-left if running
+      if (runningDot) {
+        const dotX = dotSize / 2 + 2; // Lower-left corner
+        const dotY = 32 - dotSize / 2 - 2;
+
+        // Dark border for contrast against light backgrounds
+        ctx.beginPath();
+        ctx.arc(dotX, dotY, dotSize / 2 + 1, 0, 2 * Math.PI);
+        ctx.fillStyle = dotColors.border;
+        ctx.fill();
+
+        // White dot
+        ctx.beginPath();
+        ctx.arc(dotX, dotY, dotSize / 2, 0, 2 * Math.PI);
+        ctx.fillStyle = dotColors.running;
+        ctx.fill();
+      }
+
+      // Draw green dot on lower-right if ready
+      if (readyDot) {
+        const dotX = 32 - dotSize / 2 - 2; // Lower-right corner
+        const dotY = 32 - dotSize / 2 - 2;
+
+        // Dark border for contrast
+        ctx.beginPath();
+        ctx.arc(dotX, dotY, dotSize / 2 + 1, 0, 2 * Math.PI);
+        ctx.fillStyle = dotColors.border;
+        ctx.fill();
+
+        // Green dot (theme color)
+        ctx.beginPath();
+        ctx.arc(dotX, dotY, dotSize / 2, 0, 2 * Math.PI);
+        ctx.fillStyle = dotColors.ready;
+        ctx.fill();
+      }
+
+      resolve(canvas.toDataURL());
+    };
+    img.onerror = (err) => {
+      reject(err);
+    };
+    img.src = baseFaviconUrl;
+  });
+}

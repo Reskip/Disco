@@ -1,0 +1,137 @@
+---
+title: disco Documentation
+description: The command center for AI enablement. A shared canvas for coding agents and long-lived AI teammates, anchored on git branches, with real-time multiplayer and an MCP surface agents drive themselves.
+---
+
+import { getBasePath, LOGO_MARK_PATH } from '../../lib/siteMetadata';
+
+<div style={{ textAlign: 'center', marginTop: '2rem', marginBottom: '2rem' }}>
+  <img
+    src={`${getBasePath()}${LOGO_MARK_PATH}`}
+    alt=""
+    width="135"
+    height="135"
+    style={{ width: '135px', height: '135px', opacity: 0.9 }}
+  />
+</div>
+
+# <span className="gradient-text">disco</span>
+
+**The command center for AI enablement.**
+
+Disco is a shared canvas where coding agents (Claude Code, Codex, Gemini) and long-lived AI teammates run side-by-side on isolated git branches, the anchor entity where sessions, dev environments, prompts, and PRs converge. Your whole team rallies around the same live work in real time, and the agents themselves drive Disco over MCP.
+
+import { GifGallery, YouTubeEmbed } from '../../components';
+import { ScreenshotGallery } from '../../components/ScreenshotGallery';
+
+## In Action
+
+<GifGallery />
+
+<YouTubeEmbed id="3in0qh7ZH0g" title="Disco 13-minute walkthrough" />
+
+**13-minute walkthrough.** Unscripted demo showing Disco's core features
+
+---
+
+## Getting Started
+
+Requires Node.js ≥ 22.12.
+
+```bash
+npm install -g disco-live
+disco init
+disco daemon start
+disco open
+```
+
+Then add your first repo. For Docker, source builds, and other options, see [Extended Installation](/guide/extended-install).
+
+**Then dive in:**
+
+- **[Raising Your First AI Teammate](/guide/first-teammate).** The short path to succeeding with Disco: one named teammate, one real job
+- **[Features Overview](/guide/features-overview).** A map of what Disco does, starting with branches, sessions, and boards
+- **[Architecture](/guide/architecture).** System design and the typed TypeScript client
+- **[Development Guide](/guide/development).** Run Disco in Disco and contribute
+
+---
+
+## Screenshots
+
+![Disco board with live collaborator cursors, colorful zones, branch cards, markdown notes, and interactive agent dashboards.](/screenshots/board-hero.png)
+
+_Multiplayer spatial canvas with zones, branches, live cursors, notes, and agent-built dashboards_
+
+<ScreenshotGallery
+  shots={[
+    {
+      src: '/screenshots/conversation_full_page.png',
+      alt: 'Disco task-centric conversation UI showing AI agent messages, tool calls, and file changes in a structured timeline',
+      caption: 'Task-centric conversation UI',
+    },
+    {
+      src: '/screenshots/settings_modal.png',
+      alt: 'Disco settings modal for configuring MCP servers, managing branches, and agent preferences',
+      caption: 'MCP server and branch management',
+    },
+    {
+      src: '/screenshots/zone-trigger.png',
+      alt: 'Disco zone trigger modal showing a templated prompt with mustache placeholders ({{ branch.name }}, {{ branch.pull_request_url }}) and Prompt/Fork/Spawn action choices',
+      caption: 'Zone trigger with templated prompt',
+    },
+    {
+      src: '/screenshots/tool-blocks.png',
+      alt: 'Disco chat showing structured tool blocks: collapsible thinking, Grep with pattern badge, Edit with red/green inline diff, and Bash with expandable output',
+      caption: 'Structured tool blocks with inline diffs',
+    },
+    {
+      src: '/screenshots/env-variants-full.png',
+      alt: 'Disco branch environment tab showing YAML config with named variants (docs, full, sqlite, postgres) and Docker compose commands',
+      caption: 'Branch environment with named variants',
+    },
+    {
+      src: '/screenshots/create-session-modal.png',
+      alt: 'Disco create session modal showing five agent runtime cards side-by-side: Claude Code, Codex, Gemini, OpenCode, GitHub Copilot (BETA)',
+      caption: 'Pick any SDK: Claude, Codex, Gemini, OpenCode, Copilot',
+    },
+    {
+      src: '/screenshots/baked_in_terminal.png',
+      alt: 'Disco built-in terminal with automatic branch context and environment variable injection',
+      caption: 'Built-in terminal with branch context',
+    },
+    {
+      src: '/screenshots/onboarding.png',
+      alt: 'Disco onboarding welcome screen showing team status, recent activity, and quick start guide',
+      caption: 'Welcome screen showing team status',
+    },
+  ]}
+/>
+
+---
+
+## Stack
+
+**Backend:** FeathersJS, Drizzle ORM, LibSQL
+**Frontend:** React 18, TypeScript, Ant Design, React Flow
+**CLI:** oclif
+**Realtime:** WebSocket via Socket.io
+
+See the [Architecture Guide](/guide/architecture) for details.
+
+---
+
+## Contributing
+
+TypeScript strict mode, branded types, repository pattern with Drizzle ORM.
+
+Read the [Development Guide](/guide/development) for the local development workflow.
+
+---
+
+## License
+
+Disco is source-available under the Business Source License 1.1. Its Additional
+Use Grant permits production use but not commercializing Disco itself as the
+defined Disco Offering. Each version converts to Apache License 2.0 on
+January 15, 2029, or earlier if the BSL's four-year limit applies. See the
+[license](https://github.com/preset-io/disco/blob/main/LICENSE) for the controlling terms.

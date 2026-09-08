@@ -1,0 +1,419 @@
+import {
+  agenticToolRequiresModelSelection,
+  getAgenticToolModelConfiguration,
+  isAgenticToolModelSelectionComplete,
+} from '@disco/agentic-tools';
+import type {
+  AgenticToolName,
+  AgenticToolPreset,
+  DefaultAgenticToolConfig,
+  DiscoClient,
+  User,
+} from '@disco-live/client';
+import {
+  canonicalTenantAgenticTool,
+  USER_DEFAULT_AGENTIC_CONFIGURATION,
+  WORKSPACE_DEFAULT_AGENTIC_CONFIGURATION,
+} from '@disco-live/client';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { AppLocale } from '../../contexts/LocaleContext';
+import { useLocale } from '../../contexts/LocaleContext';
+import { useDiscoStore } from '../../store/discoStore';
+import { getModelDisplayName } from '../ModelSelector';
+import { getPermissionModeLabel } from '../PermissionModeSelector';
+
+export const INLINE_AGENTIC_CONFIGURATION = '__inline__';
+
+export { USER_DEFAULT_AGENTIC_CONFIGURATION, WORKSPACE_DEFAULT_AGENTIC_CONFIGURATION };
+
+/** Match the daemon's raw-tool-first lookup while retaining canonical fallback. */
+export function getUserAgenticToolDefault(
+  currentUser: User | null | undefined,
+  tool: AgenticToolName
+) {
+  const canonicalTool = canonicalTenantAgenticTool(tool);
+  return {
+    selection:
+      currentUser?.default_agentic_selection?.[tool] ??
+      currentUser?.default_agentic_selection?.[canonicalTool],
+    configuration:
+      currentUser?.default_agentic_config?.[tool] ??
+      currentUser?.default_agentic_config?.[canonicalTool],
+  };
+}
+
+export function getUserDefaultConfigurationSource(
+  currentUser: User | null | undefined,
+  tool: AgenticToolName
+): string | undefined {
+  const { selection, configuration } = getUserAgenticToolDefault(currentUser, tool);
+  return selection || configuration ? USER_DEFAULT_AGENTIC_CONFIGURATION : undefined;
+}
+
+export function summarizeAgenticConfiguration(
+  tool: AgenticToolName,
+  config?: DefaultAgenticToolConfig,
+  locale: AppLocale = 'en-US'
+): string {
+  if (!config) return '';
+  const parts: string[] = [];
+  if (config.modelConfig?.model) {
+    parts.push(
+      config.modelConfig.provider
+        ? `${config.modelConfig.provider}/${config.modelConfig.model}`
+        : getModelDisplayName(tool, config.modelConfig.model)
+    );
+  }
+  if (config.permissionMode)
+    parts.push(getPermissionModeLabel(tool, config.permissionMode, locale));
+  return parts.join(' · ');
+}
+
+interface Options {
+  tool: AgenticToolName;
+  client: DiscoClient | null;
+  currentUser?: User | null;
+  allowInlineSelection?: boolean;
+  preserveInlineSelection?: boolean;
+}
+
+interface AgenticConfigurationSourceOption {
+  value: string;
+  title: string;
+  summary: string;
+  disabled?: boolean;
+}
+
+function preferredConfigurationSource(
+  tool: AgenticToolName,
+  hasUserDefault: boolean,
+  inlineAllowed: boolean,
+  workspacePreset: AgenticToolPreset | undefined,
+  presets: AgenticToolPreset[]
+): string | undefined {
+  if (hasUserDefault) return USER_DEFAULT_AGENTIC_CONFIGURATION;
+  if (agenticToolRequiresModelSelection(tool)) {
+    if (
+      workspacePreset &&
+      isAgenticToolModelSelectionComplete(tool, workspacePreset.configuration.modelConfig)
+    ) {
+      return WORKSPACE_DEFAULT_AGENTIC_CONFIGURATION;
+    }
+    if (inlineAllowed) return INLINE_AGENTIC_CONFIGURATION;
+    return presets.find((preset) =>
+      isAgenticToolModelSelectionComplete(tool, preset.configuration.modelConfig)
+    )?.preset_id;
+  }
+  if (inlineAllowed) return INLINE_AGENTIC_CONFIGURATION;
+  if (workspacePreset) return WORKSPACE_DEFAULT_AGENTIC_CONFIGURATION;
+  return presets[0]?.preset_id;
+}
+
+/**
+ * Owns preset loading and default-source resolution for every configuration
+ * picker. Consumers keep their own rendering and inline form state.
+ */
+export function useAgenticConfigurationSources({
+  tool,
+  client,
+  currentUser,
+  allowInlineSelection = true,
+  preserveInlineSelection = false,
+}: Options) {
+  const { locale } = useLocale();
+  const isChinese = locale === 'zh-CN';
+  const canonicalTool = canonicalTenantAgenticTool(tool);
+  const settings = useDiscoStore((state) => state.agenticToolSettingsByName?.get(canonicalTool));
+  const inlineAllowedByPolicy = settings?.inline_configuration_allowed !== false;
+  const inlineAllowed = inlineAllowedByPolicy && allowInlineSelection;
+  const inlineSelectionAllowed =
+    inlineAllowed || (inlineAllowedByPolicy && preserveInlineSelection);
+  const [presets, setPresets] = useState<AgenticToolPreset[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState(false);
+  const retryRef = useRef<() => void>(() => {});
+
+  useEffect(() => {
+    if (!client) {
+      setPresets([]);
+      setLoading(false);
+      // Client absence is not a successful empty response. Keep the current
+      // source untouched until a client can prove whether that preset exists.
+      setLoaded(false);
+      setLoadError(false);
+      retryRef.current = () => {};
+      return undefined;
+    }
+
+    let active = true;
+    setPresets([]);
+    setLoading(true);
+    setLoaded(false);
+    setLoadError(false);
+    const service = client.service('agentic-tool-presets');
+    const refresh = async () => {
+      if (active) {
+        setLoading(true);
+        setLoadError(false);
+      }
+      try {
+        const result = await service.find({ query: { tool: canonicalTool } });
+        if (!active) return;
+        setPresets(Array.isArray(result) ? result : result.data);
+        setLoaded(true);
+      } catch {
+        if (!active) return;
+        setLoadError(true);
+        setLoaded(false);
+      } finally {
+        if (active) setLoading(false);
+      }
+    };
+    const onPresetChange = () => {
+      void refresh();
+    };
+
+    retryRef.current = onPresetChange;
+    void refresh();
+    service.on?.('created', onPresetChange);
+    service.on?.('patched', onPresetChange);
+    service.on?.('removed', onPresetChange);
+    return () => {
+      active = false;
+      retryRef.current = () => {};
+      service.off?.('created', onPresetChange);
+      service.off?.('patched', onPresetChange);
+      service.off?.('removed', onPresetChange);
+    };
+  }, [canonicalTool, client]);
+
+  const retry = useCallback(() => retryRef.current(), []);
+  const workspacePreset = presets.find((preset) => preset.is_default);
+  const { selection: userSelection, configuration: userConfigBlob } = getUserAgenticToolDefault(
+    currentUser,
+    tool
+  );
+  const hasConfiguredUserDefault = Boolean(currentUser && (userSelection ?? userConfigBlob));
+  const userDefaultUsesInline = Boolean(
+    currentUser &&
+      hasConfiguredUserDefault &&
+      userSelection?.source !== 'preset' &&
+      userSelection?.source !== 'workspace_default'
+  );
+  const userDefaultConfiguration =
+    userSelection?.source === 'preset'
+      ? presets.find((preset) => preset.preset_id === userSelection.preset_id)?.configuration
+      : userSelection?.source === 'workspace_default'
+        ? workspacePreset?.configuration
+        : userConfigBlob;
+  const userDefaultModelComplete =
+    !agenticToolRequiresModelSelection(tool) ||
+    isAgenticToolModelSelectionComplete(tool, userDefaultConfiguration?.modelConfig);
+  const isSourceAllowedByPolicy = useCallback(
+    (source: string | undefined) => {
+      if (source === INLINE_AGENTIC_CONFIGURATION) return inlineSelectionAllowed;
+      if (source === USER_DEFAULT_AGENTIC_CONFIGURATION && userDefaultUsesInline) {
+        return inlineAllowed;
+      }
+      return true;
+    },
+    [inlineAllowed, inlineSelectionAllowed, userDefaultUsesInline]
+  );
+  const hasUserDefault =
+    hasConfiguredUserDefault &&
+    isSourceAllowedByPolicy(USER_DEFAULT_AGENTIC_CONFIGURATION) &&
+    userDefaultModelComplete &&
+    (userSelection?.source === 'preset'
+      ? presets.some((preset) => preset.preset_id === userSelection.preset_id)
+      : userSelection?.source === 'workspace_default'
+        ? inlineAllowed || Boolean(workspacePreset)
+        : true);
+
+  const resolveConfiguration = useCallback(
+    (source: string | undefined, inlineConfig: DefaultAgenticToolConfig = {}) => {
+      if (source === INLINE_AGENTIC_CONFIGURATION) return inlineConfig;
+      if (source === WORKSPACE_DEFAULT_AGENTIC_CONFIGURATION)
+        return workspacePreset?.configuration ?? {};
+      if (source === USER_DEFAULT_AGENTIC_CONFIGURATION) {
+        if (userSelection?.source === 'preset') {
+          return (
+            presets.find((preset) => preset.preset_id === userSelection.preset_id)?.configuration ??
+            {}
+          );
+        }
+        if (userSelection?.source === 'workspace_default')
+          return workspacePreset?.configuration ?? {};
+        return userConfigBlob ?? {};
+      }
+      return presets.find((preset) => preset.preset_id === source)?.configuration ?? {};
+    },
+    [presets, userConfigBlob, userSelection, workspacePreset]
+  );
+
+  const myDefaultSummary = useMemo(() => {
+    if (userSelection?.source === 'preset') {
+      const preset = presets.find((item) => item.preset_id === userSelection.preset_id);
+      if (!preset) return 'preset';
+      const summary = summarizeAgenticConfiguration(canonicalTool, preset.configuration, locale);
+      return summary ? `${preset.name} · ${summary}` : preset.name;
+    }
+    if (userSelection?.source === 'workspace_default') {
+      return workspacePreset
+        ? `${isChinese ? '工作区默认配置' : 'Workspace default'} · ${workspacePreset.name}`
+        : isChinese
+          ? '工作区默认配置'
+          : 'Workspace default';
+    }
+    return summarizeAgenticConfiguration(canonicalTool, userConfigBlob, locale);
+  }, [canonicalTool, isChinese, locale, presets, userConfigBlob, userSelection, workspacePreset]);
+
+  const isValidSource = useCallback(
+    (source: string | undefined) => {
+      const sourceExists =
+        presets.some((preset) => preset.preset_id === source) ||
+        (source === USER_DEFAULT_AGENTIC_CONFIGURATION && hasUserDefault) ||
+        (source === WORKSPACE_DEFAULT_AGENTIC_CONFIGURATION &&
+          (inlineAllowed || Boolean(workspacePreset))) ||
+        source === INLINE_AGENTIC_CONFIGURATION;
+      if (!isSourceAllowedByPolicy(source) || !sourceExists) return false;
+      return (
+        source === INLINE_AGENTIC_CONFIGURATION ||
+        !agenticToolRequiresModelSelection(tool) ||
+        isAgenticToolModelSelectionComplete(tool, resolveConfiguration(source).modelConfig)
+      );
+    },
+    [
+      hasUserDefault,
+      inlineAllowed,
+      isSourceAllowedByPolicy,
+      presets,
+      resolveConfiguration,
+      tool,
+      workspacePreset,
+    ]
+  );
+
+  const preferredSource = preferredConfigurationSource(
+    tool,
+    hasUserDefault,
+    inlineAllowed,
+    workspacePreset,
+    presets
+  );
+
+  const sourceOptions = useMemo<AgenticConfigurationSourceOption[]>(
+    () => [
+      ...(hasUserDefault
+        ? [
+            {
+              value: USER_DEFAULT_AGENTIC_CONFIGURATION,
+              title: isChinese ? '我的默认配置' : 'My default',
+              summary: myDefaultSummary,
+            },
+          ]
+        : []),
+      {
+        value: WORKSPACE_DEFAULT_AGENTIC_CONFIGURATION,
+        title: workspacePreset
+          ? `${isChinese ? '工作区默认配置' : 'Workspace default'} · ${workspacePreset.name}`
+          : isChinese
+            ? '工作区默认配置'
+            : 'Workspace default',
+        summary: workspacePreset
+          ? summarizeAgenticConfiguration(canonicalTool, workspacePreset.configuration, locale)
+          : isChinese
+            ? '未配置'
+            : 'not configured',
+        disabled:
+          !workspacePreset ||
+          (agenticToolRequiresModelSelection(tool) &&
+            !isAgenticToolModelSelectionComplete(tool, workspacePreset.configuration.modelConfig)),
+      },
+      ...presets.map((preset) => ({
+        value: preset.preset_id as string,
+        title: preset.name,
+        summary: summarizeAgenticConfiguration(canonicalTool, preset.configuration, locale),
+        disabled:
+          agenticToolRequiresModelSelection(tool) &&
+          !isAgenticToolModelSelectionComplete(tool, preset.configuration.modelConfig),
+      })),
+      ...(inlineAllowed
+        ? [
+            {
+              value: INLINE_AGENTIC_CONFIGURATION,
+              title: isChinese ? '为本次运行自定义…' : 'Customize for this session…',
+              summary: '',
+            },
+          ]
+        : preserveInlineSelection && inlineSelectionAllowed
+          ? [
+              {
+                value: INLINE_AGENTIC_CONFIGURATION,
+                title: isChinese ? '已保存的配置' : 'Stored configuration',
+                summary: isChinese ? '只读' : 'read-only',
+                disabled: true,
+              },
+            ]
+          : []),
+    ],
+    [
+      canonicalTool,
+      hasUserDefault,
+      inlineAllowed,
+      inlineSelectionAllowed,
+      isChinese,
+      locale,
+      myDefaultSummary,
+      preserveInlineSelection,
+      presets,
+      tool,
+      workspacePreset,
+    ]
+  );
+
+  const getSourceError = useCallback(
+    (source: string | undefined): string | undefined => {
+      if (loading) return isChinese ? '正在加载运行配置' : 'Loading configuration';
+      if (!source) {
+        return loadError
+          ? isChinese
+            ? '无法加载运行配置预设'
+            : 'Unable to load configuration presets'
+          : isChinese
+            ? '请选择运行配置'
+            : 'Choose a configuration';
+      }
+      if (!isSourceAllowedByPolicy(source)) {
+        return isChinese
+          ? '工作区策略不允许使用此配置'
+          : 'This configuration is not allowed by workspace policy';
+      }
+      // A transient request failure cannot prove that an existing preset
+      // disappeared. Preserve it until a successful retry.
+      if (loadError) return undefined;
+      if (isValidSource(source)) return undefined;
+      return agenticToolRequiresModelSelection(tool)
+        ? getAgenticToolModelConfiguration(tool)?.missingSelectionError
+        : isChinese
+          ? '此配置已不可用'
+          : 'This configuration is no longer available';
+    },
+    [isChinese, isSourceAllowedByPolicy, isValidSource, loadError, loading, tool]
+  );
+
+  return {
+    inlineAllowed,
+    inlineSelectionAllowed,
+    presets,
+    loading,
+    loaded,
+    loadError,
+    retry,
+    resolveConfiguration,
+    isValidSource,
+    preferredSource,
+    sourceOptions,
+    getSourceError,
+  };
+}

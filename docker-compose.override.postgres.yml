@@ -1,0 +1,19 @@
+# PostgreSQL mode override
+# Usage:
+#   ln -sf docker-compose.override.postgres.yml docker-compose.override.yml
+#   docker compose --profile postgres up
+#
+# Or directly:
+#   docker compose -f docker-compose.yml -f docker-compose.override.postgres.yml --profile postgres up
+
+services:
+  disco-dev:
+    # This overlay is selected explicitly and therefore bypasses Compose's
+    # automatic docker-compose.override.yml loading. Keep Codex shell
+    # sandboxing functional in PostgreSQL variants too.
+    security_opt:
+      - apparmor=unconfined
+      - seccomp=unconfined
+    environment:
+      - DISCO_DB_DIALECT=postgresql
+      - DATABASE_URL=postgresql://disco_app:disco_dev_secret@postgres:5432/disco

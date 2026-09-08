@@ -1,0 +1,88 @@
+---
+title: Getting Started
+description: Install Disco and follow the onboarding wizard. Your first AI teammate takes it from there.
+---
+
+import InstallTabs from '../../components/InstallTabs.mdx';
+
+# Getting Started
+
+Install Disco, open the UI, and follow the onboarding wizard. Your **first AI teammate** will help you get your bearings and get everything else set up. (New here? [Raising Your First AI Teammate](/guide/first-teammate) explains why one teammate is the whole onboarding.)
+
+## Install
+
+<InstallTabs />
+
+Run `disco init` after installation. It shows a multi-select for every supported agentic tool and
+requires an intentional selection of at least one. The prompt explains that each selection adds
+download time and disk use; credentials are configured later in the UI. Init writes the selection
+once to `agentic_tools.installed` and installs the exact version-aligned packages before reporting
+success. Press Ctrl+C to cancel. An intentionally tool-free headless deployment must use
+`--agentic-tools none`.
+
+To change the deployment policy later, edit `agentic_tools.installed` in `config.yaml`, run
+`disco install --sync`, and restart the daemon. Disco does not silently rewrite existing config.
+Repeat the readiness check with `disco doctor`; see
+[Agentic tools](/guide/extended-install#agentic-tools) for the complete model.
+
+## Follow the onboarding wizard
+
+The first time you open the UI, the **Onboarding Wizard** runs — five quick steps that end with your first AI teammate ready to work:
+
+1. **You.** Pick how you work: *I write code*, *I manage projects*, *I lead a team*, or *Building solo*. The rest of the setup — and your teammate's first briefing — is tailored to this.
+2. **AI.** Connect a model: Claude (recommended), GPT, Gemini, or a custom endpoint. Paste an API key, use a Claude subscription token, or sign in with ChatGPT; Disco verifies the credential on the spot.
+3. **Workspace.** Name your AI teammate and pick its emoji. Disco creates a board named after it — the teammate's home for every branch and session it works on.
+4. **Tools.** Persona-tailored MCP integration suggestions (Slack first, plus the likes of GitHub, Sentry, HubSpot, Linear, or Figma). Connect what you want now, or skip — everything is available later in **Settings → MCP**.
+5. **You're ready.** Disco seeds the teammate from the [framework repo](https://github.com/preset-io/disco-teammate) onto your new board and launches its first session with the agent you connected.
+
+Every step except the last can be skipped — the wizard never blocks you on a decision.
+
+<div style={{ display: 'flex', gap: 8, alignItems: 'flex-start', margin: '24px 0' }}>
+  <img
+    src="/screenshots/onboarding-persona.png"
+    alt="Onboarding step 1: persona cards — I write code, I manage projects, I lead a team, Building solo"
+    style={{ flex: '1 1 0', minWidth: 0, width: '100%', height: 'auto', borderRadius: 8 }}
+  />
+  <img
+    src="/screenshots/onboarding-connect-ai.png"
+    alt="Onboarding step 2: Connect your AI — Claude selected (Recommended) with API key and Subscription token tabs; GPT and Gemini below"
+    style={{ flex: '1 1 0', minWidth: 0, width: '100%', height: 'auto', borderRadius: 8 }}
+  />
+  <img
+    src="/screenshots/onboarding-name-teammate.png"
+    alt="Onboarding step 3: Name your AI teammate — name and emoji, with its own board"
+    style={{ flex: '1 1 0', minWidth: 0, width: '100%', height: 'auto', borderRadius: 8 }}
+  />
+  <img
+    src="/screenshots/onboarding-mcp-tools.png"
+    alt="Onboarding step 4: Connect your tools via MCP — persona-tailored suggestions like Slack, HubSpot, Amplitude, Figma"
+    style={{ flex: '1 1 0', minWidth: 0, width: '100%', height: 'auto', borderRadius: 8 }}
+  />
+</div>
+
+When the board opens, your teammate's first session picks up where the wizard left off — it already knows its name, how you work, and which tools you flagged. From there it can register repos, organize its board, structure a workflow, or just be a thinking partner. **Anything a user can do in Disco, the teammate can do too.** It has full access to the [Disco MCP Server](/guide/internal-mcp).
+
+## Customize your install
+
+Disco runs out of the box on SQLite as a single-user instance, but it's designed to scale up:
+
+- **PostgreSQL backend** instead of SQLite, for multi-user / team setups
+- **Multiplayer mode** with branch-level [RBAC](/guide/multiplayer-unix-isolation) and per-user permissions
+- **Execution isolation** with fail-closed local sandboxing or a reviewed delegated substrate
+- **Docker Compose** and source builds for contributor / dev workflows — see the **Docker Compose** tab above for the evaluation quickstart
+- **Custom config / database paths** for non-default install layouts
+
+For any of those, see [Extended Installation](/guide/extended-install). For credential alternatives (`claude setup-token`, `codex login --device-auth`, workspace-wide env vars), see [Authentication](/guide/extended-install#authentication).
+
+## What's next
+
+- **[Branches](/guide/branches)** · **[Sessions & Trees](/guide/sessions)** · **[Boards & Zones](/guide/boards)**: the core primitives
+- **[Features Overview](/guide/features-overview)**: Teammates, MCP, Rich Chat UX, Multiplayer, Environments, Scheduler, Cards, Artifacts
+- **[Architecture](/guide/architecture)**: system design and the typed TypeScript client
+
+## Get help
+
+- **[Discord](https://discord.gg/Qh4TrFQZpd)**: community support and discussion
+- **[GitHub Discussions](https://github.com/preset-io/disco/discussions)**: questions and ideas
+- **[GitHub Issues](https://github.com/preset-io/disco/issues)**: bugs and feature requests
+- Run `disco --help` for the full CLI reference

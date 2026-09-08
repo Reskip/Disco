@@ -1,0 +1,416 @@
+/* biome-ignore-all lint/plugin/noFirstPartyCss: the two-pane workspace needs responsive media-query selectors. */
+/* biome-ignore-all lint/complexity/noImportantStyles: hover state must override the selected row's inline theme color. */
+
+.disco-workspace-sidebar {
+  width: clamp(264px, 21vw, 292px);
+  min-width: 252px;
+}
+
+.disco-workspace-sidebar-scroll {
+  scrollbar-width: thin;
+}
+
+.disco-workspace-brand-home {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  flex: 1;
+  gap: 12px;
+  padding: 2px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.disco-workspace-brand-home > .ant-typography {
+  min-width: 0;
+  margin: 0;
+  color: inherit;
+  font-size: 28px;
+  line-height: 1;
+}
+
+.disco-workspace-brand-home:hover,
+.disco-workspace-brand-home:focus-visible {
+  background: var(--ant-color-fill-tertiary);
+}
+
+.disco-workspace-brand-home:focus-visible {
+  outline: 1px solid var(--ant-color-primary-border);
+  outline-offset: 1px;
+}
+
+.disco-workspace-new-chat.ant-btn {
+  border: 1px solid transparent !important;
+  background: var(--ant-color-primary-bg);
+  color: var(--ant-color-primary-text);
+}
+
+.disco-workspace-new-chat.ant-btn:not(:disabled):hover,
+.disco-workspace-new-chat.ant-btn:not(:disabled):focus-visible {
+  border-color: var(--ant-color-primary-border-hover) !important;
+  background: var(--ant-color-primary-bg-hover);
+  color: var(--ant-color-primary-text-hover);
+}
+
+.disco-workspace-session-row .disco-workspace-row-action {
+  flex: 0 0 auto;
+  margin-right: 4px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.disco-workspace-session-select {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  min-width: 0;
+  flex: 1;
+  padding: 6px 4px 6px 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.disco-workspace-session-inline-edit {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  flex: 1;
+  gap: 0;
+  padding-block: 3px;
+  padding-right: 8px;
+}
+
+.disco-workspace-session-inline-edit .ant-input {
+  min-width: 0;
+  height: 26px;
+  padding: 2px 6px;
+  border-radius: 7px;
+  background: var(--ant-color-bg-container);
+  box-shadow: 0 0 0 1px var(--ant-color-primary-border);
+  color: inherit;
+  font-size: 0.92rem;
+}
+
+.disco-workspace-session-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  margin-inline: 6px 5px;
+}
+
+.disco-workspace-session-status.is-running {
+  width: 14px;
+  height: 14px;
+  color: var(--ant-color-primary);
+  font-size: 12px;
+}
+
+.disco-workspace-session-status.is-unread {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ant-color-primary);
+  box-shadow: 0 0 0 3px var(--ant-color-primary-bg);
+}
+
+.disco-workspace-session-title {
+  min-width: 0;
+  flex: 1;
+  margin: 0;
+  color: inherit;
+  font-size: 13px;
+}
+
+.disco-workspace-session-row,
+.disco-workspace-agent-toggle {
+  transition:
+    background-color 150ms ease,
+    color 150ms ease;
+}
+
+.disco-workspace-session-row:hover,
+.disco-workspace-agent-toggle:hover {
+  background: var(--ant-color-fill-tertiary) !important;
+}
+
+.disco-workspace-section-heading {
+  padding: 10px 8px 6px;
+}
+
+.disco-workspace-section-toggle {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.disco-workspace-section-toggle:hover,
+.disco-workspace-section-toggle:focus-visible {
+  background: var(--ant-color-fill-tertiary);
+  border-radius: 8px;
+}
+
+.disco-workspace-section-toggle > span:first-child {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.disco-workspace-section-toggle > span:first-child > .anticon {
+  color: var(--ant-color-text-tertiary);
+  font-size: 10px;
+}
+
+.disco-workspace-section-toggle > .ant-typography {
+  flex: 0 0 auto;
+  font-size: 10px;
+}
+
+.disco-workspace-section-heading.is-with-action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 14px;
+}
+
+.disco-workspace-section-heading > .ant-typography {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+}
+
+.disco-workspace-empty-row {
+  display: block;
+  padding: 6px 10px 9px 24px;
+  font-size: 12px;
+}
+
+.disco-workspace-empty-row.is-agent {
+  padding-left: 40px;
+}
+
+.disco-workspace-show-more {
+  width: calc(100% - 18px);
+  margin: 2px 9px 5px;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ant-color-text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+  text-align: left;
+}
+
+.disco-workspace-show-more.is-agent {
+  padding-left: 26px;
+}
+
+.disco-workspace-show-more:hover,
+.disco-workspace-show-more:focus-visible {
+  background: var(--ant-color-fill-tertiary);
+  color: var(--ant-color-text);
+}
+
+.disco-workspace-loading-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px 10px 24px;
+  color: var(--ant-color-text-tertiary);
+  font-size: 12px;
+}
+
+.disco-workspace-loading-row.is-agent {
+  padding-left: 40px;
+}
+
+.disco-workspace-agent-group {
+  margin-bottom: 3px;
+}
+
+.disco-workspace-agent-row {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+}
+
+.disco-workspace-agent-more {
+  opacity: 0;
+  transition:
+    opacity 120ms ease,
+    background-color 120ms ease;
+}
+
+.disco-workspace-agent-row:hover .disco-workspace-agent-more,
+.disco-workspace-agent-row:focus-within .disco-workspace-agent-more {
+  opacity: 1;
+}
+
+.disco-workspace-agent-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  flex: 1;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--ant-color-text);
+  cursor: pointer;
+  text-align: left;
+}
+
+.disco-workspace-agent-toggle > .anticon:first-child {
+  color: var(--ant-color-text-tertiary);
+  font-size: 11px;
+}
+
+.disco-workspace-agent-toggle > .ant-typography {
+  min-width: 0;
+  flex: 1;
+  margin: 0;
+  color: inherit;
+  font-size: 13px;
+  font-weight: 580;
+}
+
+.disco-workspace-agent-toggle > .disco-workspace-group-status {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 400;
+}
+
+.disco-workspace-agent-emoji,
+.disco-workspace-agent-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  font-size: 16px;
+}
+
+.disco-workspace-agent-avatar {
+  flex: 0 0 22px;
+  border: 1px solid var(--ant-color-border-secondary);
+  background: var(--ant-color-fill-secondary);
+  color: inherit;
+  font-size: 14px;
+}
+
+.disco-workspace-account {
+  flex: 0 0 auto;
+  padding: 8px 10px 10px;
+  border-top: 1px solid var(--ant-color-border-secondary);
+}
+
+.disco-workspace-account-button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: flex-start;
+  height: 42px;
+  padding-inline: 7px;
+}
+
+.disco-workspace-account-caption {
+  display: block;
+  font-size: 0.78rem;
+}
+
+.disco-workspace-session-row:hover .disco-workspace-row-action,
+.disco-workspace-session-row:focus-within .disco-workspace-row-action {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (max-width: 840px), (max-width: 960px) and (max-height: 500px) {
+  .disco-workspace-sidebar {
+    position: fixed;
+    z-index: 30;
+    inset: 0 auto 0 0;
+    /* The app root uses CSS zoom for the per-device display scale. Plain vw
+       would be zoomed a second time and could push the settings button beyond
+       the physical viewport at 125%/150%. Size against the effective viewport
+       exposed by displayScale.ts instead. */
+    width: min(calc(var(--disco-effective-vw, 100vw) * 0.88), 340px);
+    min-width: min(calc(var(--disco-effective-vw, 100vw) * 0.88), 340px);
+    max-width: calc(var(--disco-effective-vw, 100vw) - 12px);
+    height: calc(var(--disco-visible-viewport-height, 100dvh) / var(--disco-display-scale, 1));
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+    transform: translateX(-102%);
+    transition: transform 180ms ease;
+    box-shadow: var(--ant-box-shadow-secondary);
+  }
+
+  .disco-workspace-sidebar.is-mobile-open {
+    transform: translateX(0);
+  }
+
+  .disco-workspace-new-chat.ant-btn,
+  .disco-workspace-session-select,
+  .disco-workspace-agent-toggle {
+    min-height: 44px;
+  }
+
+  .disco-workspace-account-button.is-mobile {
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
+    padding: 0;
+    justify-content: center;
+  }
+
+  .disco-workspace-session-row .disco-workspace-row-action,
+  .disco-workspace-agent-more {
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
+.disco-workspace-mobile-account-menu {
+  width: calc(min(calc(var(--disco-effective-vw, 100vw) * 0.88), 340px) - 20px);
+  max-width: calc(var(--disco-effective-vw, 100vw) - 32px);
+}
+
+.disco-workspace-mobile-account-menu .ant-dropdown-menu,
+.disco-workspace-mobile-account-menu .ant-dropdown-menu-item {
+  width: 100%;
+}
+
+@media (hover: none), (pointer: coarse) {
+  .disco-workspace-session-row .disco-workspace-row-action,
+  .disco-workspace-agent-more {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
+@media (min-width: 1800px) {
+  .disco-workspace-sidebar {
+    width: clamp(276px, 17vw, 312px);
+  }
+}

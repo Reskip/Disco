@@ -1,0 +1,115 @@
+/**
+ * Authorization utilities for Feathers services and custom routes.
+ */
+
+import { Forbidden, NotAuthenticated } from '@disco/core/feathers';
+import type { AuthenticatedParams, HookContext, UserRole } from '@disco/core/types';
+import { hasMinimumRole } from '@disco/core/types';
+import { executorRuntimeScopeGuard } from '../auth/executor-runtime-scope.js';
+
+export type Role = UserRole;
+
+/**
+ * Ensure the request is authenticated and has the minimum required role.
+ *
+ * Internal calls (params.provider is falsy) bypass authorization checks.
+ * Service accounts (_isServiceAccount) also bypass authorization checks.
+ */
+export function ensureMinimumRole(
+  params: AuthenticatedParams | undefined,
+  minimumRole: Role,
+  action: string = 'perform this action'
+): void {
+  // Skip authorization for internal calls (daemon-to-daemon)
+  if (!params?.provider) {
+    return;
+  }
+
+  if (!params.user) {
+    throw new NotAuthenticated('Authentication required');
+  }
+
+  // Skip authorization for service accounts (executor, etc.)
+  // biome-ignore lint/suspicious/noExplicitAny: Service account flag is added dynamically by auth strategy
+  if ((params.user as any)._isServiceAccount === true) {
+    return;
+  }
+
+  if (!hasMinimumRole(params.user.role, minimumRole)) {
+    throw new Forbidden(`You need ${minimumRole} access to ${action}`);
+  }
+}
+
+/**
+ * Feathers hook factory that enforces a minimum role for the given action.
+ */
+export function requireMinimumRole(minimumRole: Role, action?: string) {
+  return (context: HookContext) => {
+    ensureMinimumRole(context.params, minimumRole, action);
+    return context;
+  };
+}
+
+/**
+ * Helper to register authenticated custom routes with hooks.
+ *
+ * This utility reduces boilerplate when creating custom Feathers routes that require authentication.
+ * It automatically applies requireAuth and requireMinimumRole hooks to specified methods.
+ *
+ * @param app - Feathers application instance
+ * @param path - Route path (can include params like '/sessions/:id/spawn')
+ * @param service - Service implementation object with method handlers
+ * @param authConfig - Object mapping method names to required roles and action descriptions
+ * @param requireAuth - The requireAuth hook from Feathers authentication
+ *
+ * @example
+ * registerAuthenticatedRoute(
+ *   app,
+ *   '/sessions/:id/spawn',
+ *   {
+ *     async create(data, params) {
+ *       // handler implementation
+ *     }
+ *   },
+ *   {
+ *     create: { role: ROLES.MEMBER, action: 'spawn sessions' }
+ *   },
+ *   requireAuth
+ * );
+ */
+export function registerAuthenticatedRoute(
+  // biome-ignore lint/suspicious/noExplicitAny: Feathers app type is complex and varies
+  app: any,
+  path: string,
+  // biome-ignore lint/suspicious/noExplicitAny: Service can have various method signatures
+  service: any,
+  authConfig: Record<string, { role: Role; action: string }>,
+  // biome-ignore lint/suspicious/noExplicitAny: Hook type from Feathers is complex
+  requireAuth: any,
+  options: {
+    around?: Array<(context: HookContext, next: () => Promise<void>) => Promise<void>>;
+  } = {}
+): void {
+  // Register the service
+  app.use(path, service);
+
+  // Build hooks object
+  const hooks: Record<
+    string,
+    Array<(context: HookContext) => HookContext | Promise<HookContext>>
+  > = {};
+
+  for (const [method, config] of Object.entries(authConfig)) {
+    hooks[method] = [
+      requireAuth,
+      executorRuntimeScopeGuard(),
+      requireMinimumRole(config.role, config.action),
+    ];
+  }
+
+  // Apply hooks
+  app.service(path).hooks({
+    ...(options.around ? { around: { all: options.around } } : {}),
+    before: hooks,
+  });
+}

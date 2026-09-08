@@ -1,0 +1,671 @@
+import {
+  type ResolvedMultiTenancyConfig,
+  resolveTenantContext,
+  TenantResolutionError,
+} from '@disco/core/config';
+import type { SessionRepository, TenantScopeAwareDatabase } from '@disco/core/db';
+import { getCurrentTenantId, runWithTenantDatabaseScope, shortId } from '@disco/core/db';
+import type { Application } from '@disco/core/feathers';
+import {
+  isRealtimeRelayEnvelope,
+  MAX_REALTIME_RELAY_BYTES,
+  REALTIME_RELAY_VERSION,
+  type RealtimeRelayEnvelope,
+} from '@disco/core/realtime';
+import {
+  type HookContext,
+  type TenantID,
+  type User,
+} from '@disco/core/types';
+import { tenantChannelName } from '../realtime/routing.js';
+import { RealtimeAccessCache, type RealtimeAccessSessionRepository } from './realtime-access-cache.js';
+
+/**
+ * Per-session channel that carries only the high-frequency streaming events
+ * (message text/thinking chunks, tool start/complete). Connections join this
+ * room via the `session-streams` service after passing a session-access check,
+ * so streaming traffic reaches only the tabs actively viewing a session
+ * instead of the whole tenant. Session ids are globally-unique UUIDv7, so the
+ * unprefixed name cannot collide across tenants; cross-tenant membership is
+ * additionally impossible because the subscribe path gates on a tenant-scoped
+ * `sessions.get`.
+ */
+const SESSION_STREAM_CHANNEL_PREFIX = 'session-stream:';
+const EXECUTOR_TASK_CHANNEL_PREFIX = 'executor-task:';
+
+/**
+ * Private control-plane room for the one executor JWT scoped to a Task.
+ *
+ * Unlike normal Task events, membership is not derived from Session ownership:
+ * configureChannels joins this room only after ServiceJWTStrategy has verified
+ * an `executor-session` token whose signed `task_id` matches the room. There is
+ * no client-callable subscribe method.
+ */
+export function executorTaskChannelName(tenantId: string, taskId: string): string {
+  return `${EXECUTOR_TASK_CHANNEL_PREFIX}${tenantId}:${taskId}`;
+}
+
+export function sessionStreamChannelName(sessionId: string): string {
+  return `${SESSION_STREAM_CHANNEL_PREFIX}${sessionId}`;
+}
+
+/**
+ * Remove a connection from every session-stream room it has joined. Called on
+ * logout so a still-connected-but-deauthenticated socket stops receiving live
+ * session text — Feathers only auto-drops channel membership on socket
+ * disconnect, and streaming delivery would otherwise keep reaching a logged-out
+ * connection (which is no longer in the authenticated/tenant channels but may
+ * still sit in a session-stream room).
+ */
+export function leaveAllSessionStreamChannels(app: Application, connection: unknown): void {
+  for (const name of app.channels ?? []) {
+    if (name.startsWith(SESSION_STREAM_CHANNEL_PREFIX)) {
+      app.channel(name).leave(connection as never);
+    }
+  }
+}
+
+/** Drop task-control capability on logout or before replacing socket auth. */
+export function leaveAllExecutorTaskChannels(app: Application, connection: unknown): void {
+  for (const name of app.channels ?? []) {
+    if (name.startsWith(EXECUTOR_TASK_CHANNEL_PREFIX)) {
+      app.channel(name).leave(connection as never);
+    }
+  }
+}
+
+/** Drop every tenant-scoped Feathers channel on logout or live auth replacement. */
+export function leaveAllTenantChannels(app: Application, connection: unknown): void {
+  for (const name of app.channels ?? []) {
+    if (name.startsWith('tenant:')) {
+      app.channel(name).leave(connection as never);
+    }
+  }
+}
+
+/** Join the private executor control room after the signed task claim is verified. */
+export function joinExecutorTaskChannel(
+  app: Application,
+  tenantId: string,
+  taskId: string,
+  connection: unknown
+): void {
+  app.channel(executorTaskChannelName(tenantId, taskId)).join(connection as never);
+}
+
+/**
+ * Return an existing channel by name, or null if it has never been created.
+ * Feathers' channel lookup MATERIALIZES the channel when absent — and a channel
+ * with no joined connection is never auto-cleaned (Feathers only prunes on the
+ * last leave) — so the publish path must not touch a room that has no
+ * subscribers. Only `session-streams.create` (a real join) should create the
+ * room; joined channels get Feathers' empty-cleanup on leave/disconnect.
+ */
+function existingChannel(app: Application, name: string): PublishChannel | null {
+  return (app.channels ?? []).includes(name) ? app.channel(name) : null;
+}
+
+/**
+ * Join a connection to a session's streaming room. Centralized here (the
+ * tenant-aware realtime facade) so subscribe/publish share one channel name
+ * and the raw `app.channel` surface stays in a single audited file.
+ */
+export function joinSessionStreamChannel(
+  app: Application,
+  sessionId: string,
+  connection: unknown
+): void {
+  app.channel(sessionStreamChannelName(sessionId)).join(connection as never);
+}
+
+/**
+ * Remove a connection from a session's streaming room, but only if the room
+ * already exists. A `remove` for a never-joined room (any authenticated caller
+ * can send one) or a dispose after logout/disconnect already pruned the room
+ * would otherwise re-materialize an empty, never-cleaned channel — the same
+ * leak class as the publish path. `.leave` on an absent room is a no-op anyway.
+ */
+export function leaveSessionStreamChannel(
+  app: Application,
+  sessionId: string,
+  connection: unknown
+): void {
+  existingChannel(app, sessionStreamChannelName(sessionId))?.leave(connection as never);
+}
+
+const DEBUG_REALTIME_PUBLISH =
+  process.env.DISCO_DEBUG_REALTIME_PUBLISH === '1' ||
+  process.env.DEBUG?.includes('realtime-publish');
+
+function realtimePublishDebug(...args: unknown[]): void {
+  if (DEBUG_REALTIME_PUBLISH) {
+    console.debug(...args);
+  }
+}
+
+type PublishContext = Pick<HookContext, 'path' | 'method' | 'id' | 'event' | 'app' | 'params'>;
+
+type ConnectionLike = {
+  user?: (Partial<User> & { _isServiceAccount?: boolean }) | undefined;
+  authentication?: { user?: (Partial<User> & { _isServiceAccount?: boolean }) | undefined };
+};
+
+type RealtimePublishOptions = {
+  app: Application;
+  db?: TenantScopeAwareDatabase;
+  sessionsRepository: SessionRepository;
+  accessCache?: RealtimeAccessCache;
+  multiTenancy?: ResolvedMultiTenancyConfig;
+  /** Present only in explicit HA mode. Redis transports a minimal safe envelope. */
+  realtimeRelay?: {
+    relay: (envelope: RealtimeRelayEnvelope) => void;
+    setRelayHandler: (handler: (envelope: RealtimeRelayEnvelope) => void | Promise<void>) => void;
+  };
+};
+
+type PublishChannel = ReturnType<Application['channel']>;
+
+const SESSION_ID_SCOPED_PATHS = new Set([
+  'tasks',
+  'messages',
+  'session-mcp-servers',
+  'session-env-selections',
+]);
+
+// Authentication and credential control-plane results must never enter shared
+// Redis, even if a future service accidentally enables publication for them.
+export const REDIS_FEATHERS_DENIED_PATHS = new Set([
+  'authentication',
+  'authentication/refresh',
+  'check-auth',
+  'session-tokens',
+  'user-api-keys',
+  'config/resolve-api-key',
+  'mcp-servers/oauth-start',
+  'mcp-servers/oauth-callback',
+  'mcp-servers/oauth-complete',
+  'mcp-servers/oauth-disconnect',
+  'mcp-servers/oauth-status',
+  'mcp-servers/oauth-auth-headers',
+  'mcp-servers/oauth-refresh',
+  'mcp-servers/test-oauth',
+  'user-mcp-oauth-tokens',
+  'codex-auth/device',
+  'codex-auth/import',
+  'codex-auth/logout',
+  'opencode-auth',
+  'terminals',
+]);
+
+function mayEnterRedisRelay(path: string, event: string): boolean {
+  if (REDIS_FEATHERS_DENIED_PATHS.has(path)) return false;
+  return true;
+}
+
+function safeRelayData(data: unknown): unknown | undefined {
+  try {
+    const encoded = JSON.stringify(data);
+    if (encoded === undefined || Buffer.byteLength(encoded, 'utf8') > MAX_REALTIME_RELAY_BYTES)
+      return undefined;
+    return JSON.parse(encoded) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+// High-frequency per-chunk events emitted on the `messages` service during a
+// streaming turn (text + thinking deltas). These fan out once per token-batch,
+// so they must be scoped to session subscribers rather than the whole tenant.
+const MESSAGE_STREAMING_EVENTS = new Set([
+  'streaming:start',
+  'streaming:chunk',
+  'streaming:end',
+  'streaming:error',
+  'thinking:start',
+  'thinking:chunk',
+  'thinking:end',
+]);
+
+// Per-chunk / per-tool events emitted on the `tasks` service during a turn.
+const TASK_STREAMING_EVENTS = new Set(['thinking:chunk', 'tool:start', 'tool:complete']);
+
+function isStreamingEvent(context: PublishContext): boolean {
+  if (context.path === 'messages/streaming') return true;
+  const event = context.event;
+  if (!event) return false;
+  if (context.path === 'messages') {
+    return event.startsWith('streaming:') || MESSAGE_STREAMING_EVENTS.has(event);
+  }
+  if (context.path === 'tasks') {
+    return TASK_STREAMING_EVENTS.has(event);
+  }
+  return false;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function pickString(obj: Record<string, unknown> | null, ...keys: string[]): string | undefined {
+  if (!obj) return undefined;
+  for (const key of keys) {
+    const value = obj[key];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return undefined;
+}
+
+function extractSessionId(data: unknown): string | undefined {
+  const record = asRecord(data);
+  return pickString(record, 'session_id', 'sessionId');
+}
+
+function extractTaskId(data: unknown): string | undefined {
+  const record = asRecord(data);
+  return pickString(record, 'task_id', 'taskId');
+}
+
+function extractMessageId(data: unknown): string | undefined {
+  const record = asRecord(data);
+  return pickString(record, 'message_id', 'messageId');
+}
+
+function extractCreatedBy(data: unknown): string | undefined {
+  const record = asRecord(data);
+  return pickString(record, 'created_by', 'createdBy');
+}
+
+function userFromConnection(
+  connection: unknown
+): (Partial<User> & { _isServiceAccount?: boolean }) | undefined {
+  const c = connection as ConnectionLike | undefined;
+  return c?.user ?? c?.authentication?.user;
+}
+
+function isServiceConnection(connection: unknown): boolean {
+  const user = userFromConnection(connection);
+  return user?._isServiceAccount === true || (user?.role as string | undefined) === 'service';
+}
+
+/** Per-connection flag: set only by the explicit `{capability:true}` announce (not by a plain subscribe), so the owner fallback skips this connection for all sessions. */
+export const SESSION_STREAMS_AWARE_FLAG = '__discoSessionStreamsAware';
+
+/** Set the aware flag. Lives beside the raw `app.channel` surface so realtime-routing mutations stay in one audited place. */
+export function markConnectionSessionStreamsAware(connection: unknown): void {
+  if (connection && typeof connection === 'object') {
+    (connection as Record<string, unknown>)[SESSION_STREAMS_AWARE_FLAG] = true;
+  }
+}
+
+function isSessionStreamsAware(connection: unknown): boolean {
+  return (
+    !!connection &&
+    typeof connection === 'object' &&
+    (connection as Record<string, unknown>)[SESSION_STREAMS_AWARE_FLAG] === true
+  );
+}
+
+async function taskSessionId(context: PublishContext, taskId: string): Promise<string | null> {
+  try {
+    const task = (await context.app.service('tasks').get(taskId, {
+      provider: undefined,
+    })) as { session_id?: string } | null;
+    return task?.session_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function messageSessionId(
+  context: PublishContext,
+  messageId: string
+): Promise<string | null> {
+  try {
+    const message = (await context.app.service('messages').get(messageId, {
+      provider: undefined,
+    })) as { session_id?: string } | null;
+    return message?.session_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolvePersonalWorkspaceOwnerId(
+  data: unknown,
+  context: PublishContext,
+  accessCache: RealtimeAccessCache
+): Promise<string | null | undefined> {
+  if (context.path === 'sessions') {
+    const creator = extractCreatedBy(data);
+    if (creator) return creator;
+    const sessionId = extractSessionId(data);
+    return sessionId ? accessCache.getSessionOwnerId(sessionId) : null;
+  }
+
+  if (!SESSION_ID_SCOPED_PATHS.has(context.path ?? '')) return undefined;
+  let sessionId = extractSessionId(data);
+  if (!sessionId) {
+    const taskId = extractTaskId(data);
+    if (taskId) sessionId = (await taskSessionId(context, taskId)) ?? undefined;
+  }
+  if (!sessionId) {
+    const messageId = extractMessageId(data);
+    if (messageId) sessionId = (await messageSessionId(context, messageId)) ?? undefined;
+  }
+  return sessionId ? accessCache.getSessionOwnerId(sessionId) : null;
+}
+
+function filterToServiceConnections(authenticated: PublishChannel): PublishChannel {
+  return authenticated.filter((connection: unknown) => isServiceConnection(connection));
+}
+
+function filterToUserIdsOrServices(
+  authenticated: PublishChannel,
+  userIds: Set<string>
+): PublishChannel {
+  return authenticated.filter((connection: unknown) => {
+    if (isServiceConnection(connection)) return true;
+    const userId = userFromConnection(connection)?.user_id;
+    return typeof userId === 'string' && userIds.has(userId);
+  });
+}
+
+/**
+ * Delivery set for a streaming event. Streaming chunks are the dominant
+ * always-on realtime cost, so they bypass the tenant-wide broadcast and go to:
+ *
+ *   1. the per-session stream room — connections that explicitly subscribed
+ *      (session panels / transcripts that passed a session-access check),
+ *   2. service connections — scheduler and other service
+ *      consumers keep working exactly as before,
+ *   3. the session owner's own connections — a cheap fallback so a creator's
+ *      already-open tabs keep updating during deploy skew, before a
+ *      stale-cached client has re-subscribed after refresh.
+ *
+ * Authorization is enforced at PUBLISH time, not just at subscribe time. Room
+ * members and the owner fallback are filtered through the current cached
+ * Session owner, so a forged or stale subscription cannot widen delivery.
+ *
+ * Everything else (created/patched/removed, status transitions) keeps its
+ * existing tenant/owner scoping. Malformed events without a resolvable
+ * session id fail closed to service connections only.
+ */
+async function resolveStreamingDelivery(
+  app: Application,
+  data: unknown,
+  tenantScoped: PublishChannel,
+  accessCache: RealtimeAccessCache
+): Promise<PublishChannel | PublishChannel[]> {
+  const serviceConnections = filterToServiceConnections(tenantScoped);
+  const sessionId = extractSessionId(data);
+  if (!sessionId) return serviceConnections;
+
+  // Intersect the room with the tenant/auth channel: a connection that logged
+  // out (removed from authenticated + tenant channels) or was tenant-evicted
+  // but is still socket-connected may linger in a session-stream room, so this
+  // structurally guarantees nothing outside the current tenant/auth set can
+  // receive — independent of the per-connection room cleanup on logout.
+  const tenantConnections = new Set<unknown>(
+    (tenantScoped as unknown as { connections: unknown[] }).connections
+  );
+  // Never materialize the room on the publish path — a session streaming with
+  // zero subscribers would otherwise accumulate an empty, never-cleaned channel
+  // per session. Only an actual subscribe (join) creates it.
+  const existingRoom = existingChannel(app, sessionStreamChannelName(sessionId));
+  const room = existingRoom
+    ? existingRoom.filter((connection: unknown) => tenantConnections.has(connection))
+    : null;
+
+  let ownerId: string | null = null;
+  try {
+    ownerId = await accessCache.getSessionOwnerId(sessionId);
+  } catch {
+    // Best-effort owner fallback; the session room + service connections still
+    // deliver even if the owner lookup fails.
+  }
+  // Connections already in THIS session's room receive via the room, so the
+  // owner fallback excludes them — room-scoped, not connection-wide (an owner
+  // subscribed to A still gets fallback for other owned sessions it never joined).
+  const roomConnections = new Set<unknown>(
+    room ? (room as unknown as { connections: unknown[] }).connections : []
+  );
+  // Owner fallback: only owner connections that haven't announced awareness
+  // (aware clients get streaming via the room) and aren't in this room. Never widens.
+  const ownerChannel = (): PublishChannel =>
+    tenantScoped.filter(
+      (connection: unknown) =>
+        userFromConnection(connection)?.user_id === ownerId &&
+        !isSessionStreamsAware(connection) &&
+        !roomConnections.has(connection)
+    );
+
+  // Disco conversations never widen beyond the Session owner. A stale or
+  // forged room subscription is filtered again at publish time.
+  if (!ownerId) return serviceConnections;
+  const channels: PublishChannel[] = [serviceConnections];
+  if (room) {
+    channels.push(
+      room.filter((connection: unknown) => userFromConnection(connection)?.user_id === ownerId)
+    );
+  }
+  channels.push(ownerChannel());
+  return channels;
+}
+
+function extractConnectionTenantId(context: HookContext): TenantID | undefined {
+  const params = context.params as
+    | {
+        connection?: {
+          tenant?: unknown;
+          data?: { tenant?: unknown };
+        };
+      }
+    | undefined;
+  const tenant = params?.connection?.tenant ?? params?.connection?.data?.tenant;
+  return tenant && typeof tenant === 'object' && 'tenant_id' in tenant
+    ? typeof tenant.tenant_id === 'string'
+      ? (tenant.tenant_id as TenantID)
+      : undefined
+    : undefined;
+}
+
+function resolveRealtimeTenantId(
+  multiTenancy: ResolvedMultiTenancyConfig,
+  context: HookContext
+): TenantID {
+  try {
+    return resolveTenantContext(multiTenancy, { params: context.params }).tenant_id;
+  } catch (error) {
+    const connectionTenantId = extractConnectionTenantId(context);
+    if (error instanceof TenantResolutionError && connectionTenantId) return connectionTenantId;
+
+    const ambientTenantId = getCurrentTenantId();
+    if (error instanceof TenantResolutionError && ambientTenantId) {
+      return ambientTenantId as TenantID;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Register the single global Feathers publish handler.
+ *
+ * Session-scoped events are delivered only to the creating user's connections
+ * and scoped service executors. Other tenant-wide control-plane events retain
+ * their normal authenticated delivery.
+ */
+export function configureRealtimePublish(options: RealtimePublishOptions): void {
+  const {
+    app,
+    db,
+    sessionsRepository,
+    accessCache = new RealtimeAccessCache({
+      sessionsRepository: sessionsRepository as unknown as RealtimeAccessSessionRepository,
+    }),
+    multiTenancy,
+    realtimeRelay,
+  } = options;
+
+  const resolveLocalDelivery = async (data: unknown, context: HookContext) => {
+    const authenticated = app.channel('authenticated');
+    let tenantScoped = authenticated;
+    let tenantId: TenantID | undefined;
+    if (multiTenancy) {
+      try {
+        tenantId = resolveRealtimeTenantId(multiTenancy, context);
+        tenantScoped = app.channel(tenantChannelName(tenantId));
+      } catch (error) {
+        if (error instanceof TenantResolutionError) {
+          console.warn('[realtime] Suppressing event without tenant context', {
+            path: context.path,
+            event: context.event,
+            method: context.method,
+          });
+          return { delivery: filterToServiceConnections(authenticated), tenantId: undefined };
+        }
+        throw error;
+      }
+    }
+
+    const isExecutorControlEvent =
+      (context.path === 'tasks' && context.event === 'termination_requested') ||
+      (context.path === 'tasks' && context.event === 'steering_requested') ||
+      (context.path === 'messages' && context.event === 'permission_resolved');
+    if (isExecutorControlEvent) {
+      const taskId = extractTaskId(data);
+      if (!tenantId || !taskId) return { delivery: [] as PublishChannel[], tenantId };
+      const room = existingChannel(app, executorTaskChannelName(tenantId, taskId));
+      return { delivery: room ? [room] : ([] as PublishChannel[]), tenantId };
+    }
+
+    const resolveDelivery = async (): Promise<PublishChannel | PublishChannel[]> => {
+      if (isStreamingEvent(context)) {
+        return resolveStreamingDelivery(app, data, tenantScoped, accessCache);
+      }
+
+      const ownerId = await resolvePersonalWorkspaceOwnerId(data, context, accessCache);
+      if (ownerId === null) return filterToServiceConnections(tenantScoped);
+      if (ownerId !== undefined) {
+        return filterToUserIdsOrServices(tenantScoped, new Set([ownerId]));
+      }
+      return tenantScoped;
+    };
+
+    const delivery =
+      db && tenantId
+        ? await runWithTenantDatabaseScope(db, tenantId, resolveDelivery)
+        : await resolveDelivery();
+    return { delivery, tenantId };
+  };
+
+  app.publish(async (data: unknown, context: HookContext) => {
+    if (context.path && context.method && !isStreamingEvent(context)) {
+      realtimePublishDebug(
+        `📡 [Publish] ${context.path} ${context.method}`,
+        context.id
+          ? `id: ${typeof context.id === 'string' ? shortId(context.id) : context.id}`
+          : '',
+        `channels: ${app.channel('authenticated').length}`
+      );
+    }
+
+    const resolved = await resolveLocalDelivery(data, context);
+    if (
+      realtimeRelay &&
+      resolved.tenantId &&
+      context.path &&
+      context.event &&
+      mayEnterRedisRelay(context.path, context.event)
+    ) {
+      // Feathers after-hooks may redact a service result by setting dispatch.
+      // The local transport prefers that value; Redis must do the same or a
+      // gateway/config service could fan out the unredacted event argument.
+      const dispatchedData = context.dispatch !== undefined ? context.dispatch : data;
+      const relayData = safeRelayData(dispatchedData);
+      if (relayData !== undefined) {
+        const envelope: RealtimeRelayEnvelope = {
+          version: REALTIME_RELAY_VERSION,
+          tenantId: resolved.tenantId,
+          path: context.path,
+          event: context.event,
+          ...(context.method ? { method: context.method } : {}),
+          ...(typeof context.id === 'string' || typeof context.id === 'number'
+            ? { id: context.id }
+            : {}),
+          data: relayData,
+        };
+        try {
+          if (!isRealtimeRelayEnvelope(envelope)) {
+            console.warn('[realtime/redis] publication omitted: envelope is not bounded JSON');
+            return resolved.delivery;
+          }
+          realtimeRelay.relay(envelope);
+        } catch {
+          // Redis readiness has already turned false. The durable mutation is
+          // not rolled back merely because its best-effort notification failed.
+          console.warn('[realtime/redis] publication relay unavailable');
+        }
+      } else {
+        console.warn('[realtime/redis] publication omitted: payload is not bounded JSON');
+      }
+    }
+    return resolved.delivery;
+  });
+
+  realtimeRelay?.setRelayHandler(async (envelope) => {
+    // Never trust the Redis namespace as authorization. Re-run the exact local
+    // tenant/owner publisher against this replica's own authenticated channels.
+    if (!mayEnterRedisRelay(envelope.path, envelope.event)) return;
+    const params: HookContext['params'] & Record<string, unknown> = {
+      provider: 'socketio-redis-relay',
+      tenant: { tenant_id: envelope.tenantId, source: 'explicit' },
+    };
+    const context = {
+      app,
+      path: envelope.path,
+      event: envelope.event,
+      method: envelope.method,
+      id: envelope.id,
+      params,
+      result: envelope.data,
+      dispatch: envelope.data,
+    } as unknown as HookContext;
+    const resolved = await resolveLocalDelivery(envelope.data, context);
+    if (resolved.tenantId !== envelope.tenantId) return;
+    const combined = combinePublishChannels(resolved.delivery);
+    if (process.env.DISCO_DEBUG_REALTIME_PUBLISH === '1') {
+      console.debug(
+        `[realtime/redis] relay authorized path=${envelope.path} event=${envelope.event} tenant=${envelope.tenantId} connections=${combined.connections.length}`
+      );
+    }
+    if (combined.connections.length === 0) return;
+    // This enters Feathers' transport dispatcher directly and deliberately
+    // does not re-enter app.publish, preventing a Redis relay loop.
+    (app as unknown as { emit: (...args: unknown[]) => boolean }).emit(
+      'publish',
+      envelope.event,
+      combined,
+      context,
+      envelope.data
+    );
+  });
+}
+
+function combinePublishChannels(delivery: PublishChannel | PublishChannel[]) {
+  const channels = Array.isArray(delivery) ? delivery : [delivery];
+  const connections = [...new Set(channels.flatMap((channel) => channel.connections as unknown[]))];
+  return {
+    connections,
+    get length() {
+      return connections.length;
+    },
+    dataFor(connection: unknown) {
+      const channel = channels.find((candidate) =>
+        (candidate.connections as unknown[]).includes(connection)
+      ) as (PublishChannel & { data?: unknown; dataFor?: (value: unknown) => unknown }) | undefined;
+      return channel?.dataFor ? channel.dataFor(connection) : channel?.data;
+    },
+  };
+}

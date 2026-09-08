@@ -1,0 +1,41 @@
+# PostgreSQL + RBAC Testing Environment
+# Extends base docker-compose.yml with PostgreSQL database and RBAC features
+#
+# Usage: docker compose --profile postgres up
+#
+# This profile provides:
+# - PostgreSQL database (instead of SQLite)
+# - RBAC + executor filesystem sandbox enabled
+# - Test users (alice, bob)
+# - Test branches with ownership configured
+#
+services:
+  disco-dev:
+    # Full sandbox environments select this file explicitly, so Compose does
+    # not auto-load docker-compose.override.yml. Permit Codex's nested Linux
+    # sandbox here as part of the self-contained full environment overlay.
+    security_opt:
+      - apparmor=unconfined
+      - seccomp=unconfined
+    environment:
+      # PostgreSQL database configuration
+      - DISCO_DB_DIALECT=postgresql
+      - DATABASE_URL=postgresql://disco_app:disco_dev_secret@postgres:5432/disco
+
+      # PostgreSQL startup skips the SQLite-only `disco init`, so provide the
+      # stable development secrets that production supplies via its secret
+      # manager. These values are intentionally local-environment-only.
+      - DISCO_JWT_SECRET=${DISCO_JWT_SECRET:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}
+      - DISCO_MASTER_SECRET=${DISCO_MASTER_SECRET:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}
+
+      # Enable RBAC + local filesystem sandbox
+      - DISCO_RBAC_ENABLED=${DISCO_RBAC_ENABLED:-true}
+      - DISCO_UNIX_USER_MODE=${DISCO_UNIX_USER_MODE:-sandbox}
+      - DISCO_SANDBOX_ENABLED=${DISCO_SANDBOX_ENABLED:-true}
+      - DISCO_SANDBOX_HOME_MODE=${DISCO_SANDBOX_HOME_MODE:-per_user}
+
+      # Create test principals (alice, bob) on startup
+      - CREATE_RBAC_TEST_USERS=${CREATE_RBAC_TEST_USERS:-true}
+
+    # Use PostgreSQL+RBAC-specific entrypoint
+    entrypoint: ['/usr/local/bin/docker-entrypoint-postgres.sh']

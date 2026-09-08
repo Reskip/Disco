@@ -1,0 +1,123 @@
+import { sql } from 'drizzle-orm';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { generateId } from '../../lib/ids';
+import { TaskStatus } from '../../types/task';
+import { createDatabase, type Database } from '../client';
+import { isPostgresDatabase } from '../database-wrapper';
+import { initializeDatabase } from '../migrate';
+import { SessionRepository } from './sessions';
+import { TaskRepository } from './tasks';
+
+const postgresUrl = process.env.DISCO_TEST_POSTGRES_URL;
+const usesPostgresSchema = process.env.DISCO_DB_DIALECT === 'postgresql';
+
+describe.skipIf(!postgresUrl || !usesPostgresSchema)('TaskRepository PostgreSQL', () => {
+  let db: Database;
+  const originalTimezone = process.env.TZ;
+
+  beforeAll(async () => {
+    process.env.TZ = 'America/Sao_Paulo';
+    db = createDatabase({ dialect: 'postgresql', url: postgresUrl! });
+    await initializeDatabase(db);
+    if (!isPostgresDatabase(db)) throw new Error('PostgreSQL test requires PostgreSQL');
+    await db.execute(sql`SET TIME ZONE 'America/Sao_Paulo'`);
+  });
+
+  afterAll(async () => {
+    if (originalTimezone === undefined) delete process.env.TZ;
+    else process.env.TZ = originalTimezone;
+    await (db as Database & { $client: { end: () => Promise<void> } }).$client.end();
+  });
+
+  it('preserves the claimed UTC instant across an idempotent reread in a non-UTC timezone', async () => {
+    expect(new Date('2026-07-11T00:00:00').getTimezoneOffset()).toBe(180);
+
+    const session = await new SessionRepository(db).create({
+      session_id: generateId(),
+      agentic_tool: 'claude-code',
+      created_by: 'postgres-test-user',
+      working_directory: `/tmp/postgres-task-claim/${generateId()}`,
+    });
+    const tasks = new TaskRepository(db);
+    const task = await tasks.create({
+      task_id: generateId(),
+      session_id: session.session_id,
+      created_by: 'postgres-test-user',
+      full_prompt: 'postgres timestamp regression',
+      status: TaskStatus.DISPATCHING,
+      message_range: {
+        start_index: 0,
+        end_index: 0,
+        start_timestamp: new Date().toISOString(),
+      },
+      git_state: { ref_at_start: 'main', sha_at_start: 'postgres-test' },
+      tool_use_count: 0,
+    });
+    const secondTask = await tasks.create({
+      task_id: generateId(),
+      session_id: session.session_id,
+      created_by: 'postgres-test-user',
+      full_prompt: 'postgres SQL page regression',
+      status: TaskStatus.COMPLETED,
+      message_range: {
+        start_index: 0,
+        end_index: 0,
+        start_timestamp: new Date().toISOString(),
+      },
+      git_state: { ref_at_start: 'main', sha_at_start: 'postgres-test' },
+      tool_use_count: 0,
+    });
+    const taskPage = await tasks.findPage({
+      sessionId: session.session_id,
+      sort: { task_id: 1 },
+      limit: 1,
+      skip: 1,
+    });
+    expect(taskPage).toMatchObject({ total: 2 });
+    expect(taskPage.data.map((row) => row.task_id)).toEqual(
+      [task.task_id, secondTask.task_id].sort().slice(1)
+    );
+
+    const beforeClaim = Date.now();
+    const first = await tasks.connectExecutor(task.task_id);
+    const second = await tasks.connectExecutor(task.task_id);
+    const afterClaim = Date.now();
+
+    expect(first?.transitioned).toBe(true);
+    expect(second).toEqual({ task: first?.task, transitioned: false });
+    expect(first?.task.last_executor_heartbeat_at).toBe(first?.task.executor_connected_at);
+    const connectedAt = Date.parse(first!.task.executor_connected_at!);
+    expect(connectedAt).toBeGreaterThanOrEqual(beforeClaim);
+    expect(connectedAt).toBeLessThanOrEqual(afterClaim);
+
+    await Promise.allSettled([
+      tasks.claimTermination({
+        taskId: task.task_id,
+        cause: 'user_stop',
+        errorMessage: 'Stopped by user',
+      }),
+      tasks.updateFromExecutor(task.task_id, { status: TaskStatus.AWAITING_INPUT }),
+    ]);
+    expect(await tasks.findById(task.task_id)).toMatchObject({
+      status: TaskStatus.STOPPING,
+      termination_request: { cause: 'user_stop' },
+    });
+    await expect(tasks.updateFromExecutor(task.task_id, { model: 'late' })).rejects.toThrow(
+      'not connected and executor-writable'
+    );
+
+    if (!isPostgresDatabase(db)) throw new Error('PostgreSQL test requires PostgreSQL');
+    const columns = await db.execute(sql`
+      SELECT column_name, data_type
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'tasks'
+        AND column_name IN ('executor_connected_at', 'last_executor_heartbeat_at')
+      ORDER BY column_name
+    `);
+    expect(columns).toEqual([
+      { column_name: 'executor_connected_at', data_type: 'timestamp with time zone' },
+      { column_name: 'last_executor_heartbeat_at', data_type: 'timestamp with time zone' },
+    ]);
+  });
+});

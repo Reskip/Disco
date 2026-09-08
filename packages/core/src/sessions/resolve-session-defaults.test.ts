@@ -1,0 +1,417 @@
+import { describe, expect, it } from 'vitest';
+import type { User, UserID } from '../types/index.js';
+import { resolveSessionDefaults, resolveSessionMcpServerIds } from './resolve-session-defaults.js';
+
+const now = new Date('2026-05-03T00:00:00.000Z');
+
+function makeUser(
+  partial: Partial<User['default_agentic_config']> = {},
+  defaultMcpServerIds?: string[]
+): User {
+  return {
+    user_id: 'user-1' as UserID,
+    email: 'a@b.c',
+    role: 'member',
+    onboarding_completed: true,
+    must_change_password: false,
+    created_at: new Date(),
+    is_scheduled: false,
+    default_agentic_config: partial,
+    default_mcp_server_ids: defaultMcpServerIds,
+  } as unknown as User;
+}
+
+describe('resolveSessionDefaults', () => {
+  describe('permission_config', () => {
+    it('falls back to system default when nothing else is set', () => {
+      const r = resolveSessionDefaults({ agenticTool: 'claude-code' });
+      expect(r.permission_config).toEqual({ mode: 'auto' });
+    });
+
+    it("uses the user's tool default when present", () => {
+      const r = resolveSessionDefaults({
+        agenticTool: 'claude-code',
+        user: makeUser({ 'claude-code': { permissionMode: 'bypassPermissions' } }),
+      });
+      expect(r.permission_config.mode).toBe('bypassPermissions');
+    });
+
+    it('explicit override wins over user default', () => {
+      const r = resolveSessionDefaults({
+        agenticTool: 'claude-code',
+        user: makeUser({ 'claude-code': { permissionMode: 'bypassPermissions' } }),
+        overrides: { permissionMode: 'plan' },
+      });
+      expect(r.permission_config.mode).toBe('plan');
+    });
+
+    it('maps cross-agent modes through mapPermissionMode', () => {
+      // User stored a Claude mode but the target tool is Gemini → must map.
+      const r = resolveSessionDefaults({
+        agenticTool: 'gemini',
+        user: makeUser({ gemini: { permissionMode: 'bypassPermissions' } }),
+      });
+      expect(r.permission_config.mode).toBe('yolo');
+    });
+
+    it('emits full codex sub-config from user defaults', () => {
+      const r = resolveSessionDefaults({
+        agenticTool: 'codex',
+        user: makeUser({
+          codex: {
+            permissionMode: 'auto',
+            codexSandboxMode: 'workspace-write',
+            codexApprovalPolicy: 'on-request',
+            codexNetworkAccess: false,
+          },
+        }),
+      });
+      expect(r.permission_config.codex).toEqual({
+        sandboxMode: 'workspace-write',
+        approvalPolicy: 'on-request',
+        networkAccess: false,
+      });
+    });
+
+    it('always emits codex sub-config for codex sessions, filling missing fields from the mapped mode', () => {
+      // No user defaults — sub-config should be filled from
+      // mapToCodexPermissionConfig(getDefaultPermissionMode('codex')).
+      const r = resolveSessionDefaults({ agenticTool: 'codex' });
+      expect(r.permission_config).toEqual({
+        mode: 'allow-all',
+        codex: {
+          sandboxMode: 'workspace-write',
+          approvalPolicy: 'never',
+          networkAccess: true,
+        },
+      });
+    });
+
+    it("partial user defaults are preserved; missing fields fill from the user's mode (regression: don't escalate to system default)", () => {
+      // User explicitly chose a stricter approval policy but didn't set
+      // sandboxMode or networkAccess. Pre-fix this dropped the sub-config
+      // entirely and the executor fallback escalated approval to 'never'.
+      const r = resolveSessionDefaults({
+        agenticTool: 'codex',
+        user: makeUser({
+          codex: { permissionMode: 'ask', codexApprovalPolicy: 'untrusted' },
+        }),
+      });
+      expect(r.permission_config).toEqual({
+        mode: 'ask',
+        codex: {
+          // sandboxMode + networkAccess fill from mapToCodexPermissionConfig('ask')
+          sandboxMode: 'read-only',
+          approvalPolicy: 'untrusted',
+          networkAccess: false,
+        },
+      });
+    });
+
+    it('partial user defaults (only sandboxMode) — approvalPolicy + networkAccess fill from mode', () => {
+      const r = resolveSessionDefaults({
+        agenticTool: 'codex',
+        user: makeUser({
+          codex: { codexSandboxMode: 'read-only' },
+        }),
+      });
+      expect(r.permission_config.codex).toEqual({
+        sandboxMode: 'read-only',
+        approvalPolicy: 'never', // from default mode 'allow-all'
+        networkAccess: true, // from default mode 'allow-all'
+      });
+    });
+
+    it('explicit codex sub-config overrides user defaults', () => {
+      const r = resolveSessionDefaults({
+        agenticTool: 'codex',
+        user: makeUser({
+          codex: {
+            permissionMode: 'auto',
+            codexSandboxMode: 'workspace-write',
+            codexApprovalPolicy: 'on-request',
+          },
+        }),
+        overrides: {
+          codexSandboxMode: 'read-only',
+          codexApprovalPolicy: 'untrusted',
+          codexNetworkAccess: true,
+        },
+      });
+      expect(r.permission_config.codex).toEqual({
+        sandboxMode: 'read-only',
+        approvalPolicy: 'untrusted',
+        networkAccess: true,
+      });
+    });
+
+    it('omits codex sub-config for non-codex tools', () => {
+      const r = resolveSessionDefaults({
+        agenticTool: 'claude-code',
+        overrides: { codexSandboxMode: 'read-only', codexApprovalPolicy: 'untrusted' },
+      });
+      expect(r.permission_config.codex).toBeUndefined();
+    });
+  });
+
+  describe('model_config', () => {
+    it('falls back to the tool default when no model is configured anywhere', () => {
+      const r = resolveSessionDefaults({ agenticTool: 'claude-code', now });
+      expect(r.model_config).toEqual({
+        mode: 'alias',
+        model: 'claude-sonnet-5',
+        updated_at: now.toISOString(),
+      });
+    });
+
+    it('still returns undefined for tools without a static default (cursor)', () => {
+      const r = resolveSessionDefaults({ agenticTool: 'cursor', now });
+      expect(r.model_config).toBeUndefined();
+    });
+
+    it('leaves Codex effort unset when no Disco override is configured', () => {
+      const r = resolveSessionDefaults({ agenticTool: 'codex', now });
+      expect(r.model_config).toMatchObject({
+        mode: 'alias',
+        model: 'gpt-5.6-sol',
+      });
+      expect(r.model_config).not.toHaveProperty('effort');
+    });
+
+    it('preserves an explicit Codex effort override', () => {
+      const r = resolveSessionDefaults({
+        agenticTool: 'codex',
+        overrides: { modelConfig: { effort: 'xhigh' } },
+        now,
+      });
+      expect(r.model_config).toMatchObject({
+        model: 'gpt-5.6-sol',
+        effort: 'xhigh',
+      });
+    });
+
+    it('merges a Fast tier override onto the default Codex model', () => {
+      const r = resolveSessionDefaults({
+        agenticTool: 'codex',
+        overrides: { modelConfig: { serviceTier: 'fast' } },
+        now,
+      });
+      expect(r.model_config).toMatchObject({
+        model: 'gpt-5.6-sol',
+        serviceTier: 'fast',
+      });
+    });
+
+    it("uses the user's tool default model when present", () => {
+      const r = resolveSessionDefaults({
+        agenticTool: 'claude-code',
+        user: makeUser({ 'claude-code': { modelConfig: { model: 'claude-sonnet-5' } } }),
+        now,
+      });
+      expect(r.model_config?.model).toBe('claude-sonnet-5');
+      expect(r.model_config?.updated_at).toBe(now.toISOString());
+    });
+
+    it("preserves advisorModel from the user's tool default", () => {
+      const r = resolveSessionDefaults({
+        agenticTool: 'claude-code',
+        user: makeUser({
+          'claude-code': { modelConfig: { model: 'claude-sonnet-5', advisorModel: 'opus' } },
+        }),
+        now,
+      });
+      expect(r.model_config).toEqual({
+        mode: 'alias',
+        model: 'claude-sonnet-5',
+        advisorModel: 'opus',
+        updated_at: now.toISOString(),
+      });
+    });
+
+    it('merges an effort-only override onto the tool default model', () => {
+      const r = resolveSessionDefaults({
+        agenticTool: 'claude-code',
+        overrides: { modelConfig: { effort: 'max' } },
+        now,
+      });
+      expect(r.model_config).toEqual({
+        mode: 'alias',
+        model: 'claude-sonnet-5',
+        effort: 'max',
+        updated_at: now.toISOString(),
+      });
+    });
+
+    it('merges an effort-only override onto the user default model', () => {
+      const r = resolveSessionDefaults({
+        agenticTool: 'claude-code',
+        user: makeUser({ 'claude-code': { modelConfig: { model: 'claude-opus-4-6' } } }),
+        overrides: { modelConfig: { effort: 'max' } },
+        now,
+      });
+      expect(r.model_config).toEqual({
+        mode: 'alias',
+        model: 'claude-opus-4-6',
+        effort: 'max',
+        updated_at: now.toISOString(),
+      });
+    });
+
+    it('merges split advisor/effort overrides onto the user default model', () => {
+      const r = resolveSessionDefaults({
+        agenticTool: 'claude-code',
+        user: makeUser({
+          'claude-code': { modelConfig: { model: 'claude-opus-4-6', effort: 'high' } },
+        }),
+        overrides: { modelConfig: { advisorModel: 'sonnet' } },
+        now,
+      });
+      expect(r.model_config).toEqual({
+        mode: 'alias',
+        model: 'claude-opus-4-6',
+        effort: 'high',
+        advisorModel: 'sonnet',
+        updated_at: now.toISOString(),
+      });
+    });
+
+    it('explicit override wins over user default (no field merging)', () => {
+      const r = resolveSessionDefaults({
+        agenticTool: 'claude-code',
+        user: makeUser({
+          'claude-code': { modelConfig: { model: 'claude-sonnet-5', effort: 'high' } },
+        }),
+        overrides: { modelConfig: { model: 'claude-opus-4-6' } },
+        now,
+      });
+      expect(r.model_config?.model).toBe('claude-opus-4-6');
+      // first-wins, not merge — must NOT inherit effort from user default
+      expect(r.model_config).not.toHaveProperty('effort');
+    });
+  });
+
+  describe('mcp_server_ids', () => {
+    it('explicit override wins, including empty array (= "no MCPs")', () => {
+      const r = resolveSessionDefaults({
+        agenticTool: 'claude-code',
+        user: makeUser({}, ['user-1', 'user-2']),
+        overrides: { mcpServerIds: [] },
+      });
+      expect(r.mcp_server_ids).toEqual([]);
+    });
+
+    it('uses user defaults when no override is supplied', () => {
+      const r = resolveSessionDefaults({
+        agenticTool: 'claude-code',
+        user: makeUser({}, ['user-1']),
+      });
+      expect(r.mcp_server_ids).toEqual(['user-1']);
+    });
+
+    it('returns empty array when nothing is configured anywhere', () => {
+      const r = resolveSessionDefaults({ agenticTool: 'claude-code' });
+      expect(r.mcp_server_ids).toEqual([]);
+    });
+  });
+
+  describe('regression: issue #1064', () => {
+    it("a Claude session with user default 'bypassPermissions' resolves to bypassPermissions, not the most restrictive default", () => {
+      // Previously the UI drag-into-zone path created sessions with
+      // permission_config: null, which Claude Code interprets as "ask for
+      // every tool". With the helper + before:create hook, the user's
+      // saved default is honored.
+      const r = resolveSessionDefaults({
+        agenticTool: 'claude-code',
+        user: makeUser({ 'claude-code': { permissionMode: 'bypassPermissions' } }),
+      });
+      expect(r.permission_config.mode).toBe('bypassPermissions');
+    });
+  });
+
+  describe('cross-tool spawn fallback (covers SessionsService.spawn)', () => {
+    // Regression coverage for the spawn() cross-tool change in 7992a712:
+    // when the user has NO default for the target tool, the spawn path now
+    // adopts the helper's resolved values instead of partially keeping the
+    // parent's. Verify the helper produces sensible output for that case.
+
+    it('cross-tool spawn with no user default for target tool: returns mapped system default permission mode', () => {
+      // User has Claude defaults but is spawning a Codex child. There's no
+      // codex entry in default_agentic_config, so we should fall back to
+      // codex's system default ('allow-all'), not to whatever the parent had.
+      const r = resolveSessionDefaults({
+        agenticTool: 'codex',
+        user: makeUser({ 'claude-code': { permissionMode: 'bypassPermissions' } }),
+      });
+      expect(r.permission_config.mode).toBe('allow-all');
+    });
+
+    it('cross-tool spawn from Claude → Gemini with no user default: returns gemini system default', () => {
+      const r = resolveSessionDefaults({
+        agenticTool: 'gemini',
+        user: makeUser({ 'claude-code': { permissionMode: 'acceptEdits' } }),
+      });
+      expect(r.permission_config.mode).toBe('autoEdit');
+    });
+
+    it('cross-tool spawn with no user at all: returns system default and is non-null', () => {
+      // The helper is called from the catch branch in spawn() when the user
+      // lookup fails. Ensure it still returns a populated permission_config.
+      const r = resolveSessionDefaults({ agenticTool: 'codex' });
+      expect(r.permission_config).toBeDefined();
+      expect(r.permission_config.mode).toBe('allow-all');
+    });
+  });
+
+  describe('combined runtime overrides', () => {
+    // Keep the compatibility resolver delegating both agent configuration and
+    // MCP selection to their respective owners.
+
+    it('threads codex sub-config + mcp ids + permission/model overrides together', () => {
+      const r = resolveSessionDefaults({
+        agenticTool: 'codex',
+        user: makeUser({
+          codex: {
+            permissionMode: 'auto',
+            codexSandboxMode: 'workspace-write',
+            codexApprovalPolicy: 'on-request',
+          },
+        }),
+        overrides: {
+          // Simulates GatewayAgenticConfig fully populated by a Slack channel.
+          permissionMode: 'auto',
+          codexSandboxMode: 'danger-full-access',
+          codexApprovalPolicy: 'never',
+          codexNetworkAccess: true,
+          mcpServerIds: ['gateway-mcp-1', 'gateway-mcp-2'],
+        },
+      });
+      expect(r.permission_config.mode).toBe('auto');
+      expect(r.permission_config.codex).toEqual({
+        sandboxMode: 'danger-full-access',
+        approvalPolicy: 'never',
+        networkAccess: true,
+      });
+      expect(r.mcp_server_ids).toEqual(['gateway-mcp-1', 'gateway-mcp-2']);
+    });
+  });
+});
+
+describe('resolveSessionMcpServerIds', () => {
+  it('uses explicit IDs without falling through, including an empty selection', () => {
+    const fallback = {
+      user: makeUser({}, ['user-1']),
+    };
+
+    expect(resolveSessionMcpServerIds({ ...fallback, explicit: ['explicit-1'] })).toEqual([
+      'explicit-1',
+    ]);
+    expect(resolveSessionMcpServerIds({ ...fallback, explicit: [] })).toEqual([]);
+  });
+
+  it('falls back to user defaults', () => {
+    const user = makeUser({}, ['user-1']);
+
+    expect(resolveSessionMcpServerIds({ user })).toEqual(['user-1']);
+    expect(resolveSessionMcpServerIds({})).toEqual([]);
+  });
+});

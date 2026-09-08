@@ -1,0 +1,358 @@
+/* biome-ignore-all lint/plugin/noFirstPartyCss: modal split-pane layout and scoped Ant Design editor states require descendant selectors. */
+/* biome-ignore-all lint/complexity/noImportantStyles: editor sizing must override Ant Design textarea inline sizing. */
+
+.disco-agent-edit-modal .ant-modal-body,
+.disco-agent-edit-modal .ant-tabs,
+.disco-agent-edit-modal .ant-tabs-body-holder,
+.disco-agent-edit-modal .ant-tabs-body,
+.disco-agent-edit-modal .ant-tabs-content-holder,
+.disco-agent-edit-modal .ant-tabs-content,
+.disco-agent-edit-modal .ant-tabs-tabpane {
+  min-height: 0;
+}
+
+.disco-agent-edit-modal .ant-tabs {
+  height: 100%;
+}
+
+.disco-agent-mobile-nav {
+  display: none;
+}
+
+.disco-agent-edit-modal .ant-tabs-content-holder,
+.disco-agent-edit-modal .ant-tabs-body-holder,
+.disco-agent-edit-modal .ant-tabs-body,
+.disco-agent-edit-modal .ant-tabs-content,
+.disco-agent-edit-modal .ant-tabs-tabpane {
+  height: 100%;
+  overflow: hidden;
+}
+
+.disco-agent-basic-panel {
+  box-sizing: border-box;
+  height: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 8px 8px 24px;
+  scrollbar-gutter: stable;
+}
+
+.disco-agent-basic-panel form {
+  width: min(620px, 100%);
+  margin-inline: auto;
+}
+
+.disco-agent-edit-section-heading {
+  display: flex;
+  width: min(620px, 100%);
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 0 auto 14px;
+}
+
+.disco-agent-edit-section-heading > div {
+  display: grid;
+  gap: 2px;
+}
+
+.disco-agent-edit-section-heading h5 {
+  margin: 0;
+}
+
+.disco-agent-danger-panel {
+  box-sizing: border-box;
+  min-width: 0;
+  height: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 24px 12px;
+}
+
+.disco-agent-danger-content {
+  box-sizing: border-box;
+  display: grid;
+  width: min(600px, 100%);
+  min-width: 0;
+  margin-inline: auto;
+  gap: 14px;
+  padding: 24px;
+  border: 1px solid
+    color-mix(in srgb, var(--ant-color-error) 36%, var(--ant-color-border-secondary));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--ant-color-error-bg) 62%, var(--ant-color-bg-container));
+}
+
+.disco-agent-danger-content h4,
+.disco-agent-danger-content p {
+  margin: 0;
+}
+
+.disco-agent-danger-content > .ant-typography code {
+  display: inline-block;
+  width: fit-content;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.disco-agent-danger-content > .ant-popconfirm-open,
+.disco-agent-danger-content > .ant-btn {
+  justify-self: start;
+}
+
+.disco-agent-edit-avatar-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 18px;
+  padding: 14px;
+  border: 1px solid var(--ant-color-border-secondary);
+  border-radius: 12px;
+  background: var(--ant-color-fill-quaternary);
+}
+
+.disco-agent-edit-avatar-row > div {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.disco-agent-edit-avatar-row > div > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 3px;
+}
+
+.disco-agent-basic-actions {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-top: 4px;
+}
+
+.disco-agent-basic-actions > div {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
+.disco-agent-document-manager {
+  box-sizing: border-box;
+  display: grid;
+  height: 100%;
+  min-height: 0;
+  grid-template-columns: minmax(210px, 0.72fr) minmax(360px, 1.55fr);
+  overflow: hidden;
+  border: 1px solid var(--ant-color-border-secondary);
+  border-radius: 12px;
+  background: var(--ant-color-bg-container);
+}
+
+.disco-agent-document-list {
+  min-width: 0;
+  overflow-y: auto;
+  padding: 6px;
+  border-right: 1px solid var(--ant-color-border-secondary);
+}
+
+.disco-agent-document-list-head {
+  display: flex;
+  position: sticky;
+  z-index: 1;
+  top: -6px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 6px 8px;
+  background: var(--ant-color-bg-container);
+}
+
+.disco-agent-document-list .ant-spin {
+  width: 100%;
+}
+
+.disco-agent-document-list .ant-empty {
+  margin-block: 64px;
+}
+
+.disco-agent-document-list button {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.disco-agent-document-list button:hover {
+  background: var(--ant-color-fill-quaternary);
+}
+
+.disco-agent-document-list button.is-active {
+  border-color: color-mix(in srgb, var(--ant-color-primary) 32%, transparent);
+  background: color-mix(in srgb, var(--ant-color-primary) 9%, var(--ant-color-fill-quaternary));
+}
+
+.disco-agent-document-list button > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.disco-agent-document-list button strong,
+.disco-agent-document-list button small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.disco-agent-document-list button small {
+  color: var(--ant-color-text-tertiary);
+  font-weight: 400;
+}
+
+.disco-agent-document-list button em {
+  color: var(--ant-color-text-tertiary);
+  font-size: 11px;
+  font-style: normal;
+}
+
+.disco-agent-document-editor {
+  box-sizing: border-box;
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 12px;
+  padding: 16px;
+}
+
+.disco-agent-document-editor > header,
+.disco-agent-document-editor > footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.disco-agent-document-editor > footer {
+  min-height: 34px;
+}
+
+.disco-agent-document-editor > footer.is-placeholder {
+  pointer-events: none;
+  visibility: hidden;
+}
+
+.disco-agent-document-editor > header h5 {
+  margin: 0 0 2px;
+}
+
+.disco-agent-document-mobile-back {
+  display: none;
+}
+
+.disco-agent-document-enable {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  color: var(--ant-color-text-secondary);
+  font-size: 12px;
+}
+
+.disco-agent-document-editor > .ant-input {
+  height: 100% !important;
+  min-height: 0 !important;
+  resize: none;
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.disco-agent-document-editor > .ant-input[readonly] {
+  background: var(--ant-color-fill-quaternary);
+  color: var(--ant-color-text-secondary);
+  cursor: default;
+}
+
+.disco-agent-document-editor > footer > div {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+@media (max-width: 760px), (max-width: 960px) and (max-height: 500px) {
+  .disco-agent-document-manager {
+    display: block;
+  }
+
+  .disco-agent-document-editor {
+    grid-template-rows: auto minmax(0, 1fr) 116px;
+  }
+
+  .disco-agent-document-editor > footer {
+    min-height: 116px;
+  }
+
+  .disco-agent-document-manager.is-mobile-list .disco-agent-document-list,
+  .disco-agent-document-manager.is-mobile-detail .disco-agent-document-editor {
+    display: grid;
+    height: 100%;
+  }
+
+  .disco-agent-document-manager.is-mobile-list .disco-agent-document-editor,
+  .disco-agent-document-manager.is-mobile-detail .disco-agent-document-list {
+    display: none;
+  }
+
+  .disco-agent-document-list {
+    border: 0;
+  }
+
+  .disco-agent-document-list button {
+    min-height: 52px;
+  }
+
+  .disco-agent-document-mobile-back {
+    display: inline-flex;
+    min-height: 44px;
+    align-items: center;
+    align-self: flex-start;
+  }
+
+  .disco-agent-document-title {
+    min-width: 0;
+  }
+
+  .disco-agent-edit-section-heading,
+  .disco-agent-edit-avatar-row,
+  .disco-agent-basic-actions,
+  .disco-agent-document-editor > header,
+  .disco-agent-document-editor > footer {
+    align-items: stretch;
+  }
+
+  .disco-agent-edit-avatar-row,
+  .disco-agent-edit-section-heading,
+  .disco-agent-basic-actions,
+  .disco-agent-document-editor > header,
+  .disco-agent-document-editor > footer {
+    flex-direction: column;
+  }
+
+  .disco-agent-edit-avatar-row .ant-btn,
+  .disco-agent-basic-actions .ant-btn,
+  .disco-agent-document-editor > footer .ant-btn {
+    min-height: 44px;
+  }
+}

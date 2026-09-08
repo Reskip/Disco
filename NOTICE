@@ -1,0 +1,13 @@
+Disco
+
+This repository contains a customized version of software originating from:
+  Agor, Preset, Inc.
+  https://github.com/preset-io/agor
+
+The local source checkout used for this standalone snapshot was based on:
+  ca14396cbb821f2fa6ce46ef4d21c32e5402e247
+
+The snapshot includes subsequent local modifications. The upstream copyright
+notices and the Business Source License 1.1 text are retained in LICENSE.
+The standalone source repository is maintained at:
+  https://github.com/Reskip/Disco

@@ -1,0 +1,80 @@
+/**
+ * `disco daemon stop` - Stop daemon gracefully
+ */
+
+import { getDaemonUrl, loadConfig, loadConfigFromFile } from '@disco/core/config';
+import { Command } from '@oclif/core';
+import chalk from 'chalk';
+import { isInstalledPackage } from '../../lib/context.js';
+import { getDaemonPid, getManagedDaemonIdentity, stopDaemon } from '../../lib/daemon-manager.js';
+import { isExpectedManagedDaemon, probeDiscoDaemon } from '../../lib/daemon-probe.js';
+import { confirmLegacyManagedDaemonStop } from '../../lib/legacy-daemon-stop.js';
+import { assertLocalContextUnlockedWhenIdentified } from '../../lib/local-context.js';
+
+export default class DaemonStop extends Command {
+  static description = 'Stop daemon gracefully';
+
+  static examples = ['<%= config.bin %> <%= command.id %>'];
+
+  async run(): Promise<void> {
+    // Check if running in production mode
+    if (!isInstalledPackage()) {
+      this.log(chalk.red('✗ Daemon lifecycle commands only work in production mode.'));
+      this.log('');
+      this.log(chalk.bold('In development, stop the daemon with:'));
+      this.log(`  ${chalk.cyan('Use Ctrl+C in the daemon terminal')}`);
+      this.log('');
+      this.exit(1);
+    }
+
+    try {
+      // Validate the PID first; this also clears stale identity state before
+      // a persisted custom config path can influence this command.
+      const pid = getDaemonPid();
+      const identity = getManagedDaemonIdentity();
+      const config = identity?.configPath
+        ? await loadConfigFromFile(identity.configPath)
+        : await loadConfig();
+      await assertLocalContextUnlockedWhenIdentified(config);
+      const daemonUrl = identity?.daemonUrl ?? (await getDaemonUrl());
+      const probe = await probeDiscoDaemon(daemonUrl);
+      const expectedInstanceId = identity?.instanceId;
+
+      if (pid === null) {
+        if (probe.running) {
+          throw new Error(
+            `An Disco daemon is running at ${daemonUrl}, but it is not managed by this CLI. Stop its launchd/systemd service, container, or foreground terminal instead.`
+          );
+        }
+        this.log(chalk.yellow('⚠ Daemon is not running'));
+        this.log('');
+        return;
+      }
+
+      if (!identity) {
+        await confirmLegacyManagedDaemonStop(pid, daemonUrl);
+      } else if (!(await isExpectedManagedDaemon(daemonUrl, expectedInstanceId))) {
+        throw new Error(
+          `Refusing to signal PID ${pid}: it cannot be verified as the CLI-managed Disco daemon at ${daemonUrl}. Remove stale ~/.disco/daemon.pid and ~/.disco/daemon.instance files only after verifying that PID yourself.`
+        );
+      }
+
+      const stopped = stopDaemon();
+
+      if (!stopped) {
+        this.log(chalk.yellow('⚠ Daemon is not running'));
+        this.log('');
+        return;
+      }
+
+      this.log(chalk.green('✓ Daemon stopped successfully'));
+      this.log('');
+    } catch (error) {
+      this.log(chalk.red('✗ Failed to stop daemon'));
+      this.log('');
+      this.log(`Error: ${(error as Error).message}`);
+      this.log('');
+      this.exit(1);
+    }
+  }
+}

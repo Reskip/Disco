@@ -1,0 +1,237 @@
+import type { McpServer } from '@modelcontextprotocol/server';
+import { describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
+import { ToolDispatcher } from '../register-tool-proxy.js';
+import { ToolRegistry } from '../tool-registry.js';
+import { registerSearchTools } from './search.js';
+
+vi.mock('../server.js', () => ({
+  coerceJsonRecord: (value: unknown) => {
+    if (typeof value !== 'string') return value;
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value;
+    }
+  },
+  textResult: (data: unknown) => ({
+    content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+  }),
+}));
+
+function textResult(data: unknown) {
+  return {
+    content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+  };
+}
+
+type ToolHandler = (
+  args: Record<string, unknown>,
+  requestContext?: unknown
+) => Promise<{
+  content: Array<{ type: string; text: string }>;
+  isError?: boolean;
+}>;
+
+type ToolConfig = {
+  inputSchema?: {
+    safeParse: (value: unknown) => {
+      success: boolean;
+      data?: unknown;
+      error?: { issues?: Array<{ path: Array<string | number>; message: string }> };
+    };
+  };
+};
+
+function captureExecuteTool(targetHandler = vi.fn(async (args: unknown) => textResult({ args }))) {
+  let config: ToolConfig | undefined;
+  let handler: ToolHandler | undefined;
+  const dispatcher = new ToolDispatcher();
+  const requestContext = { requestId: 'test-request' };
+  dispatcher.register(
+    'disco_sessions_list',
+    {
+      inputSchema: z.object({
+        branchId: z.string().optional(),
+        limit: z.number().optional(),
+      }),
+    },
+    targetHandler
+  );
+
+  const fakeServer = {
+    registerTool: (name: string, cfg: ToolConfig, cb: ToolHandler) => {
+      if (name === 'disco_execute_tool') {
+        config = cfg;
+        handler = cb;
+      }
+    },
+  } as unknown as McpServer;
+
+  registerSearchTools(fakeServer, new ToolRegistry(), dispatcher);
+
+  if (!config || !handler) throw new Error('disco_execute_tool was not registered');
+  const invoke = (args: Record<string, unknown>) => handler!(args, requestContext);
+  return { config, handler: invoke, targetHandler, requestContext };
+}
+
+function captureSearchTools(registry = new ToolRegistry()) {
+  const captured: Record<string, { config: ToolConfig; handler: ToolHandler }> = {};
+  const fakeServer = {
+    _registeredTools: {},
+    registerTool: (name: string, cfg: ToolConfig, cb: ToolHandler) => {
+      captured[name] = { config: cfg, handler: cb };
+    },
+  } as unknown as McpServer;
+
+  registerSearchTools(fakeServer, registry);
+  return captured;
+}
+
+describe('disco_execute_tool', () => {
+  it('accepts the canonical tool_name field and forwards nested arguments', async () => {
+    const { handler, targetHandler, requestContext } = captureExecuteTool();
+
+    const result = await handler({
+      tool_name: 'disco_sessions_list',
+      arguments: { branchId: 'branch-1' },
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(targetHandler).toHaveBeenCalledWith({ branchId: 'branch-1' }, requestContext);
+  });
+
+  it('rejects camelCase toolName with a clear schema error', () => {
+    const { config } = captureExecuteTool();
+
+    const parsed = config.inputSchema?.safeParse({
+      toolName: 'disco_sessions_list',
+      arguments: { branchId: 'branch-1' },
+    });
+
+    expect(parsed?.success).toBe(false);
+    expect(parsed?.error?.issues?.[0]?.path).toEqual(['tool_name']);
+    expect(parsed?.error?.issues?.[0]?.message).toMatch(/tool_name is required/);
+    expect(parsed?.error?.issues?.[0]?.message).toMatch(/"arguments"/);
+  });
+
+  it('returns an actionable schema error when the tool name is omitted', () => {
+    const { config } = captureExecuteTool();
+
+    const parsed = config.inputSchema?.safeParse({
+      arguments: { branchId: 'branch-1' },
+    });
+
+    expect(parsed?.success).toBe(false);
+    expect(parsed?.error?.issues?.[0]?.path).toEqual(['tool_name']);
+    expect(parsed?.error?.issues?.[0]?.message).toMatch(/tool_name is required/);
+    expect(parsed?.error?.issues?.[0]?.message).toMatch(/"tool_name"/);
+  });
+
+  it('does not leak proxy-only fields into flattened target-tool arguments', async () => {
+    const { handler, targetHandler, requestContext } = captureExecuteTool();
+
+    const result = await handler({
+      tool_name: 'disco_sessions_list',
+      branchId: 'branch-1',
+      limit: 5,
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(targetHandler).toHaveBeenCalledWith({ branchId: 'branch-1', limit: 5 }, requestContext);
+  });
+
+  it('points invalid tool names to search and details discovery flow', async () => {
+    const { handler } = captureExecuteTool();
+
+    const result = await handler({
+      tool_name: 'disco_missing_tool',
+      arguments: {},
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(parsed.error).toMatch(/not found/);
+    expect(parsed.how_to_find_tools).toMatch(/disco_search_tools/);
+    expect(parsed.how_to_find_tools).toMatch(/disco_get_tool_details/);
+  });
+
+  it('rejects unknown target-tool arguments instead of silently stripping them', async () => {
+    const { handler, targetHandler } = captureExecuteTool();
+
+    const result = await handler({
+      tool_name: 'disco_sessions_list',
+      arguments: {
+        limit: 1,
+        definitelyNotAParam: 'typo',
+      },
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(parsed.error).toMatch(/unknown argument "definitelyNotAParam"/);
+    expect(parsed.error).toMatch(/disco_get_tool_details/);
+    expect(targetHandler).not.toHaveBeenCalled();
+  });
+});
+
+describe('disco_get_tool_details', () => {
+  it('returns one exact schema at a time', async () => {
+    const registry = new ToolRegistry();
+    registry.setCurrentDomain('sessions');
+    registry.register({
+      name: 'disco_sessions_list',
+      description: 'List sessions',
+      inputSchema: {
+        type: 'object',
+        properties: { branchId: { type: 'string' } },
+      },
+      annotations: { readOnlyHint: true },
+    });
+    const tools = captureSearchTools(registry);
+
+    const result = await tools.disco_get_tool_details.handler({
+      tool_name: 'disco_sessions_list',
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.tool.name).toBe('disco_sessions_list');
+    expect(parsed.tool.inputSchema.properties.branchId.type).toBe('string');
+    expect(parsed.usage.execute_with.tool_name).toBe('disco_sessions_list');
+  });
+});
+
+describe('disco_search_tools', () => {
+  it('keeps full detail responses concise until search narrows to one tool', async () => {
+    const registry = new ToolRegistry();
+    registry.setCurrentDomain('sessions');
+    registry.register({
+      name: 'disco_sessions_list',
+      description: 'List sessions',
+      inputSchema: { type: 'object', properties: { branchId: { type: 'string' } } },
+    });
+    registry.register({
+      name: 'disco_sessions_get',
+      description: 'Get a session',
+      inputSchema: { type: 'object', properties: { sessionId: { type: 'string' } } },
+    });
+    const tools = captureSearchTools(registry);
+
+    const broad = await tools.disco_search_tools.handler({
+      domain: 'sessions',
+      detail: 'full',
+      max_results: 10,
+    });
+    const broadParsed = JSON.parse(broad.content[0].text);
+    expect(broadParsed.tools[0].inputSchema).toBeUndefined();
+    expect(broadParsed.hint).toMatch(/narrowed to one tool/);
+
+    const narrow = await tools.disco_search_tools.handler({
+      query: 'disco_sessions_get',
+      detail: 'full',
+      max_results: 1,
+    });
+    const narrowParsed = JSON.parse(narrow.content[0].text);
+    expect(narrowParsed.tools[0].inputSchema.properties.sessionId.type).toBe('string');
+  });
+});

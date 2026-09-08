@@ -1,0 +1,104 @@
+/* biome-ignore-all lint/plugin/noFirstPartyCss: conversation search is a product shell surface. */
+
+.disco-session-search-controls {
+  display: grid;
+  gap: 10px;
+}
+
+.disco-session-search-results {
+  min-height: 260px;
+  max-height: min(480px, calc(var(--disco-effective-vh, 100vh) - 270px));
+  margin-top: 12px;
+  overflow-y: auto;
+  border: 1px solid var(--ant-color-border-secondary);
+  border-radius: 12px;
+  background: var(--ant-color-bg-container);
+}
+
+.disco-session-search-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  min-height: 260px;
+  color: var(--ant-color-text-secondary);
+}
+
+.disco-session-search-results > .ant-empty {
+  margin-block: 78px;
+}
+
+.disco-session-search-result {
+  display: flex;
+  width: 100%;
+  gap: 11px;
+  padding: 11px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--ant-color-border-secondary);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.disco-session-search-result:last-child {
+  border-bottom: 0;
+}
+
+.disco-session-search-result:hover,
+.disco-session-search-result.is-active {
+  background: var(--ant-color-fill-tertiary);
+}
+
+.disco-session-search-result:focus-visible {
+  outline: 2px solid var(--ant-color-primary-border);
+  outline-offset: -2px;
+}
+
+.disco-session-search-result-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 34px;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  background: var(--ant-color-fill-secondary);
+  color: var(--ant-color-text-secondary);
+}
+
+.disco-session-search-result-copy {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 3px;
+}
+
+.disco-session-search-result-title,
+.disco-session-search-result-meta {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 7px;
+}
+
+.disco-session-search-result-title > .ant-typography {
+  min-width: 0;
+}
+
+.disco-session-search-result-meta {
+  justify-content: space-between;
+  font-size: 12px;
+}
+
+.disco-session-search-hint {
+  display: block;
+  margin-top: 9px;
+  text-align: right;
+  font-size: 12px;
+}
+
+.disco-search-match {
+  color: var(--ant-color-text);
+  font-weight: 700;
+}

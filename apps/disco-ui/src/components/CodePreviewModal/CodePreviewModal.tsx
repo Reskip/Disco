@@ -1,0 +1,73 @@
+import type { FileDetail } from '@disco-live/client';
+import { CopyOutlined } from '@ant-design/icons';
+import { Button, Modal, Spin } from 'antd';
+import { ThemedSyntaxHighlighter } from '@/components/ThemedSyntaxHighlighter';
+import { copyToClipboard } from '@/utils/clipboard';
+import { getLanguageFromPath } from '@/utils/language';
+import { useThemedMessage } from '@/utils/message';
+import { getDiscoPortalContainer } from '@/utils/portalContainer';
+
+export interface CodePreviewModalProps {
+  file: FileDetail | null;
+  open: boolean;
+  onClose: () => void;
+  loading?: boolean;
+}
+
+export const CodePreviewModal = ({ file, open, onClose, loading }: CodePreviewModalProps) => {
+  const { showSuccess } = useThemedMessage();
+
+  if (!file) return null;
+
+  const language = getLanguageFromPath(file.path);
+
+  const handleCopyContent = async () => {
+    await copyToClipboard(file.content);
+    showSuccess('Content copied to clipboard!');
+  };
+
+  const handleCopyPath = async () => {
+    await copyToClipboard(file.path);
+    showSuccess('Path copied to clipboard!');
+  };
+
+  return (
+    <Modal
+      getContainer={getDiscoPortalContainer}
+      title={file.path}
+      open={open}
+      onCancel={onClose}
+      width={900}
+      styles={{
+        body: {
+          maxHeight: '70vh',
+          overflow: 'auto',
+        },
+      }}
+      footer={[
+        <Button key="copy-path" icon={<CopyOutlined />} onClick={handleCopyPath}>
+          Copy Path
+        </Button>,
+        <Button
+          key="copy-content"
+          type="primary"
+          icon={<CopyOutlined />}
+          onClick={handleCopyContent}
+        >
+          Copy Content
+        </Button>,
+        <Button key="close" onClick={onClose}>
+          Close
+        </Button>,
+      ]}
+    >
+      {loading ? (
+        <Spin style={{ display: 'block', padding: '2rem' }} description="Loading file…" />
+      ) : (
+        <ThemedSyntaxHighlighter language={language} showLineNumbers>
+          {file.content}
+        </ThemedSyntaxHighlighter>
+      )}
+    </Modal>
+  );
+};

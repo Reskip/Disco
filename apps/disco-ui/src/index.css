@@ -1,0 +1,313 @@
+/* biome-ignore-all lint/plugin/noFirstPartyCss: global resets, accessibility motion, keyframes, and third-party semantic integrations require selectors */
+/* Import Inter font from Bunny Fonts CDN (privacy-friendly, GDPR compliant) */
+/* Weights: 400 (regular), 500 (medium), 600 (semibold) */
+/* Total size: ~75KB for Latin subset, cached across sites */
+@import url("https://fonts.bunny.net/css?family=inter:400,500,600&display=swap");
+
+/* Global styles for Disco UI */
+
+.disco-filing-notice {
+  color: var(--ant-color-text-quaternary);
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.disco-filing-notice a,
+.disco-filing-notice a:hover,
+.disco-filing-notice a:focus,
+.disco-filing-notice a:focus-visible,
+.disco-filing-notice a:active,
+.disco-filing-notice a:visited {
+  color: inherit;
+  text-decoration: none;
+}
+
+.disco-login-filing-footer {
+  position: relative;
+  z-index: 1;
+  flex: 0 0 auto;
+  padding-top: 12px;
+  padding-bottom: max(0px, env(safe-area-inset-bottom));
+}
+
+/* Modals and drawers are deliberately portalled into #root so they inherit
+   Disco's display-scale zoom. Keep their portal roots out of normal flow:
+   otherwise every closed overlay adds another viewport-height block and a
+   browser focus/automation scroll can leave the whole application shifted. */
+#root {
+  position: fixed;
+  top: var(--disco-visible-viewport-top, 0px);
+  left: 0;
+  height: var(--disco-visible-viewport-height, 100dvh);
+}
+
+#root > :is(.ant-modal-root, .ant-drawer-root) {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+/* Ant Design keeps closed portal roots mounted. The root itself must not
+   intercept the workspace; only a visible overlay surface may receive input. */
+#root > .ant-modal-root > :is(.ant-modal-mask, .ant-modal-wrap),
+#root > .ant-drawer-root :is(.ant-drawer-mask, .ant-drawer-content-wrapper) {
+  pointer-events: auto;
+}
+
+/* Select popups are also portalled directly into #root. With an absolutely
+   positioned popup, Ant's percentage max-size plus the compensated fixed root
+   can resolve an auto width/height to the entire application viewport. Keep
+   the popup intrinsically sized on every breakpoint, while still constraining
+   unusually long option content to the visible app viewport. */
+#root > .ant-select-dropdown {
+  height: max-content !important;
+  max-width: calc(100% - 24px);
+  max-height: calc(100% - 24px);
+  overflow: auto;
+}
+
+/* Ant writes an explicit popup width for ordinary Selects; preserve that
+   trigger-matched width. Composer selectors only get min-width and otherwise
+   resolve their auto size to the full fixed root, so those need intrinsic
+   sizing. */
+#root
+  > .ant-select-dropdown:not([style^="width:"]):not([style*="; width:"]) {
+  width: max-content !important;
+}
+
+/* Dropdowns, tooltips and popovers use the same direct-root portal strategy
+   and need the same intrinsic-size guard on desktop as well as mobile. */
+#root > .ant-dropdown,
+#root > :is(.ant-tooltip, .ant-popover) {
+  width: max-content !important;
+  height: max-content !important;
+  max-width: calc(100% - 24px);
+  max-height: calc(100% - 24px);
+}
+
+#root > .ant-dropdown > .ant-dropdown-menu {
+  width: max-content !important;
+  max-width: 100%;
+}
+
+/* Disco uses flat controls throughout the app. Keep each Ant button's current
+   semantic colour, but remove the stock elevation and make framed variants a
+   consistent one-pixel outline. This is global (rather than workspace-scoped)
+   so buttons rendered in Modal/Popover portals follow the same rule. */
+.ant-btn {
+  box-shadow: none !important;
+}
+
+.ant-btn:not(.ant-btn-text):not(.ant-btn-link) {
+  border-width: 1px;
+  border-style: solid;
+}
+
+.ant-btn-color-primary.ant-btn-variant-solid {
+  border-color: var(--ant-color-primary-active);
+}
+
+.ant-btn-dangerous.ant-btn-variant-solid {
+  border-color: var(--ant-color-error-active);
+}
+
+/* Header icon buttons are inline-flex by default in AntD, which lets the
+   inherited 64px header line-height place them on the text baseline. Force the
+   badge wrapper into flex layout so comment icon buttons center like the rest. */
+.app-header-icon-badge {
+  display: flex;
+  align-items: center;
+}
+
+/* Prevent long text from causing horizontal scroll in collapse headers,
+   but allow vertical overflow so flex-wrapped pill rows aren't clipped (#869). */
+.ant-collapse-header {
+  overflow-x: hidden;
+}
+
+.ant-collapse-header > .ant-collapse-title {
+  overflow: hidden;
+  min-width: 0;
+}
+
+/* Status dot pulse for homepage session indicators. The halo is a pseudo
+   element animated with transform/opacity only, so the loop runs entirely on
+   the compositor. Animating box-shadow instead (the previous approach) forces
+   a main-thread style recalc + paint every frame, which kept the idle home
+   page ~50% busy. `background: inherit` picks up the dot's inline status
+   color, so the halo always matches the dot. */
+.status-dot-run,
+.status-dot-wait {
+  position: relative;
+}
+.status-dot-run::after,
+.status-dot-wait::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: inherit;
+  pointer-events: none;
+  will-change: transform, opacity;
+  animation: statusDotPulse 1.8s infinite;
+}
+@keyframes statusDotPulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.5;
+  }
+  70%,
+  100% {
+    transform: scale(2.43);
+    opacity: 0;
+  }
+}
+
+/* Ant Spin runs five infinite animations per spinner (a rotate plus four
+   per-dot opacity fades), all with implicit `from` keyframes, which Chrome
+   refuses to composite — every mounted <Spin> repaints on the main thread
+   every frame. Boards mount one per active session. Replace them with a
+   single explicit-keyframe rotate (compositor-friendly) and a static opacity
+   tail on the dots; at spinner sizes the rotating tail reads the same as the
+   original pulsing dots. */
+.ant-spin .ant-spin-dot-item {
+  animation-name: none;
+}
+.ant-spin .ant-spin-dot-item:nth-child(1) {
+  opacity: 1;
+}
+.ant-spin .ant-spin-dot-item:nth-child(2) {
+  opacity: 0.65;
+}
+.ant-spin .ant-spin-dot-item:nth-child(3) {
+  opacity: 0.45;
+}
+.ant-spin .ant-spin-dot-item:nth-child(4) {
+  opacity: 0.3;
+}
+.ant-spin .ant-spin-dot-spin {
+  animation: spinRotate 1.2s linear infinite;
+  will-change: transform;
+}
+/* Same implicit-keyframe problem for `<LoadingOutlined spin />` icons
+   (antd's loadingCircle keyframes) — retarget them at the composited rotate. */
+.anticon.anticon-spin {
+  animation: spinRotate 1s linear infinite;
+}
+/* 45deg start preserves antd's original spinner phase (its keyframes ran
+   45deg -> 405deg), so the first painted frame matches the stock Spin. */
+@keyframes spinRotate {
+  from {
+    transform: rotate(45deg);
+  }
+  to {
+    transform: rotate(405deg);
+  }
+}
+
+/* At reduced-motion the pulse halo is purely decorative and a static spinner
+   still reads as "loading", so drop both loops. */
+@media (prefers-reduced-motion: reduce) {
+  .status-dot-run::after,
+  .status-dot-wait::after {
+    animation: none;
+  }
+  .ant-spin .ant-spin-dot-spin,
+  .anticon.anticon-spin {
+    animation: none;
+  }
+}
+
+@media (max-width: 600px), (max-width: 960px) and (max-height: 500px) {
+  /* Destructive confirmations are real mobile actions, not compact desktop
+     affordances. Keep both choices comfortably tappable. */
+  .ant-popconfirm-buttons .ant-btn {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .disco-login-page {
+    box-sizing: border-box;
+    min-width: 0;
+    padding-top: max(64px, calc(env(safe-area-inset-top) + 56px)) !important;
+    padding-right: max(16px, env(safe-area-inset-right)) !important;
+    padding-bottom: max(16px, env(safe-area-inset-bottom)) !important;
+    padding-left: max(16px, env(safe-area-inset-left)) !important;
+  }
+
+  .disco-login-language.ant-btn {
+    top: max(10px, env(safe-area-inset-top)) !important;
+    right: max(10px, env(safe-area-inset-right)) !important;
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .disco-login-card {
+    min-width: 0;
+    max-width: 420px !important;
+  }
+
+  .disco-login-card > .ant-card-body {
+    padding: 20px;
+  }
+
+  .disco-login-form :is(.ant-input-affix-wrapper, .ant-btn) {
+    min-height: 44px;
+  }
+}
+
+/* Streamdown styling adjustments to match Ant Design theme.
+   Streamdown's own Tailwind utilities are compiled (with shadcn tokens
+   bridged to --ant-* variables) into MarkdownRenderer's checked-in
+   streamdown-tailwind.generated.css; only deliberate Disco deviations from
+   the upstream look belong here. */
+[data-streamdown] {
+  /* Let Ant Design Typography handle font family */
+  font-family: inherit;
+}
+
+/* Headings - reduce excessive margins from Tailwind defaults */
+[data-streamdown="heading-1"],
+[data-streamdown="heading-2"],
+[data-streamdown="heading-3"],
+[data-streamdown="heading-4"],
+[data-streamdown="heading-5"],
+[data-streamdown="heading-6"] {
+  margin-top: 1em;
+  margin-bottom: 0.5em;
+}
+
+/* Links follow AntD's hover convention (Streamdown has no hover change).
+   With link safety enabled, links render as <button> elements. */
+[data-streamdown="link"] {
+  color: var(--ant-color-primary);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+[data-streamdown="link"]:hover {
+  color: var(--ant-color-primary-hover);
+}
+
+/* Lists - reduce spacing for better density */
+[data-streamdown="ordered-list"],
+[data-streamdown="unordered-list"] {
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
+}
+
+/* Ant Tree defaults render as a small "well" in dark mode
+   (rgba background, rounded corners, 4px padding). In embedded trees
+   like branch sessions and file/doc browsing, the surrounding card/modal
+   already provides the surface, so keep the tree chrome flat. */
+.disco-flat-tree.ant-tree,
+.disco-flat-tree.ant-tree .ant-tree-list,
+.disco-flat-tree.ant-tree .ant-tree-list-holder,
+.disco-flat-tree.ant-tree .ant-tree-list-holder-inner {
+  background: transparent;
+  border-radius: 0;
+  padding: 0;
+}

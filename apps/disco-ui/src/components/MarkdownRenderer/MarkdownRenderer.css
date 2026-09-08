@@ -1,0 +1,431 @@
+/* biome-ignore-all lint/plugin/noFirstPartyCss: rendered markdown semantics and heading hover anchors require descendant and pseudo selectors */
+/**
+ * Compact markdown styling for constrained contexts (cards, small containers)
+ * Reduces heading sizes, margins, and ensures content doesn't blow up layout
+ */
+
+.markdown-compact h1 {
+  font-size: 1.2em;
+  margin-top: 0.5em;
+  margin-bottom: 0.3em;
+}
+
+.markdown-compact h2 {
+  font-size: 1.1em;
+  margin-top: 0.4em;
+  margin-bottom: 0.3em;
+}
+
+.markdown-compact h3 {
+  font-size: 1em;
+  margin-top: 0.4em;
+  margin-bottom: 0.3em;
+}
+
+.markdown-compact h4,
+.markdown-compact h5,
+.markdown-compact h6 {
+  font-size: 0.95em;
+  margin-top: 0.3em;
+  margin-bottom: 0.2em;
+}
+
+.markdown-compact p {
+  margin-top: 0.3em;
+  margin-bottom: 0.3em;
+}
+
+.markdown-compact ul,
+.markdown-compact ol {
+  margin-top: 0.3em;
+  margin-bottom: 0.3em;
+  padding-left: 1.5em;
+}
+
+.markdown-compact li {
+  margin-top: 0.1em;
+  margin-bottom: 0.1em;
+}
+
+.markdown-compact pre {
+  margin-top: 0.3em;
+  margin-bottom: 0.3em;
+  font-size: 0.9em;
+}
+
+.markdown-compact code {
+  font-size: 0.9em;
+}
+
+.markdown-compact blockquote {
+  margin-top: 0.3em;
+  margin-bottom: 0.3em;
+  padding-left: 0.5em;
+}
+
+.markdown-compact table {
+  font-size: 0.9em;
+  margin-top: 0.3em;
+  margin-bottom: 0.3em;
+}
+
+/* Ensure mermaid diagrams don't get too large */
+.markdown-compact .mermaid {
+  max-width: 100%;
+  max-height: 150px;
+}
+
+.markdown-content h1,
+.markdown-content h2,
+.markdown-content h3,
+.markdown-content h4,
+.markdown-content h5,
+.markdown-content h6 {
+  scroll-margin-top: 24px;
+}
+
+.markdown-heading-anchor {
+  margin-left: 0.35em;
+  color: inherit;
+  font-size: 0.82em;
+  opacity: 0;
+  text-decoration: none;
+  transition: opacity 120ms ease;
+}
+
+.markdown-content h1:hover .markdown-heading-anchor,
+.markdown-content h2:hover .markdown-heading-anchor,
+.markdown-content h3:hover .markdown-heading-anchor,
+.markdown-content h4:hover .markdown-heading-anchor,
+.markdown-content h5:hover .markdown-heading-anchor,
+.markdown-content h6:hover .markdown-heading-anchor,
+.markdown-heading-anchor:focus {
+  opacity: 0.55;
+}
+
+.markdown-content h1 .markdown-heading-anchor:hover,
+.markdown-content h2 .markdown-heading-anchor:hover,
+.markdown-content h3 .markdown-heading-anchor:hover,
+.markdown-content h4 .markdown-heading-anchor:hover,
+.markdown-content h5 .markdown-heading-anchor:hover,
+.markdown-content h6 .markdown-heading-anchor:hover {
+  opacity: 0.85;
+  text-decoration: none;
+}
+
+/* Code-block geometry contract, mirrored from Streamdown's own utility
+   classes (compiled in streamdown-tailwind.generated.css). These duplicates
+   exist so the ASCII-layout tests can assert the contract in jsdom, which
+   does not apply @layer rules; values must match upstream's classes.
+
+   Streamdown ships a "frame in a frame": a tinted outer panel (bg-sidebar,
+   border, rounded, padding) wrapping a second bordered/rounded body box. We
+   collapse that to one container — the outer panel is the single surface, and
+   the inner body/table box below is neutralized (transparent, no border, no
+   radius) so it merges in. */
+:is(.markdown-content, .inline-markdown) [data-streamdown="code-block"] {
+  position: relative;
+  min-width: 0;
+  gap: 0;
+  padding: 0;
+  background: var(--ant-color-bg-container);
+}
+
+:is(.markdown-content, .inline-markdown) [data-streamdown="code-block-header"] {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  height: 2rem;
+  padding-inline: var(--ant-padding-sm);
+  color: var(--ant-color-text-secondary);
+  font-size: 0.75rem;
+  line-height: 1rem;
+}
+
+:is(.markdown-content, .inline-markdown)
+  [data-streamdown="code-block-header"]
+  + div:has(> [data-streamdown="code-block-actions"]) {
+  position: sticky;
+  z-index: 10;
+  top: 0.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  height: 2rem;
+  margin-top: -2rem;
+  padding-inline: var(--ant-padding-xs);
+  box-sizing: border-box;
+  pointer-events: none;
+}
+
+:is(.markdown-content, .inline-markdown) [data-streamdown="code-block-actions"] {
+  height: 2rem;
+  box-sizing: border-box;
+}
+
+:is(.markdown-content, .inline-markdown) [data-streamdown="code-block-body"] {
+  min-width: 0;
+  overflow-x: auto;
+  padding: 0 var(--ant-padding) var(--ant-padding);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+/* Same single-container treatment for GFM tables: neutralize the inner
+   bordered box so the outer table-wrapper panel is the only surface. */
+:is(.markdown-content, .inline-markdown) [data-streamdown="table-wrapper"] {
+  gap: 0;
+  padding: 0;
+  background: var(--ant-color-bg-container);
+}
+
+:is(.markdown-content, .inline-markdown) [data-streamdown="table-wrapper"] > div {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+/* Keep control chrome comfortably inside the single outer frame. The table
+   toolbar is Streamdown's first anonymous child; the code toolbar's anonymous
+   sticky wrapper is handled above. */
+:is(.markdown-content, .inline-markdown) [data-streamdown="table-wrapper"] > div:first-child {
+  padding: var(--ant-padding-xs);
+  box-sizing: border-box;
+}
+
+:is(.markdown-content, .inline-markdown) [data-streamdown="table-wrapper"] table {
+  /* Compact markdown normally adds block margins to tables. Inside
+     Streamdown's framed wrapper those margins look like stray inner padding. */
+  margin: 0;
+}
+
+.ant-typography :is(.markdown-content, .inline-markdown) [data-streamdown="code-block-body"] pre {
+  width: max-content;
+  min-width: 100%;
+  margin-top: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  /* Shiki supplies a theme background on the pre itself. Once the body border
+     is removed, retaining it recreates a dark rectangle inside the outer
+     frame; use the Ant-themed container surface while preserving token colors. */
+  /* biome-ignore lint/complexity/noImportantStyles: override Shiki's inline theme background */
+  background: transparent !important;
+  /* Ant Typography injects pre-wrap at render time. */
+  /* biome-ignore lint/complexity/noImportantStyles: this narrow third-party override must survive runtime injection order */
+  white-space: pre !important;
+}
+
+.ant-typography :is(.markdown-content, .inline-markdown) [data-streamdown="code-block-body"] code {
+  display: block;
+  white-space: inherit;
+}
+
+.ant-typography
+  :is(.markdown-content, .inline-markdown)
+  [data-streamdown="code-block-body"]
+  code
+  > span {
+  display: block;
+}
+
+/* GitHub's blockquote-alert convention is portable Markdown. The remark
+   plugin only supplies semantic classes; Disco maps them to Ant tokens here. */
+.markdown-alert {
+  --markdown-alert-color: var(--ant-color-info);
+  margin-block: var(--ant-margin-md);
+  padding: var(--ant-padding-sm) var(--ant-padding);
+  border: 1px solid color-mix(in srgb, var(--markdown-alert-color) 35%, transparent);
+  border-left: 4px solid var(--markdown-alert-color);
+  border-radius: var(--ant-border-radius);
+  background: color-mix(in srgb, var(--markdown-alert-color) 8%, transparent);
+  color: var(--ant-color-text);
+  font-style: normal;
+}
+
+.markdown-alert-note,
+.markdown-alert-important {
+  --markdown-alert-color: var(--ant-color-info);
+}
+
+.markdown-alert-tip {
+  --markdown-alert-color: var(--ant-color-success);
+}
+
+.markdown-alert-warning {
+  --markdown-alert-color: var(--ant-color-warning);
+}
+
+.markdown-alert-caution {
+  --markdown-alert-color: var(--ant-color-error);
+}
+
+.markdown-alert-title,
+.markdown-alert > p:first-child[dir="auto"] {
+  display: flex;
+  align-items: center;
+  gap: var(--ant-margin-xs);
+  margin: 0 0 var(--ant-margin-xs);
+  color: var(--markdown-alert-color);
+  font-weight: var(--ant-font-weight-strong);
+}
+
+.markdown-alert > :last-child {
+  margin-bottom: 0;
+}
+
+/* Streamdown renders Mermaid fullscreen content through a body portal. Its
+   Tailwind utility classes are intentionally not part of Disco, so reproduce
+   only this dialog's layout with Ant Design tokens and its stable selector. */
+[data-streamdown="mermaid-fullscreen"] {
+  position: fixed;
+  inset: 0;
+  z-index: var(--streamdown-fullscreen-z-index);
+  box-sizing: border-box;
+  display: flex;
+  width: 100vw;
+  height: 100dvh;
+  align-items: center;
+  justify-content: center;
+  padding: var(--ant-padding-lg);
+  background: color-mix(in srgb, var(--ant-color-bg-elevated) 95%, transparent);
+  color: var(--ant-color-text);
+  backdrop-filter: blur(var(--ant-size-xxs));
+}
+
+/* Unlike Mermaid, Streamdown portals table fullscreen views directly to body.
+   StreamdownPortalApp mirrors the active Ant semantic variables there. Keep
+   this selector more specific than Streamdown's later [data-streamdown]
+   font-family reset, and own the opaque surface instead of relying solely on
+   the generated bg-background utility. */
+body > [data-streamdown="table-fullscreen"] {
+  z-index: var(--streamdown-fullscreen-z-index);
+  background: var(--ant-color-bg-container);
+  color: var(--ant-color-text);
+  font-family: var(--ant-font-family);
+}
+
+[data-streamdown="mermaid-fullscreen"] > [role="presentation"],
+[data-streamdown="mermaid-fullscreen"] [data-streamdown="mermaid"],
+[data-streamdown="mermaid-fullscreen"] [data-streamdown="mermaid"] > div,
+[data-streamdown="mermaid-fullscreen"] [role="application"],
+[data-streamdown="mermaid-fullscreen"] [role="img"] {
+  box-sizing: border-box;
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+[data-streamdown="mermaid-fullscreen"] > [role="presentation"],
+[data-streamdown="mermaid-fullscreen"] [role="application"],
+[data-streamdown="mermaid-fullscreen"] [role="img"] {
+  align-items: center;
+  justify-content: center;
+}
+
+[data-streamdown="mermaid-fullscreen"] > [role="presentation"] {
+  padding: 0;
+}
+
+[data-streamdown="mermaid-fullscreen"] [data-streamdown="mermaid"] > div {
+  position: relative;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+[data-streamdown="mermaid-fullscreen"] [role="application"] {
+  flex: 1;
+}
+
+[data-streamdown="mermaid-fullscreen"] [role="img"] svg {
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 100%;
+}
+
+[data-streamdown="mermaid-fullscreen"] button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--ant-padding-xs);
+  border: var(--ant-line-width) solid var(--ant-color-border);
+  border-radius: var(--ant-border-radius-sm);
+  background: var(--ant-color-bg-elevated);
+  color: var(--ant-color-text-secondary);
+  cursor: pointer;
+  transition:
+    color var(--ant-motion-duration-mid),
+    background-color var(--ant-motion-duration-mid),
+    border-color var(--ant-motion-duration-mid);
+}
+
+[data-streamdown="mermaid-fullscreen"] button:hover:not(:disabled) {
+  border-color: var(--ant-color-border-secondary);
+  background: var(--ant-color-fill-secondary);
+  color: var(--ant-color-text);
+}
+
+[data-streamdown="mermaid-fullscreen"] button:focus-visible {
+  outline: var(--ant-line-width-focus) solid var(--ant-color-primary-border);
+  outline-offset: var(--ant-line-width-focus);
+}
+
+[data-streamdown="mermaid-fullscreen"] button:disabled {
+  color: var(--ant-color-text-disabled);
+  cursor: not-allowed;
+}
+
+[data-streamdown="mermaid-fullscreen"] > button {
+  position: absolute;
+  top: var(--ant-margin);
+  right: var(--ant-margin);
+  z-index: 2;
+}
+
+[data-streamdown="mermaid-fullscreen"] [data-streamdown="mermaid"] > div > div:first-child {
+  position: absolute;
+  bottom: var(--ant-margin);
+  left: var(--ant-margin);
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--ant-margin-xxs);
+  padding: var(--ant-padding-xxs);
+  border: var(--ant-line-width) solid var(--ant-color-border-secondary);
+  border-radius: var(--ant-border-radius);
+  background: var(--ant-color-bg-elevated);
+  box-shadow: var(--ant-box-shadow-secondary);
+}
+.disco-inline-upload-image {
+  display: block;
+  width: min(100%, 520px);
+  margin: 10px 0;
+  overflow: hidden;
+  border: 1px solid var(--ant-color-border-secondary);
+  border-radius: 16px;
+  background: var(--ant-color-bg-container);
+}
+
+.disco-inline-upload-image > .ant-image {
+  display: block;
+  width: 100%;
+}
+
+.disco-inline-upload-image .ant-image-img {
+  display: block;
+  width: 100%;
+  max-height: min(62vh, 620px);
+  object-fit: contain;
+}
+
+.disco-inline-upload-image-status {
+  display: grid;
+  min-height: 148px;
+  place-items: center;
+  color: var(--ant-color-text-tertiary);
+}

@@ -1,0 +1,497 @@
+/**
+ * Users Repository
+ *
+ * Type-safe CRUD operations for users with encrypted per-tool credential management.
+ * Credentials live under `data.agentic_tools[toolName][envVarName]`, encrypted at rest;
+ * the public DTO (User.agentic_tools) exposes boolean presence flags only.
+ */
+
+import type {
+  AgenticToolName,
+  AgenticToolsConfig,
+  EnvVarMetadata,
+  InternalUser,
+  StoredAgenticTools,
+  User,
+  UUID,
+} from '@disco/core/types';
+import { toAgenticToolsStatus } from '@disco/core/types';
+import { eq, like } from 'drizzle-orm';
+import { normalizeStoredEnvMap, type StoredEnvVar } from '../../config/env-vars';
+import { generateId, shortId } from '../../lib/ids';
+import { isValidExecutionHomeKey } from '../../types/user';
+import type { Database } from '../client';
+import { deleteFrom, insert, select, update } from '../database-wrapper';
+import { decryptApiKey, encryptApiKey } from '../encryption';
+import { type UserInsert as SchemaUserInsert, type UserRow, users } from '../schema';
+import {
+  type BaseRepository,
+  EntityNotFoundError,
+  RESOLVE_SHORT_ID_FETCH_LIMIT,
+  RepositoryError,
+  resolveByShortIdPrefix,
+} from './base';
+
+/**
+ * Users repository implementation
+ */
+export class UsersRepository implements BaseRepository<InternalUser, Partial<InternalUser>> {
+  constructor(private db: Database) {}
+
+  /**
+   * Convert database row to User type.
+   * Converts the encrypted `agentic_tools` blob to a boolean presence DTO so
+   * decrypted credentials never leave this repository.
+   */
+  private rowToUser(row: UserRow): InternalUser {
+    return {
+      user_id: row.user_id as UUID,
+      created_at: new Date(row.created_at),
+      updated_at: row.updated_at ? new Date(row.updated_at) : undefined,
+      username: row.username,
+      name: row.name ?? undefined,
+      emoji: row.emoji ?? undefined,
+      role: row.role,
+      unix_username: row.unix_username ?? undefined,
+      filesystem_home: row.filesystem_home ?? undefined,
+      onboarding_completed: row.onboarding_completed,
+      must_change_password: row.must_change_password,
+      tokens_valid_after: row.tokens_valid_after ? new Date(row.tokens_valid_after) : undefined,
+      avatar_url: row.data.avatar_url ?? row.data.avatar,
+      avatar: row.data.avatar,
+      avatar_source: row.data.avatar_source,
+      avatar_source_id: row.data.avatar_source_id,
+      avatar_synced_at: row.data.avatar_synced_at,
+      preferences: row.data.preferences as User['preferences'],
+      // Convert encrypted per-tool credential blobs into boolean presence flags.
+      agentic_tools: toAgenticToolsStatus(row.data.agentic_tools as StoredAgenticTools | undefined),
+      agentic_auth_methods: row.data.agentic_auth_methods,
+      // Convert canonical stored env vars to presence + scope metadata without
+      // exposing secret values. Malformed records are ignored by the normalizer.
+      env_vars: (() => {
+        const normalized = normalizeStoredEnvMap(
+          row.data.env_vars as Record<string, StoredEnvVar> | undefined
+        );
+        if (Object.keys(normalized).length === 0) return undefined;
+        const out: Record<string, EnvVarMetadata> = {};
+        for (const [name, entry] of Object.entries(normalized)) {
+          out[name] = { set: true, scope: entry.scope };
+        }
+        return out;
+      })(),
+      default_agentic_config: row.data.default_agentic_config as User['default_agentic_config'],
+      default_agentic_selection: row.data.default_agentic_selection,
+      default_mcp_server_ids: row.data.default_mcp_server_ids,
+    };
+  }
+
+  /**
+   * Convert User to database insert format
+   * For updates, this accepts the current user data from the database row
+   */
+  private userToInsert(
+    user: Partial<InternalUser> & {
+      password?: string;
+      agentic_tools_raw?: StoredAgenticTools;
+      env_vars_raw?: SchemaUserInsert['data']['env_vars'];
+    }
+  ): SchemaUserInsert {
+    const now = new Date();
+    const userId = user.user_id ?? generateId();
+
+    if (!user.username) {
+      throw new RepositoryError('User must have a username');
+    }
+
+    return {
+      user_id: userId,
+      created_at: user.created_at ? new Date(user.created_at) : now,
+      updated_at: user.updated_at ? new Date(user.updated_at) : now,
+      username: user.username,
+      password: user.password ?? '', // Password required, but handled by services layer
+      name: user.name ?? null,
+      emoji: user.emoji ?? null,
+      role: user.role ?? 'member',
+      unix_username: user.unix_username ?? null,
+      filesystem_home: user.filesystem_home ?? null,
+      onboarding_completed: user.onboarding_completed ?? false,
+      must_change_password: user.must_change_password ?? false,
+      tokens_valid_after: user.tokens_valid_after ? new Date(user.tokens_valid_after) : null,
+      data: {
+        avatar_url: user.avatar_url,
+        avatar: user.avatar,
+        avatar_source: user.avatar_source,
+        avatar_source_id: user.avatar_source_id,
+        avatar_synced_at: user.avatar_synced_at,
+        preferences: user.preferences,
+        // Encrypted per-tool credentials. Only forwarded when caller passes the
+        // raw shape (internal credential mutators); regular updates leave it undefined,
+        // letting the merge in `update()` reuse the existing on-disk blob.
+        // Cast: schema declares `opencode: Record<string, never>` (no fields by
+        // contract); StoredAgenticTools widens that to string values for shape
+        // uniformity. Runtime never writes opencode, so the cast is safe.
+        agentic_tools: user.agentic_tools_raw as SchemaUserInsert['data']['agentic_tools'],
+        agentic_auth_methods: user.agentic_auth_methods,
+        // Same pass-through as agentic_tools: env_vars are encrypted blobs
+        // not represented on the public DTO. `update()` threads the raw value
+        // from the existing row so a generic field update doesn't wipe them.
+        env_vars: user.env_vars_raw,
+        default_agentic_config: user.default_agentic_config,
+        default_agentic_selection: user.default_agentic_selection,
+        default_mcp_server_ids: user.default_mcp_server_ids,
+      },
+    };
+  }
+
+  /**
+   * Resolve short ID to full ID via the centralized helper.
+   */
+  private async resolveId(id: string): Promise<string> {
+    return resolveByShortIdPrefix(id, 'User', async (pattern) => {
+      const rows = await select(this.db)
+        .from(users)
+        .where(like(users.user_id, pattern))
+        .limit(RESOLVE_SHORT_ID_FETCH_LIMIT)
+        .all();
+      return rows.map((r: UserRow) => r.user_id);
+    });
+  }
+
+  /**
+   * Check if unix_username is already taken by another user
+   */
+  private async isUnixUsernameTaken(
+    unixUsername: string,
+    excludeUserId?: string
+  ): Promise<boolean> {
+    const result = await select(this.db)
+      .from(users)
+      .where(eq(users.unix_username, unixUsername))
+      .one();
+
+    if (!result) {
+      return false;
+    }
+
+    // If excluding a user ID (for updates), check if it's a different user
+    if (excludeUserId && result.user_id === excludeUserId) {
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Create a new user
+   */
+  async create(data: Partial<InternalUser>): Promise<InternalUser> {
+    if (data.unix_username !== undefined && !isValidExecutionHomeKey(data.unix_username)) {
+      throw new RepositoryError('Invalid execution home key format');
+    }
+    // Validate unix_username uniqueness if provided
+    if (data.unix_username) {
+      const isTaken = await this.isUnixUsernameTaken(data.unix_username);
+      if (isTaken) {
+        throw new RepositoryError(
+          `Execution home key "${data.unix_username}" is already in use by another user`
+        );
+      }
+    }
+
+    const insertData = this.userToInsert(data);
+
+    await insert(this.db, users).values(insertData).run();
+
+    const row = await select(this.db)
+      .from(users)
+      .where(eq(users.user_id, insertData.user_id))
+      .one();
+
+    if (!row) {
+      throw new RepositoryError('Failed to retrieve created user');
+    }
+
+    return this.rowToUser(row as UserRow);
+  }
+
+  /**
+   * Find user by ID (supports short ID resolution)
+   */
+  async findById(id: string): Promise<InternalUser | null> {
+    try {
+      const fullId = await this.resolveId(id);
+
+      const result = await select(this.db).from(users).where(eq(users.user_id, fullId)).one();
+
+      if (!result) {
+        return null;
+      }
+
+      return this.rowToUser(result as UserRow);
+    } catch (error) {
+      if (error instanceof EntityNotFoundError) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Find user by username
+   */
+  async findByUsername(username: string): Promise<InternalUser | null> {
+    const result = await select(this.db).from(users).where(eq(users.username, username)).one();
+
+    if (!result) {
+      return null;
+    }
+
+    return this.rowToUser(result as UserRow);
+  }
+
+  /**
+   * Find all users
+   */
+  async findAll(): Promise<InternalUser[]> {
+    const results = await select(this.db).from(users).all();
+
+    return results.map((row: UserRow) => this.rowToUser(row));
+  }
+
+  /**
+   * Update user by ID
+   */
+  async update(id: string, updates: Partial<InternalUser>): Promise<InternalUser> {
+    const fullId = await this.resolveId(id);
+
+    // Get current user
+    const current = await this.findById(fullId);
+    if (!current) {
+      throw new EntityNotFoundError('User', id);
+    }
+
+    if (updates.unix_username !== undefined && !isValidExecutionHomeKey(updates.unix_username)) {
+      throw new RepositoryError('Invalid execution home key format');
+    }
+
+    // Validate unix_username uniqueness if being changed
+    if (updates.unix_username && updates.unix_username !== current.unix_username) {
+      const isTaken = await this.isUnixUsernameTaken(updates.unix_username, fullId);
+      if (isTaken) {
+        throw new RepositoryError(
+          `Execution home key "${updates.unix_username}" is already in use by another user`
+        );
+      }
+    }
+
+    // Merge updates. Preserve the encrypted agentic_tools and env_vars blobs
+    // from the raw row so a generic field update (name, preferences, etc.)
+    // doesn't nuke stored credentials — the boolean projection on `current`
+    // can't round-trip back to encrypted bytes.
+    const rawRow = await this.getRawRow(fullId);
+    const merged = { ...current, ...updates } as Partial<InternalUser> & {
+      agentic_tools_raw?: StoredAgenticTools;
+      env_vars_raw?: SchemaUserInsert['data']['env_vars'];
+    };
+    if (rawRow?.data.agentic_tools) {
+      merged.agentic_tools_raw = rawRow.data.agentic_tools as StoredAgenticTools;
+    }
+    if (rawRow?.data.env_vars) {
+      merged.env_vars_raw = rawRow.data.env_vars;
+    }
+    const insertData = this.userToInsert(merged);
+
+    // Update database
+    await update(this.db, users)
+      .set({
+        ...insertData,
+        updated_at: new Date(),
+      })
+      .where(eq(users.user_id, fullId))
+      .run();
+
+    const row = await select(this.db).from(users).where(eq(users.user_id, fullId)).one();
+
+    if (!row) {
+      throw new RepositoryError('Failed to retrieve updated user');
+    }
+
+    return this.rowToUser(row as UserRow);
+  }
+
+  /**
+   * Delete user by ID
+   */
+  async delete(id: string): Promise<void> {
+    const fullId = await this.resolveId(id);
+
+    await deleteFrom(this.db, users).where(eq(users.user_id, fullId)).run();
+  }
+
+  /**
+   * Get raw database row (internal use only - includes encrypted keys)
+   */
+  private async getRawRow(id: string): Promise<UserRow | null> {
+    try {
+      const fullId = await this.resolveId(id);
+
+      const result = await select(this.db).from(users).where(eq(users.user_id, fullId)).one();
+
+      return result as UserRow | null;
+    } catch (error) {
+      if (error instanceof EntityNotFoundError) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Get the full decrypted credential bag for a single agentic tool.
+   *
+   * Returns `null` when the user has no stored config for that tool.
+   * Fields that fail to decrypt are dropped from the returned object and
+   * logged — callers see "missing field" rather than a thrown error so a
+   * single corrupt value doesn't poison an entire SDK spawn.
+   */
+  async getToolConfig<T extends AgenticToolName>(
+    userId: string,
+    tool: T
+  ): Promise<AgenticToolsConfig[T] | null> {
+    const row = await this.getRawRow(userId);
+    if (!row) return null;
+
+    const stored = row.data.agentic_tools as StoredAgenticTools | undefined;
+    const fields = stored?.[tool];
+    if (!fields || Object.keys(fields).length === 0) return null;
+
+    const out: Record<string, string> = {};
+    for (const [field, encrypted] of Object.entries(fields)) {
+      if (!encrypted) continue;
+      try {
+        out[field] = decryptApiKey(encrypted);
+      } catch (error) {
+        console.error(
+          `[users] Failed to decrypt ${tool}.${field} for user ${shortId(userId)}: ${
+            (error as Error).message
+          }`
+        );
+      }
+    }
+
+    return Object.keys(out).length > 0 ? (out as AgenticToolsConfig[T]) : null;
+  }
+
+  /**
+   * Get a single decrypted credential field for a tool.
+   *
+   * Returns `null` when the field is unset OR when decryption fails (logged).
+   * Throws only on storage-layer errors, not on missing/corrupt values.
+   */
+  async getToolConfigField<T extends AgenticToolName>(
+    userId: string,
+    tool: T,
+    field: keyof NonNullable<AgenticToolsConfig[T]> & string
+  ): Promise<string | null> {
+    const row = await this.getRawRow(userId);
+    if (!row) return null;
+
+    const stored = row.data.agentic_tools as StoredAgenticTools | undefined;
+    const encrypted = stored?.[tool]?.[field];
+    if (!encrypted) return null;
+
+    try {
+      return decryptApiKey(encrypted);
+    } catch (error) {
+      console.error(
+        `[users] Failed to decrypt ${tool}.${field} for user ${shortId(userId)}: ${
+          (error as Error).message
+        }`
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Set (encrypt + persist) a single credential field for a tool.
+   *
+   * Field names are env-var-shaped (e.g. ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL)
+   * and are stored encrypted regardless of whether the value is a secret —
+   * keeping the on-disk shape uniform avoids decrypt-vs-plain branching at
+   * read time. UI controls own the text-vs-password rendering distinction.
+   */
+  async setToolConfigField<T extends AgenticToolName>(
+    userId: string,
+    tool: T,
+    field: keyof NonNullable<AgenticToolsConfig[T]> & string,
+    value: string
+  ): Promise<void> {
+    const fullId = await this.resolveId(userId);
+    const row = await this.getRawRow(fullId);
+
+    if (!row) {
+      throw new EntityNotFoundError('User', userId);
+    }
+
+    const stored = (row.data.agentic_tools as StoredAgenticTools | undefined) ?? {};
+    const next: StoredAgenticTools = {
+      ...stored,
+      [tool]: {
+        ...(stored[tool] ?? {}),
+        [field]: encryptApiKey(value),
+      },
+    };
+
+    // Patch ONLY the agentic_tools sub-blob — preserve siblings (env_vars,
+    // preferences, default_agentic_config, etc.). Routing through
+    // userToInsert would lose any data subfield it doesn't explicitly
+    // forward (e.g. env_vars), which is how a credential write would
+    // otherwise nuke unrelated user state.
+    await update(this.db, users)
+      .set({
+        data: { ...row.data, agentic_tools: next },
+        updated_at: new Date(),
+      })
+      .where(eq(users.user_id, fullId))
+      .run();
+  }
+
+  /**
+   * Delete a single credential field for a tool.
+   *
+   * If the tool's bucket becomes empty after the delete, the bucket itself is
+   * removed so `data.agentic_tools` doesn't accumulate empty objects.
+   */
+  async deleteToolConfigField<T extends AgenticToolName>(
+    userId: string,
+    tool: T,
+    field: keyof NonNullable<AgenticToolsConfig[T]> & string
+  ): Promise<void> {
+    const fullId = await this.resolveId(userId);
+    const row = await this.getRawRow(fullId);
+
+    if (!row) {
+      throw new EntityNotFoundError('User', userId);
+    }
+
+    const stored = (row.data.agentic_tools as StoredAgenticTools | undefined) ?? {};
+    const toolFields = { ...(stored[tool] ?? {}) } as Record<string, string>;
+    delete toolFields[field];
+
+    const next: StoredAgenticTools = { ...stored };
+    if (Object.keys(toolFields).length > 0) {
+      next[tool] = toolFields;
+    } else {
+      delete next[tool];
+    }
+
+    // Patch only agentic_tools — see setToolConfigField for rationale.
+    await update(this.db, users)
+      .set({
+        data: { ...row.data, agentic_tools: next },
+        updated_at: new Date(),
+      })
+      .where(eq(users.user_id, fullId))
+      .run();
+  }
+}

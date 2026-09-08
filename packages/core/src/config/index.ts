@@ -1,0 +1,42 @@
+/**
+ * Disco Configuration Module
+ *
+ * Exports configuration management, repo reference parsing utilities.
+ */
+
+export * from './agentic-tool-preset-resolver';
+export * from './config-manager';
+export * from './constants';
+export * from './deployment';
+export * from './env-blocklist';
+export * from './env-locking';
+export * from './env-resolver';
+export * from './env-validation';
+export * from './env-vars';
+export * from './executor-credential-storage';
+export * from './executor-heartbeat';
+export * from './key-resolver';
+export * from './multitenancy';
+export * from './resolved-config-slice';
+export * from './sandbox-policy';
+export * from './schedule-agentic-tool-config';
+export type {
+  DiscoGitConfigParametersSettings,
+  ResolvedCors,
+  ResolvedCsp,
+  ResolvedSecurity,
+  ResolveSecurityOptions,
+} from './security-resolver';
+export {
+  getDefaultGitConfigParameters,
+  gitConfigParameterLooksSecret,
+  redactUrlUserinfo,
+  renderGitConfigParametersForLog,
+  resolveGitConfigParameters,
+  resolveSecurity,
+  SANDPACK_CSP_FRAME_SRC,
+  SANDPACK_CSP_WORKER_SRC,
+} from './security-resolver';
+export * from './storage-layout';
+export * from './tenant-agentic-tool-resolver';
+export * from './types';

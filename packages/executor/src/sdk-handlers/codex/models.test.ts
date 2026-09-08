@@ -1,0 +1,65 @@
+import { describe, expect, it } from 'vitest';
+import { getCodexContextWindowLimit } from './models.js';
+
+describe('getCodexContextWindowLimit', () => {
+  const defaultLimit = getCodexContextWindowLimit();
+
+  it('returns expected limits for known Codex-compatible models', () => {
+    const cases: Array<{ model: string; expected: number }> = [
+      { model: 'gpt-6-astra', expected: 1_050_000 },
+      { model: 'gpt-5.6-sol', expected: 1_050_000 },
+      { model: 'gpt-5.6-terra', expected: 1_050_000 },
+      { model: 'gpt-5.6-luna', expected: 1_050_000 },
+      { model: 'gpt-5.6', expected: 1_050_000 },
+      { model: 'gpt-5.5', expected: 1_050_000 },
+      { model: 'gpt-5.5-pro', expected: 1_050_000 },
+      { model: 'gpt-5.4', expected: 1_050_000 },
+      { model: 'gpt-5.4-pro', expected: 1_050_000 },
+      { model: 'gpt-5.4-mini', expected: 400_000 },
+      { model: 'gpt-5.4-nano', expected: 400_000 },
+      { model: 'gpt-5.3-codex', expected: 400_000 },
+      { model: 'gpt-5.3-codex-spark', expected: 128_000 },
+      { model: 'gpt-5.1-codex', expected: defaultLimit },
+      { model: 'gpt-5.1-codex-mini', expected: defaultLimit },
+      { model: 'gpt-5.1', expected: defaultLimit },
+      { model: 'gpt-5-codex', expected: 400_000 },
+      { model: 'gpt-5-codex-mini', expected: defaultLimit },
+      { model: 'gpt-5', expected: defaultLimit },
+      { model: 'gpt-4o', expected: 128_000 },
+      { model: 'gpt-4o-mini', expected: 64_000 },
+    ];
+
+    for (const { model, expected } of cases) {
+      expect(getCodexContextWindowLimit(model)).toBe(expected);
+    }
+  });
+
+  it('uses base model limit when version suffix is present', () => {
+    expect(getCodexContextWindowLimit('gpt-6-astra-2026-09-05')).toBe(
+      getCodexContextWindowLimit('gpt-6-astra')
+    );
+    expect(getCodexContextWindowLimit('gpt-5.6-sol-2026-07-09')).toBe(
+      getCodexContextWindowLimit('gpt-5.6-sol')
+    );
+    expect(getCodexContextWindowLimit('gpt-5-codex-2024')).toBe(
+      getCodexContextWindowLimit('gpt-5-codex')
+    );
+    expect(getCodexContextWindowLimit('gpt-4o-2024')).toBe(getCodexContextWindowLimit('gpt-4o'));
+  });
+
+  it('falls back to default limit for unknown models', () => {
+    expect(getCodexContextWindowLimit('unknown-model')).toBe(defaultLimit);
+    expect(getCodexContextWindowLimit('gpt-3-codex')).toBe(defaultLimit);
+  });
+
+  it('handles model identifiers case-insensitively', () => {
+    expect(getCodexContextWindowLimit('GPT-4O')).toBe(128_000);
+    expect(getCodexContextWindowLimit('GpT-5-CoDeX')).toBe(400_000);
+  });
+
+  it('returns default limit when model is undefined or null', () => {
+    expect(getCodexContextWindowLimit()).toBe(defaultLimit);
+    expect(getCodexContextWindowLimit(undefined)).toBe(defaultLimit);
+    expect(getCodexContextWindowLimit(null as unknown as string | undefined)).toBe(defaultLimit);
+  });
+});

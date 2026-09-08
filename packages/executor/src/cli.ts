@@ -1,0 +1,377 @@
+/**
+ * CLI entry point for executor
+ *
+ * Supports two modes:
+ * 1. --stdin mode (new): JSON payload via stdin - preferred for all commands
+ * 2. Legacy args mode: CLI arguments for backward compatibility (prompt only)
+ *
+ * The executor is ephemeral and task-scoped. Each subprocess executes exactly
+ * one command and then exits. Communication with daemon is via Feathers/WebSocket.
+ *
+ * The executor contains no host-user impersonation logic. An external
+ * delegated launcher may select its own execution identity before startup.
+ */
+
+import { createInterface } from 'node:readline';
+import { parseArgs } from 'node:util';
+import { INTERACTIVE_EXECUTOR_EVENT_PREFIX } from '@disco/core/executor-protocol';
+
+import {
+  executeCommand,
+  executeInteractiveCommand,
+  getRegisteredCommands,
+} from './commands/index.js';
+import { completeExecutorResult, emitExecutorResult } from './executor-output.js';
+import { initializeToolRegistry, ToolRegistry } from './handlers/sdk/tool-registry.js';
+import { DiscoExecutor } from './index.js';
+import {
+  type ExecutorPayload,
+  ExecutorPayloadSchema,
+  isPromptPayload,
+  type PromptPayload,
+} from './payload-types.js';
+
+const DEBUG_EXECUTOR_CLI =
+  process.env.DISCO_DEBUG_EXECUTOR_CLI === '1' || process.env.DEBUG?.includes('executor-cli');
+
+function executorCliDebug(...args: unknown[]): void {
+  if (DEBUG_EXECUTOR_CLI) {
+    console.debug(...args);
+  }
+}
+
+/**
+ * Read all input from stdin
+ */
+async function readStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(chunk as Buffer);
+  }
+  return Buffer.concat(chunks).toString('utf-8');
+}
+
+function emitInteractiveEvent(event: unknown): void {
+  console.log(`${INTERACTIVE_EXECUTOR_EVENT_PREFIX}${JSON.stringify(event)}`);
+}
+
+/**
+ * Handle JSON-over-stdin mode
+ */
+async function handleStdinMode(options: { dryRun: boolean }): Promise<void> {
+  // Read JSON from stdin
+  const input = await readStdin();
+
+  if (!input.trim()) {
+    console.error('[executor] Error: Empty input received on stdin');
+    console.error('[executor] Usage: echo \'{"command":"prompt",...}\' | disco-executor --stdin');
+    process.exit(1);
+  }
+
+  let payload: ExecutorPayload;
+
+  try {
+    const parsed = JSON.parse(input);
+    payload = ExecutorPayloadSchema.parse(parsed);
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      console.error('[executor] Error: Invalid JSON input');
+      console.error(`[executor] Details: ${error.message}`);
+    } else if (error instanceof Error && error.name === 'ZodError') {
+      console.error('[executor] Error: Invalid payload schema');
+      console.error(`[executor] Details: ${error.message}`);
+    } else {
+      console.error('[executor] Error: Failed to parse payload');
+      console.error(`[executor] Details: ${error}`);
+    }
+    process.exit(1);
+  }
+
+  executorCliDebug(`[executor] Received command: ${payload.command}`);
+
+  // Special handling for prompt command - needs long-running WebSocket connection
+  if (isPromptPayload(payload)) {
+    await handlePromptPayload(payload, options);
+    return;
+  }
+
+  // All other commands go through the command router
+  const result = await executeCommand(payload, { dryRun: options.dryRun });
+
+  // Output result on a sentinel line so daemon parsers can suppress it from logs.
+  completeExecutorResult(result);
+}
+
+/**
+ * Bounded JSON-lines transport for commands that require intermediate events
+ * or one or more command-owned control frames.
+ */
+async function handleInteractiveCommandMode(options: { dryRun: boolean }): Promise<void> {
+  const lines = createInterface({ input: process.stdin, crlfDelay: Number.POSITIVE_INFINITY });
+  const iterator = lines[Symbol.asyncIterator]();
+  try {
+    const first = await iterator.next();
+    if (first.done || !first.value.trim()) throw new Error('missing payload');
+    const payload = ExecutorPayloadSchema.parse(JSON.parse(first.value));
+    const result = await executeInteractiveCommand(
+      payload,
+      { dryRun: options.dryRun },
+      {
+        emit: emitInteractiveEvent,
+        async read() {
+          const next = await iterator.next();
+          if (next.done) throw new Error('Interactive command input closed');
+          return JSON.parse(next.value) as unknown;
+        },
+      }
+    );
+    completeExecutorResult(result);
+  } catch {
+    completeExecutorResult({
+      success: false,
+      error: {
+        code: 'INTERACTIVE_COMMAND_PROTOCOL_INVALID',
+        message: 'Interactive executor input was invalid.',
+      },
+    });
+  } finally {
+    lines.close();
+  }
+}
+
+/**
+ * Handle prompt command - requires special handling for long-running WebSocket
+ */
+async function handlePromptPayload(
+  payload: PromptPayload,
+  options: { dryRun: boolean }
+): Promise<void> {
+  if (options.dryRun) {
+    console.log(
+      JSON.stringify({
+        success: true,
+        data: {
+          dryRun: true,
+          command: 'prompt',
+          sessionId: payload.params.sessionId,
+          taskId: payload.params.taskId,
+          tool: payload.params.tool,
+          cwd: payload.params.cwd,
+          envVars: payload.env ? Object.keys(payload.env).length : 0,
+        },
+      })
+    );
+    process.exitCode = 0;
+    return;
+  }
+
+  // =========================================================================
+  // APPLY ENVIRONMENT VARIABLES FROM PAYLOAD
+  //
+  // External launchers may intentionally replace the parent environment. The
+  // daemon passes approved env vars in the payload and we apply them here.
+  // =========================================================================
+  if (payload.env && Object.keys(payload.env).length > 0) {
+    // Filter out process-hijacking env vars (NODE_OPTIONS, LD_PRELOAD, PYTHON*, etc.)
+    // These could give an attacker RCE inside the executor context.
+    const { filterEnv } = await import('@disco/core/config');
+    const { env: safeEnv, rejected } = filterEnv(payload.env as Record<string, string>, (key) => {
+      // Log key only — never the value, which is attacker-controlled.
+      executorCliDebug(`[executor] Rejected denied env var from payload: ${key}`);
+    });
+    executorCliDebug(
+      `[executor] Applying ${Object.keys(safeEnv).length} env vars from payload` +
+        (rejected.length > 0 ? ` (${rejected.length} rejected)` : '')
+    );
+    for (const [key, value] of Object.entries(safeEnv)) {
+      process.env[key] = value;
+    }
+  }
+
+  // Validate tool using registry
+  await initializeToolRegistry();
+
+  if (!ToolRegistry.has(payload.params.tool)) {
+    console.error(`[executor] Invalid tool: ${payload.params.tool}`);
+    console.error(`[executor] Valid tools: ${ToolRegistry.getAll().join(', ')}`);
+    process.exit(1);
+  }
+
+  // Seed DAEMON_URL so executor-local getDaemonUrl() works regardless of
+  // whether spawn-executor.ts already set it. In stdin-via-daemon mode the
+  // env var is already populated by spawn-executor.ts; in `disco-executor
+  // --stdin < payload.json` debug runs the payload's daemonUrl is the
+  // only source. The executor never reads config.yaml for this — see
+  // packages/executor/src/config.ts.
+  const resolvedDaemonUrl = payload.daemonUrl || 'http://localhost:3030';
+  process.env.DAEMON_URL = resolvedDaemonUrl;
+
+  // Start executor in Feathers mode
+  const executor = new DiscoExecutor({
+    sessionToken: payload.sessionToken,
+    sessionId: payload.params.sessionId,
+    taskId: payload.params.taskId,
+    prompt: payload.params.prompt,
+    tool: payload.params.tool,
+    permissionMode: payload.params.permissionMode,
+    daemonUrl: resolvedDaemonUrl,
+    messageSource: payload.params.messageSource,
+    agenticToolContext: payload.agenticToolContext,
+    resolvedConfig: payload.resolvedConfig,
+  });
+
+  await executor.start();
+}
+
+/**
+ * Handle legacy CLI arguments mode (backward compatibility)
+ */
+async function handleLegacyMode(values: {
+  'session-token'?: string;
+  'session-id'?: string;
+  'task-id'?: string;
+  prompt?: string;
+  tool?: string;
+  'permission-mode'?: string;
+  'daemon-url'?: string;
+}): Promise<void> {
+  // Validate required arguments
+  if (
+    !values['session-token'] ||
+    !values['session-id'] ||
+    !values['task-id'] ||
+    !values.prompt ||
+    !values.tool
+  ) {
+    printUsage();
+    process.exit(1);
+  }
+
+  // Validate tool using registry
+  await initializeToolRegistry();
+  const tool = values.tool as string;
+
+  if (!ToolRegistry.has(tool)) {
+    console.error(`Invalid tool: ${tool}`);
+    console.error(`Valid tools: ${ToolRegistry.getAll().join(', ')}`);
+    process.exit(1);
+  }
+
+  // Seed DAEMON_URL so executor-local getDaemonUrl() works in the legacy
+  // CLI flow too (no parent process to set it). See config.ts.
+  const resolvedDaemonUrl = (values['daemon-url'] as string) || 'http://localhost:3030';
+  process.env.DAEMON_URL = resolvedDaemonUrl;
+
+  // Start executor in Feathers mode
+  const executor = new DiscoExecutor({
+    sessionToken: values['session-token'] as string,
+    sessionId: values['session-id'] as string,
+    taskId: values['task-id'] as string,
+    prompt: values.prompt as string,
+    tool,
+    permissionMode: (values['permission-mode'] as 'ask' | 'auto' | 'allow-all') || undefined,
+    daemonUrl: resolvedDaemonUrl,
+  });
+
+  await executor.start();
+}
+
+/**
+ * Print usage information
+ */
+function printUsage(): void {
+  console.error('Usage: disco-executor [OPTIONS]');
+  console.error('');
+  console.error('Modes:');
+  console.error('  --stdin                  Read JSON payload from stdin (recommended)');
+  console.error('  [legacy args]            Use CLI arguments (backward compatible)');
+  console.error('');
+  console.error('Options:');
+  console.error('  --stdin                  Read JSON payload from stdin');
+  console.error('  --dry-run                Parse and validate without executing');
+  console.error('');
+  console.error('Legacy options (for prompt command only):');
+  console.error('  --session-token <jwt>    JWT for Feathers authentication');
+  console.error('  --session-id <id>        Session ID to execute prompt for');
+  console.error('  --task-id <id>           Task ID created by daemon');
+  console.error('  --prompt <text>          User prompt to execute');
+  console.error(`  --tool <name>            SDK tool (${ToolRegistry.getAll().join(', ')})`);
+  console.error('  --permission-mode <mode> Permission mode (ask, auto, allow-all)');
+  console.error('  --daemon-url <url>       Daemon WebSocket URL (default: http://localhost:3030)');
+  console.error('');
+  console.error('Supported commands (via --stdin):');
+  for (const cmd of getRegisteredCommands()) {
+    console.error(`  - ${cmd}`);
+  }
+  console.error('');
+  console.error('Example (stdin mode):');
+  console.error(
+    '  echo \'{"command":"prompt","sessionToken":"...","params":{...}}\' | disco-executor --stdin'
+  );
+}
+
+async function main() {
+  // Register Handlebars helpers ONCE at startup (needed for template rendering)
+  const { registerHandlebarsHelpers } = await import('@disco/core/templates/handlebars-helpers');
+  registerHandlebarsHelpers();
+  await initializeToolRegistry();
+
+  // Parse command-line arguments
+  const { values } = parseArgs({
+    options: {
+      stdin: {
+        type: 'boolean',
+        default: false,
+      },
+      'interactive-command': {
+        type: 'boolean',
+        default: false,
+      },
+      'dry-run': {
+        type: 'boolean',
+        default: false,
+      },
+      // Legacy args for backward compatibility
+      'session-token': {
+        type: 'string',
+      },
+      'session-id': {
+        type: 'string',
+      },
+      'task-id': {
+        type: 'string',
+      },
+      prompt: {
+        type: 'string',
+      },
+      tool: {
+        type: 'string',
+      },
+      'permission-mode': {
+        type: 'string',
+      },
+      'daemon-url': {
+        type: 'string',
+      },
+    },
+    allowPositionals: false,
+  });
+
+  // Route to appropriate mode
+  if (values['interactive-command']) {
+    await handleInteractiveCommandMode({ dryRun: values['dry-run'] || false });
+  } else if (values.stdin) {
+    await handleStdinMode({ dryRun: values['dry-run'] || false });
+  } else if (values['session-token']) {
+    // Legacy mode - use CLI arguments
+    await handleLegacyMode(values);
+  } else {
+    printUsage();
+    process.exit(1);
+  }
+}
+
+main().catch((error) => {
+  console.error('[executor] Fatal error:', error);
+  process.exit(1);
+});

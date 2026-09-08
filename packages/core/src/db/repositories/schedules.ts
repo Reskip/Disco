@@ -1,0 +1,360 @@
+/**
+ * Schedule Repository
+ *
+ * Type-safe CRUD operations for the first-class `schedules` table.
+ * See docs/internal/schedules-first-class-design-2026-05-24.md.
+ */
+
+import type {
+  AgentID,
+  PersistedScheduleAgenticToolConfig,
+  Schedule,
+  ScheduleID,
+  SessionID,
+  TimezoneMode,
+  UUID,
+} from '@disco/core/types';
+import { and, asc, desc, eq, isNull, like, lte, or, sql } from 'drizzle-orm';
+import { normalizeScheduleAgenticToolDefaultReference } from '../../config/schedule-agentic-tool-config';
+import { generateId } from '../../lib/ids';
+import type { Database } from '../client';
+import {
+  deleteFrom,
+  insert,
+  isPostgresDatabase,
+  lockRowForUpdate,
+  select,
+  txAsDb,
+  update,
+} from '../database-wrapper';
+import { type ScheduleInsert, type ScheduleRow, schedules } from '../schema';
+import {
+  attachHiddenTenant,
+  type BaseRepository,
+  EntityNotFoundError,
+  RESOLVE_SHORT_ID_FETCH_LIMIT,
+  RepositoryError,
+  resolveByShortIdPrefix,
+} from './base';
+import { deepMerge } from './merge-utils';
+
+export interface DueScheduleRef {
+  schedule_id: ScheduleID;
+  tenant_id?: string;
+}
+
+export class ScheduleRepository implements BaseRepository<Schedule, Partial<Schedule>> {
+  constructor(private db: Database) {}
+
+  /**
+   * Convert database row to Schedule type.
+   *
+   * `agentic_tool_config` round-trips through JSON: on Postgres it's
+   * already an object (jsonb); on SQLite it's a string we parse here.
+   */
+  private rowToSchedule(row: ScheduleRow): Schedule {
+    const storedConfig =
+      typeof row.agentic_tool_config === 'string'
+        ? (JSON.parse(row.agentic_tool_config) as PersistedScheduleAgenticToolConfig)
+        : (row.agentic_tool_config as PersistedScheduleAgenticToolConfig);
+    const config: PersistedScheduleAgenticToolConfig = {
+      ...storedConfig,
+      preset_id:
+        (row.agentic_tool_preset_id as PersistedScheduleAgenticToolConfig['preset_id']) ??
+        storedConfig.preset_id,
+    };
+
+    return attachHiddenTenant(
+      {
+        schedule_id: row.schedule_id as ScheduleID,
+        agent_id: (row.agent_id as AgentID | null) ?? null,
+        name: row.name,
+        description: row.description ?? undefined,
+        cron_expression: row.cron_expression,
+        timezone_mode: row.timezone_mode as TimezoneMode,
+        timezone: row.timezone ?? undefined,
+        prompt: row.prompt,
+        agentic_tool_config: config,
+        mcp_server_ids: row.mcp_server_ids ?? undefined,
+        enabled: Boolean(row.enabled),
+        allow_concurrent_runs: Boolean(row.allow_concurrent_runs),
+        retention: row.retention,
+        last_run_at: row.last_run_at ?? undefined,
+        last_run_session_id: (row.last_run_session_id as SessionID | null) ?? undefined,
+        next_run_at: row.next_run_at ?? undefined,
+        created_at: new Date(row.created_at).toISOString(),
+        updated_at: new Date(row.updated_at).toISOString(),
+        created_by: row.created_by as UUID,
+      },
+      row
+    );
+  }
+
+  private scheduleToInsert(s: Partial<Schedule>): ScheduleInsert {
+    const now = Date.now();
+    const scheduleId = (s.schedule_id ?? (generateId() as ScheduleID)) as string;
+
+    if (!s.created_by) throw new RepositoryError('Schedule must have a created_by');
+    if (!s.name) throw new RepositoryError('Schedule must have a name');
+    if (!s.cron_expression) throw new RepositoryError('Schedule must have a cron_expression');
+    if (!s.prompt) throw new RepositoryError('Schedule must have a prompt');
+    if (!s.agentic_tool_config) {
+      throw new RepositoryError('Schedule must have an agentic_tool_config');
+    }
+
+    const { preset_id, ...configWithoutPreset } = s.agentic_tool_config;
+    const storesDefaultReference = Boolean(
+      preset_id && normalizeScheduleAgenticToolDefaultReference(preset_id)
+    );
+    const storedAgenticToolConfig = storesDefaultReference
+      ? s.agentic_tool_config
+      : configWithoutPreset;
+    return {
+      schedule_id: scheduleId,
+      agent_id: s.agent_id ?? null,
+      name: s.name,
+      description: s.description ?? null,
+      cron_expression: s.cron_expression,
+      timezone_mode: s.timezone_mode ?? 'local',
+      timezone: s.timezone ?? null,
+      prompt: s.prompt,
+      // Drizzle's jsonb / text-with-json roundtrip handles this for us;
+      // pass the object through.
+      agentic_tool_config: storedAgenticToolConfig as unknown,
+      agentic_tool_preset_id: storesDefaultReference ? null : (preset_id ?? null),
+      mcp_server_ids: s.mcp_server_ids ?? null,
+      enabled: s.enabled ?? true,
+      allow_concurrent_runs: s.allow_concurrent_runs ?? false,
+      retention: s.retention ?? 5,
+      last_run_at: s.last_run_at ?? null,
+      last_run_session_id: s.last_run_session_id ?? null,
+      next_run_at: s.next_run_at ?? null,
+      created_at: s.created_at ? new Date(s.created_at) : new Date(now),
+      updated_at: new Date(now),
+      created_by: s.created_by,
+    } as ScheduleInsert;
+  }
+
+  /**
+   * Resolve a short ID prefix to the full schedule ID.
+   */
+  private async resolveId(id: string): Promise<string> {
+    return resolveByShortIdPrefix(id, 'Schedule', async (pattern) => {
+      const rows = await select(this.db)
+        .from(schedules)
+        .where(like(schedules.schedule_id, pattern))
+        .limit(RESOLVE_SHORT_ID_FETCH_LIMIT)
+        .all();
+      return rows.map((r: { schedule_id: string }) => r.schedule_id);
+    });
+  }
+
+  async create(data: Partial<Schedule>): Promise<Schedule> {
+    try {
+      const insertData = this.scheduleToInsert(data);
+      const row = await insert(this.db, schedules).values(insertData).returning().one();
+      return this.rowToSchedule(row);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg.includes('FOREIGN KEY constraint failed')) {
+        throw new RepositoryError(
+          `Failed to create schedule: a referenced entity does not exist. ` +
+            `Check that agent_id ('${data.agent_id ?? 'standalone'}') and created_by ('${data.created_by}') are valid.`,
+          error
+        );
+      }
+      throw new RepositoryError(`Failed to create schedule: ${msg}`, error);
+    }
+  }
+
+  async findById(id: string): Promise<Schedule | null> {
+    try {
+      const fullId = await this.resolveId(id);
+      const row = await select(this.db)
+        .from(schedules)
+        .where(eq(schedules.schedule_id, fullId))
+        .one();
+      if (!row) return null;
+      return this.rowToSchedule(row);
+    } catch (error) {
+      if (error instanceof EntityNotFoundError) return null;
+      throw error;
+    }
+  }
+
+  /**
+   * Find all schedules, with optional filters.
+   *
+   * @param filter.agent_id - only schedules for this Agent (`null` = standalone)
+   * @param filter.enabled - filter by enabled flag
+   * @param filter.created_by - filter by creator user ID
+   */
+  async findAll(filter?: {
+    agent_id?: AgentID | null;
+    enabled?: boolean;
+    created_by?: UUID;
+  }): Promise<Schedule[]> {
+    const conditions = [];
+    if (filter && 'agent_id' in filter) {
+      conditions.push(
+        filter.agent_id ? eq(schedules.agent_id, filter.agent_id) : isNull(schedules.agent_id)
+      );
+    }
+    if (filter?.enabled !== undefined) conditions.push(eq(schedules.enabled, filter.enabled));
+    if (filter?.created_by) conditions.push(eq(schedules.created_by, filter.created_by));
+
+    const query = select(this.db).from(schedules);
+    const rows =
+      conditions.length > 0 ? await query.where(and(...conditions)).all() : await query.all();
+
+    return rows.map((row: ScheduleRow) => this.rowToSchedule(row));
+  }
+
+  /** All schedules targeting one Agent (newest first). */
+  async findByAgentId(agentId: AgentID): Promise<Schedule[]> {
+    const rows = await select(this.db)
+      .from(schedules)
+      .where(eq(schedules.agent_id, agentId))
+      .orderBy(desc(schedules.created_at))
+      .all();
+    return rows.map((row: ScheduleRow) => this.rowToSchedule(row));
+  }
+
+  /**
+   * Scheduler hot-path query: all enabled schedules that are due.
+   *
+   * Returns rows where `next_run_at <= now`, OR `next_run_at IS NULL`
+   * (schedules that have never fired and need their first `next_run_at`
+   * computed). Ordered by `next_run_at ASC` so the most overdue fires
+   * first; NULL `next_run_at` sorts last (`asc` puts NULL last on
+   * Postgres but first on SQLite — practically irrelevant since the
+   * caller iterates the whole result set per tick).
+   *
+   * Uses the `schedules_enabled_next_run_idx` covering index.
+   */
+  private dueCondition(now: number) {
+    return and(
+      eq(schedules.enabled, true),
+      or(isNull(schedules.next_run_at), lte(schedules.next_run_at, now))
+    );
+  }
+
+  async findDue(now: number = Date.now()): Promise<Schedule[]> {
+    const rows = await select(this.db)
+      .from(schedules)
+      .where(this.dueCondition(now))
+      .orderBy(asc(schedules.next_run_at))
+      .all();
+    return rows.map((row: ScheduleRow) => this.rowToSchedule(row));
+  }
+
+  /**
+   * Scheduler discovery query. Returns only routing metadata so background
+   * workers can enter the correct tenant DB scope before loading schedule
+   * contents or spawning sessions.
+   */
+  async findDueRefs(now: number = Date.now(), limit = 25): Promise<DueScheduleRef[]> {
+    if (!Number.isInteger(limit) || limit <= 0 || limit > 1_000) {
+      throw new RepositoryError('Due schedule discovery limit must be between 1 and 1000');
+    }
+    const tenantColumn = (schedules as unknown as { tenant_id?: unknown }).tenant_id;
+    const columns =
+      isPostgresDatabase(this.db) && tenantColumn
+        ? { schedule_id: schedules.schedule_id, tenant_id: tenantColumn }
+        : { schedule_id: schedules.schedule_id };
+
+    const rows = await select(this.db, columns)
+      .from(schedules)
+      .where(this.dueCondition(now))
+      .orderBy(asc(schedules.next_run_at))
+      .limit(limit)
+      .all();
+
+    return (rows as Array<{ schedule_id: string; tenant_id?: unknown }>).map((row) => ({
+      schedule_id: row.schedule_id as ScheduleID,
+      ...(typeof row.tenant_id === 'string' && row.tenant_id.length > 0
+        ? { tenant_id: row.tenant_id }
+        : {}),
+    }));
+  }
+
+  /**
+   * Serialize the short admission decision for one schedule on PostgreSQL.
+   * Call inside an existing tenant database scope/transaction. No rendering,
+   * launching, or other external work belongs under this row lock.
+   */
+  async lockForRunAdmission(scheduleId: ScheduleID): Promise<void> {
+    await lockRowForUpdate(this.db, this.db, schedules, eq(schedules.schedule_id, scheduleId));
+  }
+
+  /**
+   * Update schedule by ID (atomic with database-level transaction).
+   *
+   * Uses read-merge-write inside a single
+   * transaction with row-level lock on Postgres to prevent lost updates
+   * when two writers race on the same schedule (e.g., scheduler updating
+   * `next_run_at` while the user toggles `enabled`).
+   */
+  async update(id: string, updates: Partial<Schedule>): Promise<Schedule> {
+    const fullId = await this.resolveId(id);
+
+    return await this.db.transaction(async (tx) => {
+      await lockRowForUpdate(txAsDb(tx), this.db, schedules, eq(schedules.schedule_id, fullId));
+
+      const currentRow = await select(txAsDb(tx))
+        .from(schedules)
+        .where(eq(schedules.schedule_id, fullId))
+        .one();
+      if (!currentRow) throw new EntityNotFoundError('Schedule', id);
+
+      const current = this.rowToSchedule(currentRow);
+      const merged = deepMerge(current, {
+        ...updates,
+        schedule_id: current.schedule_id,
+        agent_id: current.agent_id, // never retarget
+        created_at: current.created_at,
+        created_by: current.created_by,
+        updated_at: new Date().toISOString(),
+      });
+      if (updates.agentic_tool_config !== undefined) {
+        merged.agentic_tool_config = updates.agentic_tool_config;
+      }
+
+      const insertData = this.scheduleToInsert(merged);
+      insertData.updated_at = new Date();
+
+      const row = await update(txAsDb(tx), schedules)
+        .set(insertData)
+        .where(eq(schedules.schedule_id, fullId))
+        .returning()
+        .one();
+      return this.rowToSchedule(row);
+    });
+  }
+
+  async delete(id: string): Promise<void> {
+    const fullId = await this.resolveId(id);
+    const result = await deleteFrom(this.db, schedules)
+      .where(eq(schedules.schedule_id, fullId))
+      .run();
+    if (result.rowsAffected === 0) throw new EntityNotFoundError('Schedule', id);
+  }
+
+  /**
+   * Count schedules (optionally filtered).
+   */
+  async count(filter?: { agent_id?: AgentID | null; enabled?: boolean }): Promise<number> {
+    const conditions = [];
+    if (filter && 'agent_id' in filter) {
+      conditions.push(
+        filter.agent_id ? eq(schedules.agent_id, filter.agent_id) : isNull(schedules.agent_id)
+      );
+    }
+    if (filter?.enabled !== undefined) conditions.push(eq(schedules.enabled, filter.enabled));
+
+    const query = select(this.db, { count: sql<number>`count(*)` }).from(schedules);
+    const row =
+      conditions.length > 0 ? await query.where(and(...conditions)).one() : await query.one();
+    return Number(row?.count ?? 0);
+  }
+}

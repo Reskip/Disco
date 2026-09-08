@@ -1,0 +1,176 @@
+/**
+ * Claude Models Service
+ *
+ * Exposes the Anthropic Models API (`models.list()`) as a Feathers endpoint so
+ * the UI can render the live model list. Falls back to the static
+ * AVAILABLE_CLAUDE_MODEL_ALIASES when no API key is configured or the call fails.
+ */
+
+import { isTenantAgenticToolEnabled, resolveApiKey } from '@disco/core/config';
+import {
+  getCurrentTenantId,
+  runWithTenantDatabaseScope,
+  shortId,
+  type TenantScopeAwareDatabase,
+} from '@disco/core/db';
+import { AVAILABLE_CLAUDE_MODEL_ALIASES, DEFAULT_CLAUDE_MODEL } from '@disco/core/models';
+import type { Params, UserID } from '@disco/core/types';
+import Anthropic from '@anthropic-ai/sdk';
+
+export interface ClaudeModelOption {
+  id: string;
+  displayName: string;
+  description?: string;
+  source: 'dynamic' | 'static';
+}
+
+export interface ClaudeModelsResult {
+  default: string;
+  models: ClaudeModelOption[];
+  source: 'dynamic' | 'static';
+}
+
+const CLAUDE_MODELS_TIMEOUT_MS = 8_000;
+
+const STATIC_RESULT: ClaudeModelsResult = {
+  default: DEFAULT_CLAUDE_MODEL,
+  models: AVAILABLE_CLAUDE_MODEL_ALIASES.map((m) => ({
+    id: m.id,
+    displayName: m.displayName,
+    description: m.description,
+    source: 'static' as const,
+  })),
+  source: 'static',
+};
+
+interface AuthenticatedParams extends Params {
+  user?: { user_id: UserID };
+}
+
+/**
+ * Dated snapshot IDs (e.g. claude-sonnet-4-6-20260514) are noise in a picker
+ * that already has the alias form. Keep only alias-style entries.
+ */
+function isAlias(id: string): boolean {
+  return /^claude-[a-z]+-\d+(?:-\d+)?$/.test(id);
+}
+
+/**
+ * Build the option list from the API response. The Models API describes API
+ * model capacity, not Claude Code's selectable standard/extended variants.
+ * For known aliases, use the audited Claude Code registry so the distinct
+ * persisted `[1m]` choices are retained. Unknown API aliases remain selectable
+ * without inventing a context size or unsupported suffix.
+ */
+export function toModelOptions(models: Anthropic.ModelInfo[]): ClaudeModelOption[] {
+  const aliases = models.filter((m) => isAlias(m.id));
+
+  const options: ClaudeModelOption[] = [];
+  for (const m of aliases) {
+    const registered = AVAILABLE_CLAUDE_MODEL_ALIASES.filter(
+      (candidate) => candidate.id.replace(/\[1m\]$/, '') === m.id
+    );
+    if (registered.length > 0) {
+      options.push(
+        ...registered.map((candidate) => ({
+          id: candidate.id,
+          displayName: candidate.displayName,
+          description: candidate.description,
+          source: 'dynamic' as const,
+        }))
+      );
+    } else {
+      options.push({
+        id: m.id,
+        displayName: m.display_name,
+        description: undefined,
+        source: 'dynamic',
+      });
+    }
+  }
+  return options;
+}
+
+async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+export class ClaudeModelsService {
+  constructor(private db: TenantScopeAwareDatabase) {}
+
+  async find(params?: AuthenticatedParams): Promise<ClaudeModelsResult> {
+    const tenantId = getCurrentTenantId();
+    if (!tenantId) throw new Error('Missing active tenant context for Claude model discovery');
+    const userId = params?.user?.user_id;
+    const resolution = await runWithTenantDatabaseScope(this.db, tenantId, async (tenantDb) => {
+      if (!(await isTenantAgenticToolEnabled('claude-code', tenantDb))) {
+        throw new Error('Claude Code is disabled for this workspace');
+      }
+      return resolveApiKey('ANTHROPIC_API_KEY', {
+        userId,
+        db: tenantDb,
+        tool: 'claude-code',
+      });
+    });
+
+    if (!resolution.apiKey) {
+      console.log(
+        `[Claude Models] No Anthropic API key for user ${userId ? shortId(userId) : 'unknown'} — returning static list`
+      );
+      return STATIC_RESULT;
+    }
+
+    try {
+      const client = new Anthropic({
+        apiKey: resolution.apiKey,
+        baseURL: (resolution.connection as { ANTHROPIC_BASE_URL?: string } | undefined)
+          ?.ANTHROPIC_BASE_URL,
+      });
+      const page = await withTimeout(
+        client.models.list({ limit: 100 }),
+        CLAUDE_MODELS_TIMEOUT_MS,
+        'Anthropic models.list() timed out'
+      );
+
+      const allModels: Anthropic.ModelInfo[] = [];
+      for await (const model of page) {
+        allModels.push(model);
+      }
+
+      const options = toModelOptions(allModels);
+      if (options.length === 0) {
+        console.warn('[Claude Models] API returned no alias-style models, falling back to static');
+        return STATIC_RESULT;
+      }
+
+      console.log(
+        `[Claude Models] Fetched ${options.length} models for user ${userId ? shortId(userId) : 'unknown'} (source: ${resolution.source})`
+      );
+      return {
+        default: DEFAULT_CLAUDE_MODEL,
+        models: options,
+        source: 'dynamic',
+      };
+    } catch (err) {
+      console.warn(
+        '[Claude Models] Anthropic models.list() failed, falling back to static list:',
+        err instanceof Error ? err.message : err
+      );
+      return STATIC_RESULT;
+    }
+  }
+}
+
+export function createClaudeModelsService(db: TenantScopeAwareDatabase): ClaudeModelsService {
+  return new ClaudeModelsService(db);
+}

@@ -1,0 +1,938 @@
+---
+title: Containerized Execution
+description: Running Disco executors in Kubernetes, Docker, or other containerized environments with shared storage
+---
+
+import { ExecutorDiagram } from '../../components/ExecutorDiagram';
+
+# Containerized Execution
+
+This guide covers running Disco's executor component in containerized environments like Kubernetes, enabling scalable and isolated execution of AI coding agents.
+
+---
+
+## Overview
+
+Disco's architecture separates the **daemon** (orchestration layer) from the **executor** (isolated execution environment). This separation enables flexible deployment models:
+
+- **Local mode**: Daemon spawns executors as subprocesses (default)
+- **Containerized mode**: Daemon spawns executors in containers/pods via configurable templates
+
+### The Executor Model
+
+<ExecutorDiagram />
+
+The daemon owns orchestration and delegates all git **mutations** to the executor — it still runs read-only git probes (remote URL, default branch) and credential scrubbing itself. Each executor process handles a single command and exits, except terminal (Zellij) executors, which stay alive until closed.
+
+### What the Executor Does
+
+| Command               | Purpose                                        |
+| --------------------- | ---------------------------------------------- |
+| `prompt`              | Run an agent harness (Claude Code, Codex, Gemini, OpenCode, Copilot, Cursor) |
+| `git.clone`           | Clone a repository in the selected substrate   |
+| `git.branch.add`    | Materialize a branch workspace               |
+| `git.branch.remove` | Remove branch and cleanup                    |
+| `zellij.attach`       | Attach to terminal session                     |
+
+---
+
+## Architecture Considerations
+
+### This is NOT Static Deployment
+
+Running Disco in Kubernetes is fundamentally different from deploying static web applications:
+
+| Static Deploys       | Disco Dev Environments   |
+| -------------------- | ----------------------- |
+| Immutable containers | Interactive development |
+| No shared state      | Shared git branches    |
+| Scale out replicas   | User-specific sessions  |
+| Ephemeral storage    | Persistent filesystem   |
+
+**Key insight**: every executor command for a branch must see the same durable branch working copy
+at the absolute path recorded in PostgreSQL. That can be one shared filesystem, or an external
+launcher can attach one persistent per-branch volume to each short-lived executor. Daemon pods do
+not themselves need the branch mount in the external topology.
+
+---
+
+## Infrastructure Prerequisites
+
+Containerized Disco requires infrastructure that most organizations already have for multi-server environments. **Disco assumes this infrastructure exists - it does not provide it.**
+
+### Storage and identity requirements
+
+A delegated executor must receive trusted `{tenant_id}` and `{user_id}` values and bind them to isolated runtime storage. The launcher—not a host uid chosen by Disco—owns the mapping to container identities, persistent homes, credentials, and branch mounts.
+
+The daemon validates its declared storage contract but cannot prove the external substrate's claims. Use an immutable image, least-privilege service identity, tenant-separated storage, and explicit Stop/orphan cleanup.
+
+## Shared Filesystem Setup
+
+### Persistence Must Match the Database
+
+This is the single most common deployment foot-gun and worth calling out
+before the rest of the storage discussion.
+
+**If the Disco database is persistent, every branch workspace it references must also be
+persistent.** A global `$HOME` mount is one implementation, not a requirement. The database stores
+absolute paths to every repository clone and branch. If the database survives a pod restart but
+the corresponding branch volume does not
+(for example, the database is backed by a `PersistentVolumeClaim` while
+`$HOME` is an `emptyDir`), then on redeploy the daemon will reference
+paths that no longer exist. Opening a terminal or running a session will
+fail when the executor tries to `chdir` into a directory that's gone.
+
+The daemon will surface a clear error in this state (`cwd does not exist
+on disk: ...`, see [issue
+\#1109](https://github.com/preset-io/disco/issues/1109)), but the only
+real fix is to restore the volume or, if the volume is unrecoverable,
+clean up the orphan database rows using
+`disco branch remove` / `disco repo remove` before re-cloning.
+
+Safe configurations include:
+
+- **Shared-local**: database plus `data_home` on shared persistent storage mounted at the same path
+  on each daemon.
+- **External executors**: database plus durable per-branch volumes mounted at each recorded branch
+  path. A persistent per-user home is additionally required for CLI-native credentials.
+- **Both ephemeral**: Database on `emptyDir`, `$HOME` on `emptyDir`. Fine
+  for short-lived test pods. Everything resets together.
+- **Avoid mixing**: Persistent database + ephemeral filesystem is the
+  broken state described above.
+
+### Why Shared Storage?
+
+Disco's development model requires:
+
+1. **Watch mode**: File changes detected in real-time
+2. **Agent access**: AI agents read/write to branches
+3. **Terminal access**: Users interact with files via Zellij
+4. **Environment execution**: Docker Compose, npm, etc. run in branches
+
+All of these need access to the same filesystem.
+
+### Directory Separation
+
+Disco supports separating daemon config from git data:
+
+```yaml
+# ~/.disco/config.yaml
+
+paths:
+  # Daemon operating files (config, database, logs)
+  # Default: ~/.disco/
+  # Storage: local SSD (fast, daemon-local)
+
+  # Git data (repos, branches)
+  # Default: same as disco_home
+  # Storage: shared filesystem (EFS, NFS)
+  data_home: /data/disco
+```
+
+This enables:
+
+```
+Local SSD                    Shared Storage (EFS)
+┌──────────────────┐        ┌──────────────────────────┐
+│ ~/.disco/         │        │ /data/disco/              │
+│ ├── config.yaml  │        │ ├── repos/               │
+│ ├── disco.db      │        │ │   └── github.com/      │
+│ └── logs/        │        │ │       └── org/repo.git │
+└──────────────────┘        │ ├── branches/           │
+                            │ │   └── org/repo/        │
+                            │ │       ├── main/        │
+                            │ │       └── feature/     │
+                            │ └── zellij/              │
+                            │     └── sessions/        │
+                            └──────────────────────────┘
+```
+
+### AWS EFS Configuration
+
+For Amazon EKS deployments:
+
+```yaml
+# StorageClass for EFS
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: disco-efs
+provisioner: efs.csi.aws.com
+parameters:
+  provisioningMode: efs-ap
+  fileSystemId: fs-xxxxxxxxx
+  directoryPerms: '755'
+  basePath: '/disco'
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+
+---
+# PersistentVolumeClaim
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: disco-data
+spec:
+  accessModes:
+    - ReadWriteMany # Critical: multiple pods need access
+  storageClassName: disco-efs
+  resources:
+    requests:
+      storage: 100Gi
+```
+
+### NFS Alternative
+
+For on-premises or non-AWS deployments:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: disco-nfs
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteMany
+  nfs:
+    server: nfs-server.internal
+    path: /exports/disco
+  mountOptions:
+    - nfsvers=4.1
+    - rsize=1048576
+    - wsize=1048576
+    - hard
+    - timeo=600
+    - retrans=2
+```
+
+---
+
+## Executor Command Template
+
+### Configuration
+
+The daemon spawns executors using a configurable template:
+
+```yaml
+# ~/.disco/config.yaml
+
+execution:
+  # Local execution (default)
+  # executor_command_template: null
+
+  # Kubernetes execution
+  executor_command_template: |
+    kubectl run executor-{task_id} \
+      --image=ghcr.io/preset-io/disco-executor:latest \
+      --rm -i --restart=Never \
+      --labels="disco-tenant={tenant_id},disco-user={user_id}" \
+      --overrides='{
+        "spec": {
+          "containers": [{
+            "name": "executor",
+            "stdin": true,
+            "stdinOnce": true,
+            "volumeMounts": [{
+              "name": "data",
+              "mountPath": "/data/disco"
+            }]
+          }],
+          "volumes": [{
+            "name": "data",
+            "persistentVolumeClaim": {
+              "claimName": "disco-data"
+            }
+          }]
+        }
+      }' \
+      -- disco-executor --stdin
+```
+
+### Template Variables
+
+| Variable          | Description                             | Example               |
+| ----------------- | --------------------------------------- | --------------------- |
+| `{task_id}`       | Unique task identifier (auto-generated) | `a1b2c3d4`            |
+| `{command}`       | Executor command                        | `prompt`, `git.clone` |
+| `{unix_user}`     | Compatibility delegated home key        | `disco_alice`          |
+| `{session_id}`    | Disco session ID (if available)          | `01abc123...`         |
+| `{branch_id}`     | Branch ID (if available)                | `01xyz789...`         |
+| `{user_id}`       | Trusted authenticated Disco user UUID    | `01user789...`        |
+| `{tenant_id}`     | Trusted ambient tenant ID                | `tenant-abc`          |
+
+`{tenant_id}` comes from the authenticated operation's ambient tenant context
+and is rendered as one shell-escaped argument because tenant identity may
+originate in an external authentication claim. Use the placeholder unquoted,
+for example `launcher --tenant-id {tenant_id}`. If a template references
+`{tenant_id}` but no tenant context is active, Disco refuses to execute the
+template instead of passing a literal or empty tenant value. In
+`required_from_auth` mode, every executor launch requires an active tenant
+context, whether or not its template uses the placeholder.
+
+`{unix_user}` is validated against the delegated home-key format and Disco refuses
+to execute the template when the value is malformed — it is rendered into a
+`sh -c` command and commonly used as a path segment for per-user home mounts.
+In `unix_user_mode: delegated` it carries the session user's `unix_username`;
+in delegated mode it carries the compatibility home key.
+
+> **Codex subscription credentials caveat:** Codex auth-file operations already run through an
+> executor, but correctness requires every auth helper and Task for one trusted tenant/user identity
+> to receive the same persistent home. Declare that guarantee as
+> `execution.executor_storage.user_home: persistent-per-user`; the launcher must actually implement
+> it. The constrained HA profile admits auth-file check/import/logout only with a consistent
+> declared home. Declaring storage does not make the process-affine device-code poller durable, so
+> device sign-in remains gated.
+
+### How It Works
+
+1. Daemon receives request (e.g., start agent session)
+2. Daemon constructs JSON payload with all parameters
+3. Daemon substitutes template variables
+4. Daemon executes template command via `sh -c`
+5. Payload is piped to executor via stdin
+6. **Daemon returns immediately** (fire-and-forget)
+7. Executor connects back to daemon via WebSocket
+8. Executor performs work, updates database via Feathers API
+9. Pod terminates when executor exits
+
+### Fire-and-Forget Design
+
+The daemon **never waits** for executor completion. This is critical for:
+
+- **Responsiveness**: UI gets immediate feedback
+- **Scalability**: Daemon doesn't hold connections open
+- **Resilience**: Executor failures don't block daemon
+
+The executor is responsible for:
+
+- **Status updates**: Updating task/session status via Feathers API
+- **Error reporting**: Logging and broadcasting errors via WebSocket
+- **Database operations**: All mutations happen in the executor
+- **User notifications**: Emitting events the UI can display as toasts
+
+---
+
+## Security Context
+
+### Pod Security Best Practices
+
+```yaml
+spec:
+  securityContext:
+    # Run as non-root user (mapped from Disco user)
+    runAsNonRoot: true
+    runAsUser: 1001
+    runAsGroup: 1001
+
+    # Match filesystem group for shared storage
+    fsGroup: 1001
+
+    # Prevent privilege escalation
+    allowPrivilegeEscalation: false
+
+  containers:
+    - name: executor
+      securityContext:
+        # Read-only root filesystem where possible
+        readOnlyRootFilesystem: false # Agents need /tmp
+
+        # Drop all capabilities except what's needed
+        capabilities:
+          drop:
+            - ALL
+```
+
+### Delegated identity and storage
+
+Disco does not create or select container users. A delegated launcher receives
+trusted tenant and user identifiers plus the transitional execution-home key,
+then owns runtime identity, persistent credential storage, workspace mounts,
+containment, cancellation, and cleanup. Document and test that contract for the
+chosen orchestrator; a `runAsUser` value alone is not proof of tenant isolation.
+- **Init container** to set up user environment
+
+---
+
+## Timeout and Resource Management
+
+### Long-Running Sessions
+
+AI agent sessions can run 20-60 minutes. Configure appropriately:
+
+```yaml
+# Pod spec
+spec:
+  # Allow 2 hours for agent sessions
+  activeDeadlineSeconds: 7200
+
+  containers:
+    - name: executor
+      resources:
+        requests:
+          cpu: '500m'
+          memory: '1Gi'
+        limits:
+          cpu: '4'
+          memory: '8Gi' # Agents can be memory-intensive
+```
+
+### Command-Specific Timeouts
+
+Different executor commands have different timeout needs:
+
+| Command            | Typical Duration | Recommended Timeout |
+| ------------------ | ---------------- | ------------------- |
+| `prompt`           | 5-60 minutes     | 2 hours             |
+| `git.clone`        | 1-10 minutes     | 30 minutes          |
+| `git.branch.add` | 1-30 seconds     | 5 minutes           |
+| `zellij.attach`    | Session duration | 8 hours             |
+
+### Timeout Configuration
+
+Since the daemon uses fire-and-forget spawning, timeouts are managed at the Kubernetes level:
+
+```yaml
+spec:
+  # Pod-level deadline (failsafe)
+  activeDeadlineSeconds: 7200
+
+  containers:
+    - name: executor
+      # Liveness probe - detect stuck processes
+      livenessProbe:
+        exec:
+          command:
+            - cat
+            - /tmp/executor-alive
+        initialDelaySeconds: 60
+        periodSeconds: 30
+        failureThreshold: 3
+```
+
+---
+
+## Network Configuration
+
+### Executor-to-Daemon Communication
+
+Executors connect back to the daemon via WebSocket:
+
+```yaml
+# Daemon Service (internal)
+apiVersion: v1
+kind: Service
+metadata:
+  name: disco-daemon
+spec:
+  selector:
+    app: disco-daemon
+  ports:
+    - port: 3030
+      targetPort: 3030
+  type: ClusterIP # Internal only for executors
+
+---
+# Ingress for external UI access
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: disco-ui
+spec:
+  rules:
+    - host: disco.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: disco-ui
+                port:
+                  number: 80
+```
+
+### Environment Variables
+
+Executor receives daemon URL in payload:
+
+```json
+{
+  "command": "prompt",
+  "daemonUrl": "http://disco-daemon.disco.svc.cluster.local:3030",
+  "sessionToken": "eyJhbGc...",
+  "params": { ... }
+}
+```
+
+### Egress Requirements
+
+Executors need outbound access to:
+
+| Service                             | Purpose          |
+| ----------------------------------- | ---------------- |
+| `api.anthropic.com`                 | Claude API       |
+| `api.openai.com`                    | OpenAI/Codex API |
+| `generativelanguage.googleapis.com` | Gemini API       |
+| `github.com`, `gitlab.com`          | Git operations   |
+
+Configure NetworkPolicy or egress controls accordingly.
+
+### Daemon URL Resolution
+
+The **daemon** (not the executor) is responsible for knowing its own URL. It passes this URL to executors in the JSON payload:
+
+```json
+{
+  "command": "prompt",
+  "daemonUrl": "http://disco-daemon.disco.svc.cluster.local:3030",
+  "sessionToken": "eyJhbGc...",
+  "params": { ... }
+}
+```
+
+The executor simply uses `payload.daemonUrl` to connect back - it never reads `config.yaml`.
+
+**Local mode**: The daemon defaults to `http://localhost:{PORT}`.
+
+**Containerized mode**: Configure `daemon.public_url` so the daemon knows its k8s service URL:
+
+```yaml
+# ~/.disco/config.yaml (read by daemon only)
+daemon:
+  port: 3030
+  # URL that executors use to reach the daemon (k8s internal service DNS)
+  public_url: http://disco-daemon.disco.svc.cluster.local:3030
+```
+
+At startup, the daemon calls `configureDaemonUrl()` which sets this URL globally. All subsequent executor payloads automatically include the correct `daemonUrl`.
+
+---
+
+## High Availability
+
+### Current status
+
+Disco has an explicit constrained active-active daemon mode using PostgreSQL, Redis realtime fanout,
+and sticky Engine.IO ingress. See [Daemon high availability](/guide/daemon-ha) for the supported
+surface and runnable Compose smoke topology.
+
+### Shared Filesystem Simplifies HA
+
+With shared storage (EFS/NFS) for both `DISCO_DATA_HOME` and `/home`, the daemon becomes largely stateless:
+
+- **Executors**: Make fresh connections to daemon - no sticky sessions needed
+- **Database**: SQLite on shared storage, or use Turso/LibSQL for distributed access
+- **Filesystem state**: Consistent across all replicas via shared mount
+
+### What Still Needs Redis
+
+FeathersJS uses Socket.io for real-time UI updates. With multiple daemon replicas:
+
+- **UI WebSocket connections**: Long-lived, need event broadcasting across replicas
+- **Redis adapter**: Required so events from one replica reach all connected clients
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   Browser   │     │   Browser   │     │   Browser   │
+└──────┬──────┘     └──────┬──────┘     └──────┬──────┘
+       │                   │                   │
+       ▼                   ▼                   ▼
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  Daemon-1   │◄───►│    Redis    │◄───►│  Daemon-2   │
+└─────────────┘     └─────────────┘     └─────────────┘
+       │                                       │
+       └──────────────┬────────────────────────┘
+                      ▼
+              ┌─────────────┐
+              │  EFS / NFS  │  (shared storage)
+              └─────────────┘
+```
+
+The external Cloud shape does not mount tenant workspaces into daemon pods. It declares
+`persistent-per-user` home and `persistent-per-branch` workspace guarantees, uses clone-only branch
+storage when the base repository is unavailable, and keeps Engine.IO affinity at ingress.
+
+**References:**
+
+- [FeathersJS Scaling Guide](https://feathersjs.com/guides/advanced/scaling)
+- [Socket.io Redis Adapter](https://socket.io/docs/v4/redis-adapter/)
+
+For most deployments, a single daemon replica is sufficient. Scale horizontally by running multiple executor pods instead.
+
+---
+
+## Filesystem permissions and runtime identity
+
+Disco no longer creates Unix users/groups or sends UID/GID template variables. Configure pod/container `securityContext` in the launcher or workload definition. Prefer stable `{tenant_id}` and `{user_id}` inputs and resolve them through trusted deployment configuration rather than mutable usernames.
+
+The compatibility `{unix_user}` variable is an opaque delegated home key. It is validated for safe path/template use but is not evidence of a host account or isolation boundary.
+
+## Dev Environments in Containerized Mode
+
+### The Three-Tier Architecture
+
+In a fully containerized Disco deployment, there are three distinct tiers:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Tier 1: Disco Control Plane                                 │
+│  - Daemon pod (orchestration, API, database)                │
+│  - UI pod (web interface)                                   │
+│  - Always running                                           │
+└─────────────────────────────────────────────────────────────┘
+                          │
+                          │ spawns
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Tier 2: Executor Pods                                      │
+│  - Short-lived pods for agent sessions                      │
+│  - Run Claude/Gemini/Codex SDKs                            │
+│  - Mount shared storage (EFS)                               │
+│  - Exit when task completes                                 │
+└─────────────────────────────────────────────────────────────┘
+                          │
+                          │ may spawn
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Tier 3: Dev Environment Containers                         │
+│  - Docker Compose, npm, pytest, etc.                        │
+│  - Defined in branch's environment config                 │
+│  - May run as sidecar or separate pods                      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Dev Environment Strategies
+
+In containerized mode, branch dev environments should also be containerized:
+
+**Option A: Kubernetes-Native Commands**
+
+Replace Docker Compose with `kubectl` commands in environment config:
+
+```yaml
+# branch environment config
+environment:
+  start_command: |
+    kubectl apply -f k8s/dev-environment.yaml
+  stop_command: |
+    kubectl delete -f k8s/dev-environment.yaml
+  health_command: |
+    kubectl get pods -l app=myapp-dev -o jsonpath='{.items[0].status.phase}'
+```
+
+**Option B: Docker-in-Docker (DinD)**
+
+Run Docker daemon inside executor pods:
+
+```yaml
+spec:
+  containers:
+    - name: executor
+      image: ghcr.io/preset-io/disco-executor:latest
+    - name: dind
+      image: docker:dind
+      securityContext:
+        privileged: true
+```
+
+**Option C: Podman (Rootless)**
+
+Use Podman for rootless container execution within pods.
+
+### Recommendation
+
+For production deployments, **Option A (Kubernetes-native)** is recommended:
+
+- No privileged containers required
+- Better resource isolation
+- Consistent with cluster security policies
+
+---
+
+## Deployment Patterns
+
+### Pattern 1: Daemon + On-Demand Executor Pods
+
+Best for: Variable workloads, cost optimization
+
+```
+┌─────────────────┐
+│  Daemon Pod     │ (always running)
+│  + UI Pod       │
+└────────┬────────┘
+         │ spawns on demand
+         ▼
+┌─────────────────┐
+│  Executor Pod   │ (ephemeral, exits when done)
+│  Session ABC    │
+└─────────────────┘
+```
+
+```yaml
+# Daemon Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: disco-daemon
+spec:
+  replicas: 1 # Single daemon
+  template:
+    spec:
+      serviceAccountName: disco-daemon
+      containers:
+        - name: daemon
+          image: ghcr.io/preset-io/disco:latest
+          command: ['disco', 'daemon', 'start']
+          volumeMounts:
+            - name: config
+              mountPath: /home/disco/.disco
+            - name: data
+              mountPath: /data/disco
+```
+
+### Pattern 2: Executor DaemonSet (Pre-warmed)
+
+Best for: Low latency requirements
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: disco-executor-pool
+spec:
+  selector:
+    matchLabels:
+      app: disco-executor
+  template:
+    spec:
+      containers:
+        - name: executor
+          image: ghcr.io/preset-io/disco-executor:latest
+          command: ['sleep', 'infinity'] # Warm pool
+          volumeMounts:
+            - name: data
+              mountPath: /data/disco
+```
+
+Note: Pre-warmed executors require custom orchestration to reuse pods.
+
+---
+
+## Monitoring and Observability
+
+### Metrics to Track
+
+| Metric                           | Description                  |
+| -------------------------------- | ---------------------------- |
+| `disco_executor_spawn_total`      | Total executor spawns        |
+| `disco_executor_duration_seconds` | Execution duration histogram |
+| `disco_executor_failures_total`   | Failed executions            |
+| `disco_prompt_tokens_total`       | Token usage by session       |
+
+### Pod Events
+
+Monitor executor pod lifecycle:
+
+```bash
+kubectl get events --field-selector involvedObject.name=executor-abc123
+```
+
+### Logging
+
+Executor logs appear in:
+
+- Pod stdout/stderr (captured by Kubernetes)
+- Daemon logs (spawn events, timeouts)
+
+```yaml
+# Daemon config
+logging:
+  level: info
+  format: json
+```
+
+---
+
+## Troubleshooting
+
+### Pod Stuck in Pending
+
+```bash
+kubectl describe pod executor-abc123
+```
+
+Common causes:
+
+- Insufficient resources (request more CPU/memory)
+- PVC not bound (check EFS provisioning)
+- Node selector mismatch
+
+### Filesystem Permission Denied
+
+```bash
+kubectl exec -it executor-abc123 -- ls -la /data/disco/worktrees
+```
+
+Verify:
+
+- `fsGroup` matches branch group
+- EFS access point configured correctly
+- PVC mounted with correct permissions
+
+### Executor Timeout
+
+Check daemon logs:
+
+```bash
+kubectl logs -f deployment/disco-daemon | grep "EXECUTOR_TIMEOUT"
+```
+
+Solutions:
+
+- Increase `activeDeadlineSeconds`
+- Increase daemon spawn timeout
+- Check network connectivity to APIs
+
+### WebSocket Connection Failed
+
+Verify daemon is accessible from executor pods:
+
+```bash
+kubectl exec -it executor-abc123 -- \
+  curl -s http://disco-daemon:3030/health
+```
+
+Check:
+
+- Service exists and has endpoints
+- NetworkPolicy allows traffic
+- Daemon pod is healthy
+
+---
+
+## Migration from Local to Containerized
+
+### Step 1: Enable Directory Separation
+
+```yaml
+# ~/.disco/config.yaml
+paths:
+  data_home: /data/disco
+```
+
+### Step 2: Migrate Existing Data
+
+```bash
+# Move repos and branches to shared storage. The on-disk dir name is
+# still `worktrees` for backwards compatibility with existing installs.
+mv ~/.disco/repos /data/disco/repos
+mv ~/.disco/worktrees /data/disco/worktrees
+
+# Create symlinks for backward compatibility
+ln -s /data/disco/repos ~/.disco/repos
+ln -s /data/disco/worktrees ~/.disco/worktrees
+```
+
+### Step 3: Test Local with New Paths
+
+Verify everything works before adding containerization:
+
+```bash
+disco repo list
+disco branch list
+```
+
+### Step 4: Configure Daemon URL and Executor Template
+
+Add the containerized execution configuration:
+
+```yaml
+# ~/.disco/config.yaml
+daemon:
+  port: 3030
+  # URL that executors use to reach the daemon (k8s service DNS)
+  public_url: http://disco-daemon.disco.svc.cluster.local:3030
+
+execution:
+  executor_command_template: |
+    kubectl run executor-{task_id} \
+      --image=ghcr.io/preset-io/disco-executor:latest \
+      --rm -i --restart=Never \
+      --labels="disco-tenant={tenant_id},disco-user={user_id}" \
+      -- disco-executor --stdin
+```
+
+### Upgrade Remote Executors with the Daemon
+
+Remote executors may be deployed independently, but they are part of the same
+runtime contract as the daemon. Upgrade remote executor images to the same Disco
+release when upgrading the daemon; mixed-version daemon/executor deployments are
+not a supported rollout mode. Before downgrading to a release that predates the
+`dispatching` state, stop or settle pending dispatches with the current daemon.
+
+### SDK Health Watchdog
+
+Disco can detect an executor whose wrapper is alive but whose SDK stream stops
+making progress. The watchdog starts in observe-only mode so upgrades collect
+diagnostics without stopping work:
+
+```yaml
+execution:
+  sdk_watchdog:
+    mode: observe # disabled | observe | enforce
+    first_progress_timeout_ms: 180000
+    abort_grace_ms: 15000
+    claude_idle_timeout_ms: 3600000 # null disables Claude's post-progress check
+```
+
+`observe` records what would have fired. Use `enforce` only after reviewing
+real-workload diagnostics for false positives; `disabled` is the rollback
+switch. Unknown SDK events fail open while they continue, permission/input
+waits pause the clock, and known active Claude tools are not timed out.
+
+SDK activity facts share the existing executor heartbeat transport. Disabling
+`execution.executor_heartbeat.enabled` therefore disables persisted pulse
+diagnostics and the stale-wrapper backstop, but the executor-local watchdog and
+its direct failure report remain active.
+
+User Stop first persists the Task's `stopping` state. That normal realtime Task
+patch travels over the executor's authenticated WebSocket, so the executor can
+abort its SDK and run provider cleanup regardless of which host or pod runs the
+daemon. Reconnecting executors read the durable Task state instead of relying on
+an ephemeral cancellation event. The executor reports quiescence only after its
+SDK and stop hooks return.
+
+For locally spawned executors, Disco additionally verifies process-group absence
+before the session becomes promptable; a short cooperative grace is followed by
+SIGTERM/SIGKILL only when the wrapper does not exit itself. A scoped remote
+executor's quiescence report is the authoritative cooperative result because
+the daemon cannot inspect a process group on another host. Missing reports still
+flow through the heartbeat supervisor and remain visible and blocked rather
+than being treated as proof of termination. OpenCode server-side execution also
+remains unverified. After an abrupt daemon restart, Disco keeps its existing
+orphan cleanup behavior; diagnostics disclose that logical release does not
+prove remote process termination.
+
+### Step 5: Test Single Executor
+
+Spawn one executor pod manually:
+
+```bash
+kubectl run test-executor \
+  --image=ghcr.io/preset-io/disco-executor:latest \
+  --rm -it -- disco-executor --version
+```
+
+### Step 6: Full Integration Test
+
+Create a branch and run an agent session through the UI.
+
+---
+
+## Related Documentation
+
+- [Multiplayer Execution Isolation](/guide/multiplayer-unix-isolation) - RBAC, local sandboxing, and delegated execution
+- [Environments](/guide/environment-configuration) - Branch environment templates
+- [Architecture](/guide/architecture) - System design overview

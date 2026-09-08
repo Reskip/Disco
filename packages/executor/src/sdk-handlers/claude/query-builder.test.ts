@@ -1,0 +1,621 @@
+import type { SessionID, TaskID } from '@disco/core/types';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+// Mock minimal dependencies
+vi.mock('@disco/core/lib/validation', () => ({
+  validateDirectory: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock('@disco/core/db', () => ({
+  // shortId is used in log lines inside query-builder; passthrough mock.
+  shortId: vi.fn((id: string) => id),
+}));
+vi.mock('@anthropic-ai/claude-agent-sdk', () => ({ query: vi.fn() }));
+vi.mock('@disco/core/templates/session-context', () => ({
+  renderDiscoSystemPrompt: vi.fn().mockResolvedValue('prompt'),
+}));
+vi.mock('@disco/core/tools/mcp/http-headers', () => ({
+  mergeMCPRemoteHeaders: vi.fn(({ custom, auth }) => ({ ...(custom || {}), ...(auth || {}) })),
+}));
+vi.mock('@disco/core/tools/mcp/jwt-auth', () => ({
+  resolveMCPAuthHeaders: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock('../../config.js', () => ({
+  getDaemonUrl: vi.fn().mockResolvedValue('http://localhost:3030'),
+}));
+vi.mock('@disco/core/mcp', async () => {
+  const actual = await vi.importActual<typeof import('@disco/core/mcp')>('@disco/core/mcp');
+  return { ...actual, getMcpServersForSession: vi.fn().mockResolvedValue([]) };
+});
+vi.mock('./models.js', () => ({
+  DEFAULT_CLAUDE_MODEL: 'claude-sonnet-4-6',
+}));
+vi.mock('../base/permission-hooks.js', () => ({
+  createCanUseToolCallback: vi.fn(
+    () => () => Promise.resolve({ behavior: 'allow', updatedInput: {} })
+  ),
+}));
+
+import { getMcpServersForSession } from '@disco/core/mcp';
+import { resolveMCPAuthHeaders } from '@disco/core/tools/mcp/jwt-auth';
+import * as Claude from '@anthropic-ai/claude-agent-sdk';
+import { CLAUDE_CODE_DISALLOWED_TOOLS } from './constants.js';
+import { formatListForLog, type QuerySetupDeps, setupQuery } from './query-builder.js';
+
+describe('MCP logging helpers', () => {
+  it('formats long server lists without dumping every entry', () => {
+    expect(formatListForLog(['a', 'b', 'c'], 5)).toBe('a, b, c');
+    expect(formatListForLog(['a', 'b', 'c', 'd'], 2)).toBe('a, b +2 more');
+  });
+});
+
+describe('setupQuery - Local Settings Support', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getMcpServersForSession).mockResolvedValue([]);
+    vi.mocked(resolveMCPAuthHeaders).mockResolvedValue(undefined);
+    vi.mocked(Claude.query).mockReturnValue({
+      [Symbol.asyncIterator]: () => ({ next: () => Promise.resolve({ done: true }) }),
+      interrupt: () => Promise.resolve(),
+    } as any);
+  });
+
+  function createMockDeps(): QuerySetupDeps {
+    return {
+      sessionsRepo: {
+        findById: vi.fn().mockResolvedValue({
+          session_id: 'test-session' as SessionID,
+          working_directory: process.cwd(),
+        }),
+      } as any,
+      permissionLocks: new Map(),
+    };
+  }
+
+  it('includes "local" in the SDK settingSources', async () => {
+    const deps = createMockDeps();
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps);
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+
+    // This is the core test for your feature:
+    // It ensures 'local' is passed alongside 'user' and 'project'
+    expect(callArgs.options.settingSources).toContain('local');
+    expect(callArgs.options.settingSources).toEqual(
+      expect.arrayContaining(['user', 'project', 'local'])
+    );
+  });
+
+  it('logs only the generic prompt start and passes resume and prompt data to the SDK', async () => {
+    const prompt = 'sk-ant-SECRET_QUERY_SENTINEL\r\nsecond line\nDATABASE_URL=do-not-log';
+    const deps = createMockDeps();
+    const now = new Date().toISOString();
+    vi.mocked(deps.sessionsRepo.findById).mockResolvedValue({
+      session_id: 'test-session' as SessionID,
+      working_directory: process.cwd(),
+      mcp_token: 'test-token',
+      sdk_session_id: 'sdk-session-secret',
+      created_at: now,
+      last_updated: now,
+      permission_config: { mode: 'default' },
+      model_config: {
+        mode: 'alias',
+        model: 'claude-sonnet-4-6',
+        updated_at: now,
+        effort: 'high',
+        advisorModel: 'opus',
+      },
+    } as any);
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    try {
+      await setupQuery('test-session' as SessionID, prompt, deps);
+
+      expect(logSpy.mock.calls).toEqual([['🤖 Prompting Claude for session test-session...']]);
+
+      const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+      expect(callArgs.options).not.toHaveProperty('debug');
+      expect(callArgs.options.resume).toBe('sdk-session-secret');
+      const promptIterator = callArgs.prompt[Symbol.asyncIterator]();
+      const firstMessage = await promptIterator.next();
+      expect(firstMessage.value.message.content).toEqual([{ type: 'text', text: prompt }]);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  // Pin the literal disallow list so a stray edit to the constant
+  // (e.g. dropping `ExitWorktree`) trips this test, not just the plumbing one.
+  // See `constants.ts` for why each name is on the list — #1177 covers
+  // AskUserQuestion; the rest were operator-approved at the same time.
+  // `ScheduleWakeup` added in #1253 (Disco schedules supersede /loop).
+  it('locks the disallowed-tools list to the operator-approved names', () => {
+    expect(CLAUDE_CODE_DISALLOWED_TOOLS).toEqual([
+      'AskUserQuestion',
+      'ExitPlanMode',
+      'EnterWorktree',
+      'ExitWorktree',
+      'ScheduleWakeup',
+    ]);
+  });
+
+  // Plumbing: whatever's in the constant must reach the SDK.
+  it('passes the Claude Code disallowed-tools list to the SDK', async () => {
+    const deps = createMockDeps();
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps);
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    expect(callArgs.options.disallowedTools).toEqual([...CLAUDE_CODE_DISALLOWED_TOOLS]);
+  });
+
+  it('keeps non-OAuth MCP startup lazy for gateway sessions', async () => {
+    const deps = createMockDeps();
+    vi.mocked(deps.sessionsRepo.findById).mockResolvedValue({
+      session_id: 'test-session' as SessionID,
+      working_directory: process.cwd(),
+      mcp_token: 'test-token',
+      custom_context: { gateway_source: { channel_id: 'channel-1' } },
+    } as any);
+    deps.sessionMCPRepo = {} as any;
+    deps.mcpServerRepo = {} as any;
+    vi.mocked(getMcpServersForSession).mockResolvedValue([
+      {
+        server: {
+          name: 'remote',
+          transport: 'http',
+          url: 'https://example.com/mcp',
+        },
+      } as any,
+    ]);
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps);
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    const mcpServers = callArgs.options.mcpServers as Record<string, Record<string, unknown>>;
+    expect(mcpServers.disco.alwaysLoad).toBeUndefined();
+    expect(mcpServers.remote.alwaysLoad).toBeUndefined();
+  });
+
+  it('keeps MCP startup lazy for non-gateway sessions', async () => {
+    const deps = createMockDeps();
+    vi.mocked(deps.sessionsRepo.findById).mockResolvedValue({
+      session_id: 'test-session' as SessionID,
+      working_directory: process.cwd(),
+      mcp_token: 'test-token',
+    } as any);
+    deps.sessionMCPRepo = {} as any;
+    deps.mcpServerRepo = {} as any;
+    vi.mocked(getMcpServersForSession).mockResolvedValue([
+      {
+        server: {
+          name: 'remote',
+          transport: 'http',
+          url: 'https://example.com/mcp',
+        },
+      } as any,
+    ]);
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps);
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    const mcpServers = callArgs.options.mcpServers as Record<string, Record<string, unknown>>;
+    expect(mcpServers.disco.alwaysLoad).toBeUndefined();
+    expect(mcpServers.remote.alwaysLoad).toBeUndefined();
+  });
+
+  it('always loads authenticated OAuth MCP servers for non-gateway sessions', async () => {
+    const deps = createMockDeps();
+    vi.mocked(deps.sessionsRepo.findById).mockResolvedValue({
+      session_id: 'test-session' as SessionID,
+      working_directory: process.cwd(),
+      mcp_token: 'test-token',
+    } as any);
+    deps.sessionMCPRepo = {} as any;
+    deps.mcpServerRepo = {} as any;
+    vi.mocked(resolveMCPAuthHeaders).mockResolvedValue({ Authorization: 'Bearer oauth-token' });
+    vi.mocked(getMcpServersForSession).mockResolvedValue([
+      {
+        server: {
+          name: 'oauthRemote',
+          transport: 'http',
+          url: 'https://example.com/mcp',
+          auth: { type: 'oauth', oauth_access_token: 'oauth-token' },
+        },
+      } as any,
+    ]);
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps);
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    const mcpServers = callArgs.options.mcpServers as Record<string, Record<string, unknown>>;
+    expect(mcpServers.disco.alwaysLoad).toBeUndefined();
+    expect(mcpServers.oauthRemote).toMatchObject({
+      headers: { Authorization: 'Bearer oauth-token' },
+      alwaysLoad: true,
+    });
+  });
+
+  it('does not block gateway startup on unauthenticated OAuth servers with custom headers', async () => {
+    const deps = createMockDeps();
+    vi.mocked(deps.sessionsRepo.findById).mockResolvedValue({
+      session_id: 'test-session' as SessionID,
+      working_directory: process.cwd(),
+      mcp_token: 'test-token',
+      custom_context: { gateway_source: { channel_id: 'channel-1' } },
+    } as any);
+    deps.sessionMCPRepo = {} as any;
+    deps.mcpServerRepo = {} as any;
+    vi.mocked(resolveMCPAuthHeaders).mockResolvedValue(undefined);
+    vi.mocked(getMcpServersForSession).mockResolvedValue([
+      {
+        server: {
+          name: 'oauthRemote',
+          transport: 'http',
+          url: 'https://example.com/mcp',
+          auth: { type: 'oauth' },
+          headers: { 'X-Tenant': 'tenant-1' },
+        },
+      } as any,
+    ]);
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps);
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    const mcpServers = callArgs.options.mcpServers as Record<string, Record<string, unknown>>;
+    expect(mcpServers.disco.alwaysLoad).toBeUndefined();
+    expect(mcpServers.oauthRemote).toMatchObject({
+      headers: { 'X-Tenant': 'tenant-1' },
+    });
+    expect(mcpServers.oauthRemote.alwaysLoad).toBeUndefined();
+  });
+
+  it('does not block gateway startup on remote Bearer or JWT servers without resolved auth', async () => {
+    const deps = createMockDeps();
+    vi.mocked(deps.sessionsRepo.findById).mockResolvedValue({
+      session_id: 'test-session' as SessionID,
+      working_directory: process.cwd(),
+      mcp_token: 'test-token',
+      custom_context: { gateway_source: { channel_id: 'channel-1' } },
+    } as any);
+    deps.sessionMCPRepo = {} as any;
+    deps.mcpServerRepo = {} as any;
+    vi.mocked(resolveMCPAuthHeaders).mockResolvedValue(undefined);
+    vi.mocked(getMcpServersForSession).mockResolvedValue([
+      {
+        server: {
+          name: 'bearerRemote',
+          transport: 'http',
+          url: 'https://bearer.example.com/mcp',
+          auth: { type: 'bearer' },
+        },
+      } as any,
+      {
+        server: {
+          name: 'jwtRemote',
+          transport: 'http',
+          url: 'https://jwt.example.com/mcp',
+          auth: { type: 'jwt' },
+        },
+      } as any,
+    ]);
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps);
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    const mcpServers = callArgs.options.mcpServers as Record<string, Record<string, unknown>>;
+    expect(mcpServers.disco.alwaysLoad).toBeUndefined();
+    expect(mcpServers.bearerRemote.alwaysLoad).toBeUndefined();
+    expect(mcpServers.jwtRemote.alwaysLoad).toBeUndefined();
+  });
+
+  it('passes session advisorModel through the --advisor CLI flag, NOT settings', async () => {
+    const deps = createMockDeps();
+    vi.mocked(deps.sessionsRepo.findById).mockResolvedValue({
+      session_id: 'test-session' as SessionID,
+      working_directory: process.cwd(),
+      model_config: {
+        mode: 'alias',
+        model: 'claude-sonnet-4-6[1m]',
+        updated_at: '2026-06-11T00:00:00.000Z',
+        advisorModel: 'opus',
+      },
+    } as any);
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps);
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    expect(callArgs.options.model).toBe('claude-sonnet-4-6[1m]');
+    // The advisor goes through the SDK's extraArgs → `--advisor opus`.
+    expect(callArgs.options.extraArgs).toMatchObject({ advisor: 'opus' });
+    // EACCES regression guard: we must NOT pass `settings` as an object, which
+    // makes the CLI materialize a content-addressed /tmp/claude-settings-*.json
+    // that collides across sessions/users (EACCES on open). See query-builder.ts.
+    expect(callArgs.options.settings).toBeUndefined();
+  });
+
+  it('passes advisorModel [1m] through to Claude Code without translating it to a beta', async () => {
+    const deps = createMockDeps();
+    vi.mocked(deps.sessionsRepo.findById).mockResolvedValue({
+      session_id: 'test-session' as SessionID,
+      working_directory: process.cwd(),
+      model_config: {
+        mode: 'alias',
+        model: 'claude-sonnet-4-6',
+        updated_at: '2026-06-11T00:00:00.000Z',
+        advisorModel: 'claude-opus-4-7[1m]',
+      },
+    } as any);
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps);
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    expect(callArgs.options.extraArgs).toMatchObject({ advisor: 'claude-opus-4-7[1m]' });
+    expect(callArgs.options.settings).toBeUndefined();
+    expect(callArgs.options.betas).toBeUndefined();
+  });
+
+  it('omits --advisor (and settings) entirely when no advisorModel is set', async () => {
+    // Turn-off contract: clearing the advisor leaves no --advisor flag and no
+    // settings object, so the session starts exactly as it did pre-advisor.
+    const deps = createMockDeps();
+    vi.mocked(deps.sessionsRepo.findById).mockResolvedValue({
+      session_id: 'test-session' as SessionID,
+      working_directory: process.cwd(),
+      model_config: {
+        mode: 'alias',
+        model: 'claude-sonnet-4-6',
+        updated_at: '2026-06-11T00:00:00.000Z',
+        // no advisorModel
+      },
+    } as any);
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps);
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    expect(
+      (callArgs.options.extraArgs as Record<string, unknown> | undefined)?.advisor
+    ).toBeUndefined();
+    expect(callArgs.options.settings).toBeUndefined();
+  });
+
+  it('ignores a whitespace-only advisorModel (no --advisor, no settings)', async () => {
+    const deps = createMockDeps();
+    vi.mocked(deps.sessionsRepo.findById).mockResolvedValue({
+      session_id: 'test-session' as SessionID,
+      working_directory: process.cwd(),
+      model_config: {
+        mode: 'alias',
+        model: 'claude-sonnet-4-6',
+        updated_at: '2026-06-11T00:00:00.000Z',
+        advisorModel: '   ',
+      },
+    } as any);
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps);
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    expect(
+      (callArgs.options.extraArgs as Record<string, unknown> | undefined)?.advisor
+    ).toBeUndefined();
+    expect(callArgs.options.settings).toBeUndefined();
+  });
+});
+
+describe('setupQuery - canUseTool registration', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(Claude.query).mockReturnValue({
+      [Symbol.asyncIterator]: () => ({ next: () => Promise.resolve({ done: true }) }),
+      interrupt: () => Promise.resolve(),
+    } as any);
+  });
+
+  function createPermissionDeps(): QuerySetupDeps {
+    return {
+      sessionsRepo: {
+        findById: vi.fn().mockResolvedValue({
+          session_id: 'test-session' as SessionID,
+          working_directory: process.cwd(),
+        }),
+      } as any,
+      messagesRepo: {} as any,
+      sessionMCPRepo: {} as any,
+      mcpServerRepo: {} as any,
+      permissionService: {} as any,
+      tasksService: {} as any,
+      messagesService: {} as any,
+      sessionsService: {} as any,
+      permissionLocks: new Map(),
+    };
+  }
+
+  // With AskUserQuestion now disallowed (#1177), the SDK no longer needs
+  // canUseTool registered in bypass mode — the previous workaround that
+  // forced registration to intercept AskUserQuestion is gone. Bypass mode
+  // should now skip canUseTool entirely, matching SDK semantics.
+  it('does not register canUseTool when permissionMode is "bypassPermissions"', async () => {
+    const deps = createPermissionDeps();
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps, {
+      taskId: 'test-task' as TaskID,
+      permissionMode: 'bypassPermissions',
+    });
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    expect(callArgs.options.canUseTool).toBeUndefined();
+    expect(callArgs.options.permissionMode).toBe('bypassPermissions');
+  });
+
+  it('registers canUseTool in default permission mode', async () => {
+    const deps = createPermissionDeps();
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps, {
+      taskId: 'test-task' as TaskID,
+      permissionMode: 'default',
+    });
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    expect(callArgs.options.canUseTool).toBeTypeOf('function');
+  });
+
+  it('does not register canUseTool when required deps are missing (no taskId)', async () => {
+    const deps = createPermissionDeps();
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps, {
+      permissionMode: 'bypassPermissions',
+      // no taskId
+    });
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    expect(callArgs.options.canUseTool).toBeUndefined();
+  });
+});
+
+/**
+ * `bypassPermissions` removes the approval channel, which leaves an `ask` tool
+ * unanswerable. It resolves to a refusal rather than to `allow`, so the mode is
+ * "stop asking me" for everything except the tools an operator explicitly asked
+ * to be prompted about.
+ */
+describe('setupQuery - ask under bypassPermissions', () => {
+  const GATED_SERVER = 'files';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(Claude.query).mockReturnValue({
+      [Symbol.asyncIterator]: () => ({ next: () => Promise.resolve({ done: true }) }),
+      interrupt: () => Promise.resolve(),
+    } as any);
+    vi.mocked(getMcpServersForSession).mockResolvedValue([
+      {
+        server: {
+          mcp_server_id: 'files-server',
+          name: GATED_SERVER,
+          transport: 'stdio',
+          command: 'noop',
+          scope: 'global',
+          source: 'user',
+          enabled: true,
+          tool_permissions: { write_file: 'ask', read_file: 'allow' },
+        },
+        source: 'global',
+      },
+    ] as any);
+  });
+
+  function createDepsWithGatedServer(): QuerySetupDeps {
+    return {
+      sessionsRepo: {
+        findById: vi.fn().mockResolvedValue({
+          session_id: 'test-session' as SessionID,
+          working_directory: process.cwd(),
+          mcp_token: 'token',
+        }),
+      } as any,
+      messagesRepo: {} as any,
+      sessionMCPRepo: {} as any,
+      mcpServerRepo: {} as any,
+      permissionService: {} as any,
+      tasksService: {} as any,
+      messagesService: {} as any,
+      sessionsService: {} as any,
+      permissionLocks: new Map(),
+    };
+  }
+
+  it('hard-denies an "ask" tool when there is nowhere to ask', async () => {
+    await setupQuery('test-session' as SessionID, 'test prompt', createDepsWithGatedServer(), {
+      taskId: 'test-task' as TaskID,
+      permissionMode: 'bypassPermissions',
+    });
+
+    const options = vi.mocked(Claude.query).mock.calls[0][0].options;
+    // `disallowedTools` is mode-independent, so this holds even though bypass
+    // skips canUseTool and could skip hooks.
+    expect(options.disallowedTools).toContain(`mcp__${GATED_SERVER}__write_file`);
+    // An "allow" tool is untouched: the mode is not a blanket refusal.
+    expect(options.disallowedTools).not.toContain(`mcp__${GATED_SERVER}__read_file`);
+  });
+
+  it('leaves an "ask" tool promptable when an approval channel exists', async () => {
+    await setupQuery('test-session' as SessionID, 'test prompt', createDepsWithGatedServer(), {
+      taskId: 'test-task' as TaskID,
+      permissionMode: 'default',
+    });
+
+    const options = vi.mocked(Claude.query).mock.calls[0][0].options;
+    expect(options.disallowedTools).not.toContain(`mcp__${GATED_SERVER}__write_file`);
+    // Positive control: the server really was processed, so the absence above
+    // is the promptable path and not a fixture that produced no servers.
+    expect(Object.keys(options.mcpServers ?? {})).toContain(GATED_SERVER);
+    expect(options.canUseTool).toBeTypeOf('function');
+  });
+});
+
+/**
+ * The CLI rewrites both halves of a namespaced name into `[a-zA-Z0-9_-]`, and
+ * matches rules against the rewritten form. A rule carrying the raw tool name
+ * binds to nothing, which reads as unconfigured — allow.
+ */
+describe('setupQuery - tool names the CLI has to rewrite', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(Claude.query).mockReturnValue({
+      [Symbol.asyncIterator]: () => ({ next: () => Promise.resolve({ done: true }) }),
+      interrupt: () => Promise.resolve(),
+    } as any);
+    vi.mocked(getMcpServersForSession).mockResolvedValue([
+      {
+        server: {
+          mcp_server_id: 'gh-server',
+          name: 'My.Server',
+          transport: 'stdio',
+          command: 'noop',
+          scope: 'global',
+          source: 'user',
+          enabled: true,
+          tool_permissions: { 'repo.create': 'deny', repo_read: 'allow' },
+        },
+        source: 'global',
+      },
+    ] as any);
+  });
+
+  function deps(): QuerySetupDeps {
+    return {
+      sessionsRepo: {
+        findById: vi.fn().mockResolvedValue({
+          session_id: 'test-session' as SessionID,
+          working_directory: process.cwd(),
+          mcp_token: 'token',
+        }),
+      } as any,
+      messagesRepo: {} as any,
+      sessionMCPRepo: {} as any,
+      mcpServerRepo: {} as any,
+      permissionService: {} as any,
+      tasksService: {} as any,
+      messagesService: {} as any,
+      sessionsService: {} as any,
+      permissionLocks: new Map(),
+    };
+  }
+
+  it('denies under the rewritten tool name, not only the raw one', async () => {
+    await setupQuery('test-session' as SessionID, 'test prompt', deps(), {
+      taskId: 'test-task' as TaskID,
+      permissionMode: 'default',
+    });
+
+    const disallowed = vi.mocked(Claude.query).mock.calls[0][0].options.disallowedTools as string[];
+
+    // What the CLI actually offers the model, and therefore the only form that
+    // can bind: both halves rewritten.
+    expect(disallowed).toContain('mcp__My_Server__repo_create');
+    // The raw form stays listed too — a rule that matches nothing is inert.
+    expect(disallowed).toContain('mcp__My.Server__repo.create');
+    // An "allow" tool is not swept in by the rewrite.
+    expect(disallowed).not.toContain('mcp__My_Server__repo_read');
+  });
+});

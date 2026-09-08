@@ -1,0 +1,449 @@
+/**
+ * Env resolver scope-filtering tests.
+ *
+ * Verifies that `resolveUserEnvironment`:
+ *   - always includes `scope: 'global'` entries
+ *   - includes `scope: 'session'` entries ONLY when a matching selection row
+ *     exists in `session_env_selections` for the given sessionId
+ */
+
+import type { Session, SessionID, UserID } from '@disco/core/types';
+import { SessionStatus } from '@disco/core/types';
+import { eq } from 'drizzle-orm';
+import { afterAll, beforeAll, describe, expect } from 'vitest';
+import { select, update } from '../db/database-wrapper';
+import { encryptApiKey } from '../db/encryption';
+import { SessionEnvSelectionRepository } from '../db/repositories/session-env-selections';
+import { SessionRepository } from '../db/repositories/sessions';
+import { UsersRepository } from '../db/repositories/users';
+import { users } from '../db/schema';
+import { dbTest } from '../db/test-helpers';
+import { generateId } from '../lib/ids';
+import { createUserProcessEnvironment, resolveUserEnvironment } from './env-resolver';
+import type { StoredEnvVar } from './env-vars';
+
+// Force real AES encryption so URL-shaped tool config (e.g. ANTHROPIC_BASE_URL)
+// round-trips without tripping decryptApiKey's dev-mode `:` heuristic.
+beforeAll(() => {
+  if (!process.env.DISCO_MASTER_SECRET) {
+    process.env.DISCO_MASTER_SECRET = 'test-master-secret-env-resolver';
+  }
+});
+
+function encEntry(value: string, scope: StoredEnvVar['scope']): StoredEnvVar {
+  return {
+    value_encrypted: encryptApiKey(value),
+    scope,
+  };
+}
+
+async function createUserWithEnv(db: any, envVars: Record<string, unknown>): Promise<UserID> {
+  const usersRepo = new UsersRepository(db);
+  const user = await usersRepo.create({
+    username: `test-${Date.now()}-${Math.random()}@example.com`,
+    name: 'Test',
+  });
+  // Patch the user's JSON `data.env_vars` directly. UsersRepository has no
+  // public env_vars mutator (managed by the daemon services layer); writing
+  // the stored shape ourselves is the cleanest way to exercise the resolver.
+  const row = await select(db).from(users).where(eq(users.user_id, user.user_id)).one();
+  const currentData =
+    (row?.data as Record<string, unknown> | undefined) ?? ({} as Record<string, unknown>);
+  await update(db, users)
+    .set({ data: { ...currentData, env_vars: envVars } })
+    .where(eq(users.user_id, user.user_id))
+    .run();
+  return user.user_id as UserID;
+}
+
+async function createSessionForUser(db: any, userId: UserID): Promise<SessionID> {
+  const sessionRepo = new SessionRepository(db);
+
+  const data: Partial<Session> = {
+    session_id: generateId() as SessionID,
+    agentic_tool: 'claude-code',
+    status: SessionStatus.IDLE,
+    created_by: userId,
+    created_at: new Date().toISOString(),
+    last_updated: new Date().toISOString(),
+    tasks: [],
+    contextFiles: [],
+    genealogy: { children: [] },
+    working_directory: `/tmp/env-resolver/${userId}/${generateId()}`,
+  };
+  const session = await sessionRepo.create(data);
+  return session.session_id as SessionID;
+}
+
+describe('resolveUserEnvironment — scope filtering', () => {
+  dbTest('global-scope vars are always included', async ({ db }) => {
+    const userId = await createUserWithEnv(db, {
+      GITHUB_TOKEN: encEntry('gh-secret', 'global'),
+    });
+
+    const env = await resolveUserEnvironment(userId, db);
+    expect(env.GITHUB_TOKEN).toBe('gh-secret');
+  });
+
+  dbTest('session-scope vars are EXCLUDED when no sessionId is provided', async ({ db }) => {
+    const userId = await createUserWithEnv(db, {
+      SESSION_ONLY: encEntry('session-secret', 'session'),
+    });
+
+    const env = await resolveUserEnvironment(userId, db);
+    expect(env.SESSION_ONLY).toBeUndefined();
+  });
+
+  dbTest(
+    'session-scope vars are EXCLUDED when sessionId has no matching selection',
+    async ({ db }) => {
+      const userId = await createUserWithEnv(db, {
+        SESSION_ONLY: encEntry('session-secret', 'session'),
+      });
+      const sessionId = await createSessionForUser(db, userId);
+
+      const env = await resolveUserEnvironment(userId, db, { sessionId });
+      expect(env.SESSION_ONLY).toBeUndefined();
+    }
+  );
+
+  dbTest('session-scope vars are INCLUDED when selected for the session', async ({ db }) => {
+    const userId = await createUserWithEnv(db, {
+      SESSION_ONLY: encEntry('session-secret', 'session'),
+      OTHER_SESSION: encEntry('not-selected', 'session'),
+      GITHUB_TOKEN: encEntry('gh', 'global'),
+    });
+    const sessionId = await createSessionForUser(db, userId);
+    const selRepo = new SessionEnvSelectionRepository(db);
+    await selRepo.add(sessionId, 'SESSION_ONLY');
+
+    const env = await resolveUserEnvironment(userId, db, { sessionId });
+    expect(env.SESSION_ONLY).toBe('session-secret');
+    expect(env.OTHER_SESSION).toBeUndefined();
+    expect(env.GITHUB_TOKEN).toBe('gh'); // global still included
+  });
+
+  dbTest('selection for one session does not leak to another session', async ({ db }) => {
+    const userId = await createUserWithEnv(db, {
+      SHARED_NAME: encEntry('secret', 'session'),
+    });
+    const sessionA = await createSessionForUser(db, userId);
+    const sessionB = await createSessionForUser(db, userId);
+    const selRepo = new SessionEnvSelectionRepository(db);
+    await selRepo.add(sessionA, 'SHARED_NAME');
+
+    const envA = await resolveUserEnvironment(userId, db, { sessionId: sessionA });
+    const envB = await resolveUserEnvironment(userId, db, { sessionId: sessionB });
+    expect(envA.SHARED_NAME).toBe('secret');
+    expect(envB.SHARED_NAME).toBeUndefined();
+  });
+});
+
+// ============================================================================
+// Per-tool credential scoping (cross-SDK isolation)
+//
+// Verifies that `resolveUserEnvironment(..., { tool })` merges ONLY the
+// requested tool's credentials from `data.agentic_tools[tool]` and never
+// leaks credentials from other tools' buckets — the security regression
+// that motivated PR #1077.
+// ============================================================================
+
+describe('resolveUserEnvironment — per-tool credential scoping', () => {
+  /**
+   * Seed a user with full per-tool credential blobs across multiple tools so
+   * we can verify that selecting one tool does not surface another's keys.
+   * Mirrors the on-disk shape: `data.agentic_tools[tool][envVarName] = encrypted`.
+   */
+  async function createUserWithToolCreds(db: any): Promise<UserID> {
+    const usersRepo = new UsersRepository(db);
+    const user = await usersRepo.create({
+      username: `tool-test-${Date.now()}-${Math.random()}@example.com`,
+      name: 'Tool Test',
+    });
+    const userId = user.user_id as UserID;
+
+    await usersRepo.setToolConfigField(userId, 'claude-code', 'ANTHROPIC_API_KEY', 'anthropic-key');
+    await usersRepo.setToolConfigField(
+      userId,
+      'claude-code',
+      'ANTHROPIC_BASE_URL',
+      'https://gateway.example.com'
+    );
+    await usersRepo.setToolConfigField(userId, 'codex', 'OPENAI_API_KEY', 'openai-key');
+    await usersRepo.setToolConfigField(
+      userId,
+      'codex',
+      'OPENAI_BASE_URL',
+      'https://codex-gateway.example.com/v1'
+    );
+    await usersRepo.setToolConfigField(userId, 'gemini', 'GEMINI_API_KEY', 'gemini-key');
+    await usersRepo.setToolConfigField(userId, 'copilot', 'COPILOT_GITHUB_TOKEN', 'gh-copilot');
+    await usersRepo.setToolConfigField(userId, 'cursor', 'CURSOR_API_KEY', 'cursor-key');
+
+    return userId;
+  }
+
+  dbTest('omitting `tool` excludes ALL per-tool credentials', async ({ db }) => {
+    const userId = await createUserWithToolCreds(db);
+    const env = await resolveUserEnvironment(userId, db);
+    // Safe default: non-SDK runtimes shouldn't
+    // see any per-SDK keys.
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.ANTHROPIC_BASE_URL).toBeUndefined();
+    expect(env.OPENAI_API_KEY).toBeUndefined();
+    expect(env.GEMINI_API_KEY).toBeUndefined();
+    expect(env.COPILOT_GITHUB_TOKEN).toBeUndefined();
+    expect(env.CURSOR_API_KEY).toBeUndefined();
+  });
+
+  dbTest('tool=claude-code merges only claude-code fields', async ({ db }) => {
+    const userId = await createUserWithToolCreds(db);
+    const env = await resolveUserEnvironment(userId, db, { tool: 'claude-code' });
+    expect(env.ANTHROPIC_API_KEY).toBe('anthropic-key');
+    expect(env.ANTHROPIC_BASE_URL).toBe('https://gateway.example.com');
+    // Other tools' credentials must NOT leak.
+    expect(env.OPENAI_API_KEY).toBeUndefined();
+    expect(env.GEMINI_API_KEY).toBeUndefined();
+    expect(env.COPILOT_GITHUB_TOKEN).toBeUndefined();
+    expect(env.CURSOR_API_KEY).toBeUndefined();
+  });
+
+  dbTest('tool=codex merges OPENAI_API_KEY + OPENAI_BASE_URL only', async ({ db }) => {
+    const userId = await createUserWithToolCreds(db);
+    const env = await resolveUserEnvironment(userId, db, { tool: 'codex' });
+    expect(env.OPENAI_API_KEY).toBe('openai-key');
+    // Per-user custom OpenAI-compatible endpoint (vLLM, Ollama, internal gateway, etc.)
+    // must propagate so the executor's Codex SDK picks it up.
+    expect(env.OPENAI_BASE_URL).toBe('https://codex-gateway.example.com/v1');
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.ANTHROPIC_BASE_URL).toBeUndefined();
+    expect(env.GEMINI_API_KEY).toBeUndefined();
+    expect(env.COPILOT_GITHUB_TOKEN).toBeUndefined();
+    expect(env.CURSOR_API_KEY).toBeUndefined();
+  });
+
+  dbTest('tool=gemini merges only GEMINI_API_KEY', async ({ db }) => {
+    const userId = await createUserWithToolCreds(db);
+    const env = await resolveUserEnvironment(userId, db, { tool: 'gemini' });
+    expect(env.GEMINI_API_KEY).toBe('gemini-key');
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.OPENAI_API_KEY).toBeUndefined();
+    expect(env.CURSOR_API_KEY).toBeUndefined();
+  });
+
+  dbTest('tool=copilot merges only COPILOT_GITHUB_TOKEN', async ({ db }) => {
+    const userId = await createUserWithToolCreds(db);
+    const env = await resolveUserEnvironment(userId, db, { tool: 'copilot' });
+    expect(env.COPILOT_GITHUB_TOKEN).toBe('gh-copilot');
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.OPENAI_API_KEY).toBeUndefined();
+    expect(env.GEMINI_API_KEY).toBeUndefined();
+    expect(env.CURSOR_API_KEY).toBeUndefined();
+  });
+
+  dbTest('tool=cursor merges only CURSOR_API_KEY', async ({ db }) => {
+    const userId = await createUserWithToolCreds(db);
+    const env = await resolveUserEnvironment(userId, db, { tool: 'cursor' });
+    expect(env.CURSOR_API_KEY).toBe('cursor-key');
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.OPENAI_API_KEY).toBeUndefined();
+    expect(env.GEMINI_API_KEY).toBeUndefined();
+    expect(env.COPILOT_GITHUB_TOKEN).toBeUndefined();
+  });
+
+  dbTest('tool credentials override same-named global env vars', async ({ db }) => {
+    // Seed env_vars with a global ANTHROPIC_API_KEY, then set a different
+    // value via the agentic_tools bucket. The tool-scoped value should win
+    // because per-SDK config is the explicit "use this for this tool" surface.
+    const usersRepo = new UsersRepository(db);
+    const user = await usersRepo.create({
+      username: `precedence-${Date.now()}-${Math.random()}@example.com`,
+      name: 'Precedence',
+    });
+    const userId = user.user_id as UserID;
+
+    const row = await select(db).from(users).where(eq(users.user_id, userId)).one();
+    const currentData = (row?.data as Record<string, unknown>) ?? {};
+    await update(db, users)
+      .set({
+        data: {
+          ...currentData,
+          env_vars: {
+            ANTHROPIC_API_KEY: encEntry('global-fallback', 'global'),
+          },
+        },
+      })
+      .where(eq(users.user_id, userId))
+      .run();
+
+    await usersRepo.setToolConfigField(userId, 'claude-code', 'ANTHROPIC_API_KEY', 'tool-specific');
+
+    const envWithTool = await resolveUserEnvironment(userId, db, { tool: 'claude-code' });
+    expect(envWithTool.ANTHROPIC_API_KEY).toBe('tool-specific');
+
+    // Without `tool`, the global env var still wins (no tool merge happens).
+    const envNoTool = await resolveUserEnvironment(userId, db);
+    expect(envNoTool.ANTHROPIC_API_KEY).toBe('global-fallback');
+  });
+});
+
+// ============================================================================
+// Git identity mirroring
+//
+// When a user sets GIT_AUTHOR_NAME/USERNAME but not GIT_COMMITTER_NAME/USERNAME,
+// createUserProcessEnvironment should mirror author → committer so that git
+// commits don't split author (user) from committer (system git config owner).
+// ============================================================================
+
+describe('createUserProcessEnvironment — git identity mirroring', () => {
+  // Ensure GIT_COMMITTER_* are absent from the test process environment so
+  // buildAllowlistedEnv() doesn't pre-populate them and mask the mirroring.
+  const savedCommitterName = process.env.GIT_COMMITTER_NAME;
+  const savedCommitterEmail = process.env.GIT_COMMITTER_EMAIL;
+  const savedAuthorName = process.env.GIT_AUTHOR_NAME;
+  const savedAuthorEmail = process.env.GIT_AUTHOR_EMAIL;
+
+  beforeAll(() => {
+    delete process.env.GIT_COMMITTER_NAME;
+    delete process.env.GIT_COMMITTER_EMAIL;
+    delete process.env.GIT_AUTHOR_NAME;
+    delete process.env.GIT_AUTHOR_EMAIL;
+  });
+
+  afterAll(() => {
+    if (savedCommitterName !== undefined) process.env.GIT_COMMITTER_NAME = savedCommitterName;
+    if (savedCommitterEmail !== undefined) process.env.GIT_COMMITTER_EMAIL = savedCommitterEmail;
+    if (savedAuthorName !== undefined) process.env.GIT_AUTHOR_NAME = savedAuthorName;
+    if (savedAuthorEmail !== undefined) process.env.GIT_AUTHOR_EMAIL = savedAuthorEmail;
+  });
+
+  dbTest('mirrors author → committer when only author vars are set', async ({ db }) => {
+    const userId = await createUserWithEnv(db, {
+      GIT_AUTHOR_NAME: encEntry('Alice Dev', 'global'),
+      GIT_AUTHOR_EMAIL: encEntry('alice@example.com', 'global'),
+    });
+
+    const env = await createUserProcessEnvironment(userId, db);
+    expect(env.GIT_AUTHOR_NAME).toBe('Alice Dev');
+    expect(env.GIT_AUTHOR_EMAIL).toBe('alice@example.com');
+    expect(env.GIT_COMMITTER_NAME).toBe('Alice Dev');
+    expect(env.GIT_COMMITTER_EMAIL).toBe('alice@example.com');
+  });
+
+  dbTest('does not override explicitly set committer vars', async ({ db }) => {
+    const userId = await createUserWithEnv(db, {
+      GIT_AUTHOR_NAME: encEntry('Alice Dev', 'global'),
+      GIT_AUTHOR_EMAIL: encEntry('alice@example.com', 'global'),
+      GIT_COMMITTER_NAME: encEntry('Alice Bot', 'global'),
+      GIT_COMMITTER_EMAIL: encEntry('alice-bot@example.com', 'global'),
+    });
+
+    const env = await createUserProcessEnvironment(userId, db);
+    expect(env.GIT_COMMITTER_NAME).toBe('Alice Bot');
+    expect(env.GIT_COMMITTER_EMAIL).toBe('alice-bot@example.com');
+  });
+
+  dbTest('mirrors independently — name without username and vice versa', async ({ db }) => {
+    const userId = await createUserWithEnv(db, {
+      GIT_AUTHOR_NAME: encEntry('Alice Dev', 'global'),
+      GIT_AUTHOR_EMAIL: encEntry('alice@example.com', 'global'),
+      GIT_COMMITTER_EMAIL: encEntry('alice-committer@example.com', 'global'),
+      // GIT_COMMITTER_NAME intentionally absent
+    });
+
+    const env = await createUserProcessEnvironment(userId, db);
+    expect(env.GIT_COMMITTER_NAME).toBe('Alice Dev'); // mirrored
+    expect(env.GIT_COMMITTER_EMAIL).toBe('alice-committer@example.com'); // unchanged
+  });
+
+  dbTest('no-op when neither author nor committer vars are set', async ({ db }) => {
+    const userId = await createUserWithEnv(db, {
+      GITHUB_TOKEN: encEntry('gh-secret', 'global'),
+    });
+
+    const env = await createUserProcessEnvironment(userId, db);
+    expect(env.GIT_AUTHOR_NAME).toBeUndefined();
+    expect(env.GIT_COMMITTER_NAME).toBeUndefined();
+  });
+
+  dbTest('mirrors committer → author when only committer vars are set', async ({ db }) => {
+    const userId = await createUserWithEnv(db, {
+      GIT_COMMITTER_NAME: encEntry('Bob Ops', 'global'),
+      GIT_COMMITTER_EMAIL: encEntry('bob@example.com', 'global'),
+    });
+
+    const env = await createUserProcessEnvironment(userId, db);
+    expect(env.GIT_COMMITTER_NAME).toBe('Bob Ops');
+    expect(env.GIT_COMMITTER_EMAIL).toBe('bob@example.com');
+    expect(env.GIT_AUTHOR_NAME).toBe('Bob Ops');
+    expect(env.GIT_AUTHOR_EMAIL).toBe('bob@example.com');
+  });
+
+  dbTest('cross-mirrors author name and committer username independently', async ({ db }) => {
+    const userId = await createUserWithEnv(db, {
+      GIT_AUTHOR_NAME: encEntry('Carol Dev', 'global'),
+      GIT_COMMITTER_EMAIL: encEntry('carol@example.com', 'global'),
+      // GIT_AUTHOR_EMAIL and GIT_COMMITTER_NAME intentionally absent
+    });
+
+    const env = await createUserProcessEnvironment(userId, db);
+    expect(env.GIT_AUTHOR_NAME).toBe('Carol Dev');
+    expect(env.GIT_COMMITTER_NAME).toBe('Carol Dev'); // mirrored from author
+    expect(env.GIT_COMMITTER_EMAIL).toBe('carol@example.com');
+    expect(env.GIT_AUTHOR_EMAIL).toBe('carol@example.com'); // mirrored from committer
+  });
+});
+
+// Session executors are spawned with `preparedEnv` built by
+// createUserProcessEnvironment(), which takes precedence over spawn-executor's
+// own env forwarding. If the managed agentic tool vars are not allowlisted here
+// the executor runs with DISCO_MANAGED_AGENTIC_TOOLS unset, falls back to
+// importing the vendor SDK by bare specifier, and every session dies with
+// "Cannot find package '@openai/codex-sdk'".
+describe('createUserProcessEnvironment — managed agentic tool runtime', () => {
+  const MANAGED_VARS = {
+    DISCO_VERSION: '0.24.0',
+    DISCO_AGENTIC_TOOLS_DIR: '/opt/disco/agentic-tools',
+    DISCO_MANAGED_AGENTIC_TOOLS: '1',
+    DISCO_HOST_CODEX_HOME: 'C:/Users/disco-test/.codex',
+    CODEX_HOME: 'E:/Disco/data/codex',
+  } as const;
+  const saved: Record<string, string | undefined> = {};
+
+  beforeAll(() => {
+    for (const [key, value] of Object.entries(MANAGED_VARS)) {
+      saved[key] = process.env[key];
+      process.env[key] = value;
+    }
+  });
+
+  afterAll(() => {
+    for (const key of Object.keys(MANAGED_VARS)) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  });
+
+  dbTest('passes the managed integration runtime through to the executor', async ({ db }) => {
+    const userId = await createUserWithEnv(db, {});
+
+    const env = await createUserProcessEnvironment(userId, db);
+
+    expect(env.DISCO_MANAGED_AGENTIC_TOOLS).toBe('1');
+    expect(env.DISCO_VERSION).toBe('0.24.0');
+    expect(env.DISCO_AGENTIC_TOOLS_DIR).toBe('/opt/disco/agentic-tools');
+    expect(env.DISCO_HOST_CODEX_HOME).toBe('C:/Users/disco-test/.codex');
+    expect(env.CODEX_HOME).toBe('E:/Disco/data/codex');
+  });
+
+  dbTest('still withholds internal secrets', async ({ db }) => {
+    process.env.DISCO_MASTER_SECRET = 'super-secret';
+    try {
+      const userId = await createUserWithEnv(db, {});
+      const env = await createUserProcessEnvironment(userId, db);
+      expect(env.DISCO_MASTER_SECRET).toBeUndefined();
+    } finally {
+      delete process.env.DISCO_MASTER_SECRET;
+    }
+  });
+});

@@ -1,0 +1,458 @@
+#!/bin/bash
+
+# Build and release-artifact script for disco-live + aligned npm packages
+#
+# Usage:
+#   ./build.sh                    # Build only
+#   ./build.sh --bump patch       # Bump version and build release tarballs
+#   ./build.sh --bump minor       # Bump to next minor version
+#   ./build.sh --version 0.25.0-rc.1 # Set an explicit aligned release candidate
+#   ./build.sh --skip-install     # Skip pnpm install step
+#   ./build.sh --with-sandpack    # Include self-hosted Sandpack bundler in build
+
+set -e  # Exit on error
+
+# Raise Node's heap ceiling so DTS generation in @disco/core (~3 GB peak) and
+# vite/next bundle steps don't OOM on low-RAM hosts. User-set NODE_OPTIONS
+# wins because Node honors the last `--max-old-space-size` it sees.
+export NODE_OPTIONS="--max-old-space-size=4096 ${NODE_OPTIONS:-}"
+
+# ── Parse flags ──────────────────────────────────────────────────────────────
+
+SKIP_INSTALL=false
+WITH_SANDPACK=false
+BUMP=""
+TARGET_VERSION=""
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --bump)
+      [[ $# -ge 2 ]] || { echo "--bump requires patch, minor, or major"; exit 1; }
+      BUMP="$2"; shift 2 ;;
+    --version)
+      [[ $# -ge 2 ]] || { echo "--version requires an exact SemVer version"; exit 1; }
+      TARGET_VERSION="$2"; shift 2 ;;
+    --skip-install) SKIP_INSTALL=true; shift ;;
+    --with-sandpack) WITH_SANDPACK=true; shift ;;
+    *) echo "Unknown option: $1"; exit 1 ;;
+  esac
+done
+
+if [[ -n "$BUMP" && "$BUMP" != "patch" && "$BUMP" != "minor" && "$BUMP" != "major" ]]; then
+  echo "Invalid bump type: $BUMP (must be patch, minor, or major)"
+  exit 1
+fi
+if [[ -n "$BUMP" && -n "$TARGET_VERSION" ]]; then
+  echo "Use either --bump or --version, not both"
+  exit 1
+fi
+if [[ -n "$TARGET_VERSION" ]] && ! [[ "$TARGET_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+  echo "Invalid version: $TARGET_VERSION (must be an exact SemVer version)"
+  exit 1
+fi
+
+# ── Setup paths ──────────────────────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+CLIENT_DIR="$REPO_ROOT/packages/client"
+CLI_DIR="$REPO_ROOT/apps/disco-cli"
+INTERNAL_STAGE="$SCRIPT_DIR/.internal.stage"
+RELEASE_DIR="$SCRIPT_DIR/release"
+INTEGRATION_IDS=(claude codex copilot gemini opencode cursor)
+INTEGRATION_DIRS=()
+for id in "${INTEGRATION_IDS[@]}"; do
+  INTEGRATION_DIRS+=("$REPO_ROOT/packages/disco-$id")
+done
+
+echo "🏗️  Building disco-live + @disco-live/client"
+echo ""
+echo "📍 Repository root: $REPO_ROOT"
+echo "📦 disco-live:       $SCRIPT_DIR"
+echo "📦 @disco-live/client: $CLIENT_DIR"
+echo "📦 @disco/cli:         $CLI_DIR"
+echo "🧩 Agentic tools:   ${INTEGRATION_IDS[*]}"
+echo ""
+
+# ── Version bump ─────────────────────────────────────────────────────────────
+
+CURRENT_VERSION=$(node -p "require('$SCRIPT_DIR/package.json').version")
+if [[ -n "$BUMP" ]]; then
+  IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+
+  case $BUMP in
+    patch) PATCH=$((PATCH + 1)) ;;
+    minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+    major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+  esac
+
+  NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+  echo "📌 Version bump: $CURRENT_VERSION → $NEW_VERSION ($BUMP)"
+elif [[ -n "$TARGET_VERSION" ]]; then
+  NEW_VERSION="$TARGET_VERSION"
+  echo "📌 Version set: $CURRENT_VERSION → $NEW_VERSION"
+else
+  NEW_VERSION="$CURRENT_VERSION"
+fi
+
+if [[ -n "$BUMP" || -n "$TARGET_VERSION" ]]; then
+  # Update the base, CLI, client, and every version-aligned integration package.
+  node - "$NEW_VERSION" "$SCRIPT_DIR" "$CLI_DIR" "$CLIENT_DIR" "${INTEGRATION_DIRS[@]}" <<'NODE'
+const fs = require('fs');
+const [version, base, cli, client, ...integrations] = process.argv.slice(2);
+for (const directory of [base, cli, client, ...integrations]) {
+  const packagePath = `${directory}/package.json`;
+  const pkg = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+  pkg.version = version;
+  fs.writeFileSync(packagePath, JSON.stringify(pkg, null, 2) + '\n');
+}
+for (const directory of integrations) {
+  const sourcePath = `${directory}/src/index.ts`;
+  const source = fs.readFileSync(sourcePath, 'utf8').replace(
+    /DISCO_INTEGRATION_VERSION = '[^']+'/,
+    `DISCO_INTEGRATION_VERSION = '${version}'`
+  );
+  fs.writeFileSync(sourcePath, source);
+}
+NODE
+  echo "  ✓ Updated disco-live/package.json"
+  echo "  ✓ Updated @disco/cli/package.json"
+  echo "  ✓ Updated @disco-live/client/package.json"
+  echo "  ✓ Updated version-aligned agentic tool packages"
+  echo ""
+else
+  # Sync CLI/client versions to match disco-live (no bump, just align)
+  CLI_VERSION=$(node -p "require('$CLI_DIR/package.json').version")
+  if [[ "$CLI_VERSION" != "$NEW_VERSION" ]]; then
+    node -e "
+      const fs = require('fs');
+      const pkg = JSON.parse(fs.readFileSync('$CLI_DIR/package.json', 'utf8'));
+      pkg.version = '$NEW_VERSION';
+      fs.writeFileSync('$CLI_DIR/package.json', JSON.stringify(pkg, null, 2) + '\n');
+    "
+    echo "📌 Synced @disco/cli version: $CLI_VERSION → $NEW_VERSION"
+    echo ""
+  fi
+  CLIENT_VERSION=$(node -p "require('$CLIENT_DIR/package.json').version")
+  if [[ "$CLIENT_VERSION" != "$NEW_VERSION" ]]; then
+    node -e "
+      const fs = require('fs');
+      const pkg = JSON.parse(fs.readFileSync('$CLIENT_DIR/package.json', 'utf8'));
+      pkg.version = '$NEW_VERSION';
+      fs.writeFileSync('$CLIENT_DIR/package.json', JSON.stringify(pkg, null, 2) + '\n');
+    "
+    echo "📌 Synced @disco-live/client version: $CLIENT_VERSION → $NEW_VERSION"
+    echo ""
+  fi
+fi
+
+echo "📦 Version: $NEW_VERSION"
+echo ""
+
+cd "$REPO_ROOT"
+pnpm check:agentic-tool-packages
+echo ""
+
+# ── Install dependencies ─────────────────────────────────────────────────────
+
+if [[ "$SKIP_INSTALL" == false ]]; then
+  echo "📥 Installing dependencies..."
+  cd "$REPO_ROOT"
+  pnpm install
+  echo ""
+fi
+
+# ── Verify dependency alignment ─────────────────────────────────────────────
+
+echo "🔍 Verifying disco-live dependency alignment..."
+cd "$REPO_ROOT"
+pnpm check:disco-live-deps
+echo ""
+
+# ── Clean previous builds ────────────────────────────────────────────────────
+
+echo "🧹 Cleaning previous builds..."
+# Build into a staging directory, then swap atomically at the end.
+# This keeps the existing dist/ available while rebuilding, so a running
+# daemon/executor isn't knocked offline during the build window.
+DIST_STAGE="$SCRIPT_DIR/dist.stage"
+rm -rf "$DIST_STAGE"
+rm -rf "$INTERNAL_STAGE"
+rm -rf "$CLIENT_DIR/dist"
+mkdir -p "$DIST_STAGE"
+mkdir -p "$INTERNAL_STAGE"
+
+# ── Build all components ─────────────────────────────────────────────────────
+#
+# Use turbo to build everything in workspace-dependency order. turbo.json
+# declares `"dependsOn": ["^build"]`, so e.g. @disco/cli (which imports types
+# from @disco/daemon) waits for daemon's dist/index.d.ts before its own DTS
+# step runs. Hand-ordering this sequence is fragile — every time someone
+# adds a new cross-package import the wrong order silently passes locally
+# (because of stale dist/) and explodes on a clean CI checkout.
+#
+# Excludes @disco/docs (Nextra docs site, not part of the published artifact).
+# NODE_ENV=production matters for the UI's vite build; harmless for the rest.
+
+echo ""
+echo "📦 Building all workspace packages (turbo, dep-ordered)..."
+cd "$REPO_ROOT"
+NODE_ENV=production pnpm exec turbo run build --filter='!@disco/docs'
+
+echo ""
+echo "🔍 Verifying @disco-live/client pack..."
+cd "$CLIENT_DIR"
+pnpm check:pack
+
+# ── Build self-hosted Sandpack bundler (optional) ────────────────────────────
+
+if [[ "$WITH_SANDPACK" == true ]]; then
+  echo ""
+  echo "🧩 Building self-hosted Sandpack bundler..."
+  # IMPORTANT: Clone OUTSIDE the monorepo. sandpack-bundler uses yarn, but yarn
+  # walks up from CWD looking for package.json and will find the monorepo root's
+  # "packageManager": "pnpm@..." field and refuse to run. Keeping it outside the
+  # repo avoids the collision entirely.
+  SANDPACK_DIR="${DISCO_SANDPACK_DIR:-$HOME/.cache/disco/sandpack-bundler}"
+  if [[ ! -d "$SANDPACK_DIR" ]]; then
+    echo "  → Cloning sandpack-bundler to $SANDPACK_DIR..."
+    mkdir -p "$(dirname "$SANDPACK_DIR")"
+    git clone --depth 1 https://github.com/codesandbox/sandpack-bundler.git "$SANDPACK_DIR"
+  fi
+  cd "$SANDPACK_DIR"
+  echo "  → Installing dependencies..."
+  yarn install --frozen-lockfile 2>/dev/null || yarn install
+  echo "  → Patching build script for relative asset paths..."
+  # sandpack-bundler's build script chains `parcel build ... && cp ...`, so we
+  # can't override via `yarn build` args (they'd land on cp). Patch the script
+  # in package.json to force `--public-url ./`, which makes Parcel emit relative
+  # asset paths that work when served from /static/sandpack/ (Parcel's default
+  # is `/`, which bakes absolute paths into index.html and breaks subpath mounts).
+  node -e "
+    const fs = require('fs');
+    const path = 'package.json';
+    const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+    if (pkg.scripts && pkg.scripts.build) {
+      const before = pkg.scripts.build;
+      let after;
+      if (/--public-url\s+\S+/.test(before)) {
+        // Replace existing flag value
+        after = before.replace(/--public-url\s+\S+/g, '--public-url ./');
+      } else {
+        // Insert flag right after 'parcel build <entry>'
+        after = before.replace(
+          /(parcel\s+build\s+\S+)/,
+          '\$1 --public-url ./'
+        );
+      }
+      if (after !== before) {
+        pkg.scripts.build = after;
+        fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+        console.log('    patched: ' + after);
+      } else {
+        console.log('    WARNING: could not find parcel build command to patch');
+      }
+    }
+  "
+  echo "  → Building..."
+  yarn build
+  echo "  ✓ Sandpack bundler built"
+fi
+
+# ── Copy artifacts to disco-live ──────────────────────────────────────────────
+
+echo ""
+echo "📋 Copying build artifacts to disco-live..."
+
+echo "  → Copying git..."
+mkdir -p "$INTERNAL_STAGE/git"
+cp -r "$REPO_ROOT/packages/git/dist/"* "$INTERNAL_STAGE/git/"
+
+echo "  → Creating package.json for bundled @disco/git..."
+jq '
+  def strip_dist: gsub("\\./dist/"; "./");
+  {
+    name: "@disco/git",
+    version: "0.1.0",
+    type: "module",
+    main: "./index.js",
+    types: "./index.d.ts",
+    exports: (.exports | walk(if type == "string" then strip_dist else . end))
+  }
+' "$REPO_ROOT/packages/git/package.json" > "$INTERNAL_STAGE/git/package.json"
+
+echo "  → Copying core..."
+mkdir -p "$INTERNAL_STAGE/core"
+cp -r "$REPO_ROOT/packages/core/dist/"* "$INTERNAL_STAGE/core/"
+
+echo "  → Creating package.json for bundled @disco/core..."
+jq '
+  def strip_dist: gsub("\\./dist/"; "./");
+  {
+    name: "@disco/core",
+    version: "0.1.0",
+    type: "module",
+    main: "./index.js",
+    types: "./index.d.ts",
+    exports: (.exports | walk(if type == "string" then strip_dist else . end))
+  }
+' "$REPO_ROOT/packages/core/package.json" > "$INTERNAL_STAGE/core/package.json"
+
+echo "  → Copying OpenCode agentic-tool package..."
+mkdir -p "$INTERNAL_STAGE/agentic-tool-opencode"
+cp -r "$REPO_ROOT/packages/agentic-tool-opencode/dist/"* "$INTERNAL_STAGE/agentic-tool-opencode/"
+
+echo "  → Creating package.json for bundled @disco/agentic-tool-opencode..."
+jq '
+  def strip_dist: gsub("\\./dist/"; "./");
+  {
+    name: "@disco/agentic-tool-opencode",
+    version: "0.1.0",
+    type: "module",
+    main: "./shared/index.js",
+    types: "./shared/index.d.ts",
+    exports: (.exports | walk(if type == "string" then strip_dist else . end))
+  }
+' "$REPO_ROOT/packages/agentic-tool-opencode/package.json" > "$INTERNAL_STAGE/agentic-tool-opencode/package.json"
+
+echo "  → Copying agentic-tool registry package..."
+mkdir -p "$INTERNAL_STAGE/agentic-tools"
+cp -r "$REPO_ROOT/packages/agentic-tools/dist/"* "$INTERNAL_STAGE/agentic-tools/"
+
+echo "  → Creating package.json for bundled @disco/agentic-tools..."
+jq '
+  def strip_dist: gsub("\\./dist/"; "./");
+  {
+    name: "@disco/agentic-tools",
+    version: "0.1.0",
+    type: "module",
+    main: "./index.js",
+    types: "./index.d.ts",
+    exports: (.exports | walk(if type == "string" then strip_dist else . end))
+  }
+' "$REPO_ROOT/packages/agentic-tools/package.json" > "$INTERNAL_STAGE/agentic-tools/package.json"
+
+node "$SCRIPT_DIR/scripts/validate-internal-package-contract.mjs" "$INTERNAL_STAGE"
+
+echo "  → Copying CLI..."
+mkdir -p "$DIST_STAGE/cli"
+cp -r "$REPO_ROOT/apps/disco-cli/dist/"* "$DIST_STAGE/cli/"
+
+echo "  → Copying daemon..."
+mkdir -p "$DIST_STAGE/daemon"
+# .build-info (sha + builtAt) is stamped into apps/disco-daemon/dist by the
+# daemon's own build script (apps/disco-daemon/scripts/stamp-build-info.mjs).
+# loadBuildInfo() reads it at boot.
+#
+# Copy from `dist/.` rather than `dist/*`: the glob does NOT match dotfiles, so
+# `dist/*` silently dropped .build-info and every published build reported
+# buildSha "dev" instead of the commit it was built from.
+cp -r "$REPO_ROOT/apps/disco-daemon/dist/." "$DIST_STAGE/daemon/"
+
+echo "  → Copying executor..."
+mkdir -p "$DIST_STAGE/executor"
+cp -r "$REPO_ROOT/packages/executor/dist/"* "$DIST_STAGE/executor/"
+
+echo "  → Copying UI..."
+mkdir -p "$DIST_STAGE/ui"
+cp -r "$REPO_ROOT/apps/disco-ui/dist/"* "$DIST_STAGE/ui/"
+
+# Build outputs are copied wholesale above, but declaration source maps, compiled
+# tests, incremental compiler state, and editor backups are not runtime assets.
+# Keep them out of both the application dist tree and the materialized internal
+# packages so switching from postinstall-created links to npm's standard bundled
+# dependencies does not add unnecessary files to the global install.
+echo "  → Removing non-runtime build artifacts..."
+find "$DIST_STAGE" "$INTERNAL_STAGE" -type f \
+  \( -name '*.map' -o -name '*.test.js' -o -name '*.test.cjs' -o -name '*.test.d.ts' \
+     -o -name '*.tsbuildinfo' -o -name '*.backup' \) -delete
+find "$DIST_STAGE" "$INTERNAL_STAGE" -type d -name test -prune -exec rm -rf {} +
+
+if [[ "$WITH_SANDPACK" == true ]]; then
+  # sandpack-bundler outputs to www/ or dist/ depending on version
+  SANDPACK_OUT=""
+  if [[ -d "$SANDPACK_DIR/www" ]]; then SANDPACK_OUT="$SANDPACK_DIR/www"; fi
+  if [[ -d "$SANDPACK_DIR/dist" ]]; then SANDPACK_OUT="$SANDPACK_DIR/dist"; fi
+  if [[ -n "$SANDPACK_OUT" ]]; then
+    echo "  → Copying Sandpack bundler..."
+    mkdir -p "$DIST_STAGE/static/sandpack"
+    cp -r "$SANDPACK_OUT/"* "$DIST_STAGE/static/sandpack/"
+  else
+    echo "  ⚠️  Sandpack bundler build output not found, skipping"
+  fi
+fi
+
+# ── Atomic swap: stage → dist ───────────────────────────────────────────────
+# Swap the old dist with the new one in two fast renames. The running daemon
+# only loses its backing files for the instant between mv commands (~ms).
+
+echo ""
+echo "🔄 Swapping dist (atomic-ish)..."
+rm -rf "$SCRIPT_DIR/dist.old"
+if [[ -d "$SCRIPT_DIR/dist" ]]; then
+  mv "$SCRIPT_DIR/dist" "$SCRIPT_DIR/dist.old"
+fi
+if ! mv "$DIST_STAGE" "$SCRIPT_DIR/dist"; then
+  echo "  ✗ Failed to move dist.stage into place"
+  if [[ -d "$SCRIPT_DIR/dist.old" ]]; then
+    echo "  ↺ Restoring previous dist..."
+    mv "$SCRIPT_DIR/dist.old" "$SCRIPT_DIR/dist" || true
+  fi
+  exit 1
+fi
+rm -rf "$SCRIPT_DIR/dist.old"
+
+# ── Package sizes ────────────────────────────────────────────────────────────
+
+echo ""
+echo "📊 Package sizes:"
+du -sh "$SCRIPT_DIR/dist" | awk '{print "  disco-live total: " $1}'
+du -sh "$INTERNAL_STAGE/core" | awk '{print "    Core:     " $1}'
+du -sh "$INTERNAL_STAGE/git" | awk '{print "    Git:      " $1}'
+du -sh "$SCRIPT_DIR/dist/cli" | awk '{print "    CLI:      " $1}'
+du -sh "$SCRIPT_DIR/dist/daemon" | awk '{print "    Daemon:   " $1}'
+du -sh "$SCRIPT_DIR/dist/executor" | awk '{print "    Executor: " $1}'
+du -sh "$SCRIPT_DIR/dist/ui" | awk '{print "    UI:       " $1}'
+if [[ -d "$SCRIPT_DIR/dist/static/sandpack" ]]; then
+  du -sh "$SCRIPT_DIR/dist/static/sandpack" | awk '{print "    Sandpack: " $1}'
+fi
+du -sh "$CLIENT_DIR/dist" | awk '{print "  @disco-live/client: " $1}'
+
+echo ""
+echo "📦 Packing immutable release artifacts..."
+rm -rf "$RELEASE_DIR"
+mkdir -p "$RELEASE_DIR"
+for directory in "${INTEGRATION_DIRS[@]}" "$CLIENT_DIR"; do
+  npm pack --ignore-scripts --pack-destination "$RELEASE_DIR" "$directory" >/dev/null
+done
+CLIENT_TARBALL="$RELEASE_DIR/disco-live-client-$NEW_VERSION.tgz"
+if [[ ! -f "$CLIENT_TARBALL" ]]; then
+  echo "  ✗ @disco-live/client pack did not produce the expected tarball: $CLIENT_TARBALL"
+  exit 1
+fi
+LIVE_TARBALL=$(node "$SCRIPT_DIR/scripts/pack-release.mjs" \
+  --destination "$RELEASE_DIR" --internal-root "$INTERNAL_STAGE")
+if [[ -z "$LIVE_TARBALL" || ! -f "$LIVE_TARBALL" ]]; then
+  echo "  ✗ disco-live pack did not produce the expected tarball: ${LIVE_TARBALL:-<no path returned>}"
+  exit 1
+fi
+echo "  ✓ $(basename "$LIVE_TARBALL")"
+rm -rf "$INTERNAL_STAGE"
+
+echo ""
+echo "🔍 Checking package-content budget..."
+node "$SCRIPT_DIR/scripts/check-package-content.mjs" "$LIVE_TARBALL"
+
+echo ""
+echo "✅ Build complete!"
+
+echo ""
+echo "📦 Package structure:"
+tree -L 2 -d "$SCRIPT_DIR/dist" 2>/dev/null || find "$SCRIPT_DIR/dist" -type d -maxdepth 2 | sed 's|^|  |'
+
+echo ""
+echo "🚀 Next steps:"
+echo "  Review artifacts in $RELEASE_DIR"
+printf "  Install this exact build: sudo npm install -g %q %q\n" "$CLIENT_TARBALL" "$LIVE_TARBALL"
+echo "  Then run the deployment's operator-controlled stop → migrate → start sequence"
+echo "  Merge the version-bump PR, then push v$NEW_VERSION to run the protected release workflow"

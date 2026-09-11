@@ -22,6 +22,17 @@ export function getAuthHeaders(): HeadersInit {
  * older sessions that have not migrated to the access/refresh token pair yet.
  */
 export function getCurrentUserIdFromJwt(): string | null {
+  const payload = getCurrentJwtClaims();
+  return typeof payload?.sub === 'string' ? payload.sub : null;
+}
+
+/** Stable tenant identity for account-scoped browser caches. */
+export function getCurrentTenantIdFromJwt(): string | null {
+  const payload = getCurrentJwtClaims();
+  return typeof payload?.tenant_id === 'string' ? payload.tenant_id : null;
+}
+
+function getCurrentJwtClaims(): Record<string, unknown> | null {
   const token = getDiscoAccessToken();
   if (!token) return null;
   try {
@@ -30,7 +41,7 @@ export function getCurrentUserIdFromJwt(): string | null {
     let b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
     while (b64.length % 4 !== 0) b64 += '=';
     const payload = JSON.parse(atob(b64));
-    return typeof payload.sub === 'string' ? payload.sub : null;
+    return payload && typeof payload === 'object' ? payload : null;
   } catch {
     return null;
   }

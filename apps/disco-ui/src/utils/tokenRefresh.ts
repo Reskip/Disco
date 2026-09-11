@@ -10,6 +10,7 @@ import type { DiscoClient, User } from '@disco-live/client';
 export const ACCESS_TOKEN_KEY = 'disco-access-token';
 export const REFRESH_TOKEN_KEY = 'disco-refresh-token';
 export const FEATHERS_ACCESS_TOKEN_KEY = 'feathers-jwt';
+export const TOKENS_CHANGED_EVENT = 'disco:tokens-changed';
 
 export interface RefreshResult {
   accessToken: string;
@@ -52,6 +53,7 @@ export function storeTokens(accessToken: string, refreshToken?: string): void {
   if (refreshToken) {
     localStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
   }
+  window.dispatchEvent(new Event(TOKENS_CHANGED_EVENT));
 }
 
 /**
@@ -82,6 +84,7 @@ export function clearTokens(): void {
   // Leaving it behind makes a logout/login cycle capable of reviving a stale
   // JWT on the next client instance, especially after a mobile BFCache restore.
   localStorage.removeItem(FEATHERS_ACCESS_TOKEN_KEY);
+  window.dispatchEvent(new Event(TOKENS_CHANGED_EVENT));
 }
 
 /**

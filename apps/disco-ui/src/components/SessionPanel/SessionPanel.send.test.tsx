@@ -1,12 +1,13 @@
 import type { DiscoClient, Session } from '@disco-live/client';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { App } from 'antd';
 import type React from 'react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AppActionsProvider } from '../../contexts/AppActionsContext';
 import { ConnectionProvider } from '../../contexts/ConnectionContext';
 import { discoStore } from '../../store/discoStore';
 import type { UploadFilesToSessionResult } from '../FileUpload/upload';
+import { clearComposerAttachmentDrafts } from './composerAttachmentStore';
 import SessionPanel from './SessionPanel';
 
 const uploadMockState = vi.hoisted(() => ({
@@ -130,7 +131,9 @@ function renderSessionPanel({
 }
 
 describe('SessionPanel composer send', () => {
+  afterEach(() => act(() => clearComposerAttachmentDrafts()));
   beforeEach(() => {
+    clearComposerAttachmentDrafts();
     discoStore.getState().reset();
     uploadMockState.uploadFilesToSession.mockReset();
     reactiveMockState.state = { tasks: [], messagesByTask: new Map() };
@@ -235,7 +238,7 @@ describe('SessionPanel composer send', () => {
     expect(textarea).toHaveValue('This belongs to the next message');
   });
 
-  it('cancels an old preupload without mixing the newly selected session composer', async () => {
+  it('keeps an old preupload and restores its attachment without mixing the new composer', async () => {
     const upload = deferred<UploadFilesToSessionResult>();
     uploadMockState.uploadFilesToSession.mockReturnValue(upload.promise);
     const onSendPrompt = vi.fn();
@@ -261,6 +264,7 @@ describe('SessionPanel composer send', () => {
     );
 
     rerenderSession(makeSession({ session_id: 'session-2' }));
+    expect(uploadMockState.uploadFilesToSession.mock.calls[0][0].signal.aborted).toBe(false);
     await waitFor(() => expect(textarea).toHaveValue(''));
     fireEvent.change(textarea, { target: { value: 'New session prompt must stay local' } });
 
@@ -279,6 +283,13 @@ describe('SessionPanel composer send', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(onSendPrompt).not.toHaveBeenCalled();
     expect(textarea).toHaveValue('New session prompt must stay local');
+    expect(screen.queryByLabelText('预览 old-session-chart.png')).not.toBeInTheDocument();
+    rerenderSession(makeSession());
+    await waitFor(() =>
+      expect(screen.getByLabelText('预览 old-session-chart.png')).toBeInTheDocument()
+    );
+    expect(textarea).toHaveValue('Old session prompt snapshot');
+    expect(uploadMockState.uploadFilesToSession).toHaveBeenCalledTimes(1);
   });
 
   it('shows an immediate local message and waits for upload before starting the agent', async () => {
@@ -338,6 +349,109 @@ describe('SessionPanel composer send', () => {
     );
     await waitFor(() => expect(textarea).toHaveValue(''));
     expect(screen.queryByLabelText('预览 rapid-chart.png')).not.toBeInTheDocument();
+  });
+
+  it('finishes sends in their original conversations without clearing another pending send', async () => {
+    const first = deferred<UploadFilesToSessionResult>();
+    const second = deferred<UploadFilesToSessionResult>();
+    uploadMockState.uploadFilesToSession
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    const onSendPrompt = vi.fn().mockResolvedValue(true);
+    const { container, rerenderSession } = renderSessionPanel({ onSendPrompt });
+    const startSend = (name: string, text: string) => {
+      fireEvent.drop(screen.getByLabelText('当前对话文件拖放区域'), {
+        dataTransfer: { types: ['Files'], files: [new File(['x'], name)] },
+      });
+      fireEvent.change(screen.getByPlaceholderText(/随心输入/i), { target: { value: text } });
+      fireEvent.click(container.querySelector('button.ant-btn-primary') as HTMLButtonElement);
+    };
+    const uploaded = (filename: string): UploadFilesToSessionResult => ({
+      success: true,
+      files: [
+        {
+          filename,
+          ref: `upl_${filename}`,
+          size: 1,
+          mimeType: 'text/plain',
+          createdAt: new Date().toISOString(),
+          expiresAt: null,
+        },
+      ],
+    });
+    startSend('first.txt', '原会话的请求');
+    fireEvent.change(screen.getByPlaceholderText(/随心输入/i), {
+      target: { value: '原会话的新草稿' },
+    });
+    rerenderSession(makeSession({ session_id: 'session-2' }));
+    startSend('second.txt', '新会话的请求');
+    expect(screen.getByTestId('pending-composer-submission')).toHaveTextContent('新会话的请求');
+    await act(async () => first.resolve(uploaded('first.txt')));
+    expect(onSendPrompt).toHaveBeenCalledTimes(1);
+    expect(onSendPrompt.mock.calls[0][0]).toBe('session-1');
+    expect(onSendPrompt.mock.calls[0][1]).toContain('原会话的请求');
+    expect(screen.getByTestId('pending-composer-submission')).toHaveTextContent('新会话的请求');
+    await act(async () => second.resolve(uploaded('second.txt')));
+    expect(onSendPrompt).toHaveBeenCalledTimes(2);
+    expect(onSendPrompt.mock.calls[1][0]).toBe('session-2');
+    rerenderSession(makeSession());
+    expect(screen.queryByLabelText('预览 first.txt')).not.toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/随心输入/i)).toHaveValue('原会话的新草稿');
+  });
+
+  it('continues a send after unmount and prevents a duplicate send after remount', async () => {
+    const upload = deferred<UploadFilesToSessionResult>();
+    uploadMockState.uploadFilesToSession.mockReturnValue(upload.promise);
+    const onSendPrompt = vi.fn().mockResolvedValue(true);
+    const first = renderSessionPanel({ onSendPrompt });
+    fireEvent.drop(screen.getByLabelText('当前对话文件拖放区域'), {
+      dataTransfer: { types: ['Files'], files: [new File(['x'], 'background.txt')] },
+    });
+    fireEvent.change(screen.getByPlaceholderText(/随心输入/i), { target: { value: '后台发送' } });
+    fireEvent.click(first.container.querySelector('button.ant-btn-primary') as HTMLButtonElement);
+    first.unmount();
+    const second = renderSessionPanel({ onSendPrompt });
+    fireEvent.change(screen.getByPlaceholderText(/随心输入/i), { target: { value: '保留新草稿' } });
+    fireEvent.click(second.container.querySelector('button.ant-btn-primary') as HTMLButtonElement);
+    expect(onSendPrompt).not.toHaveBeenCalled();
+    await act(async () =>
+      upload.resolve({
+        success: true,
+        files: [
+          {
+            filename: 'background.txt',
+            ref: 'upl_background',
+            size: 1,
+            mimeType: 'text/plain',
+            createdAt: new Date().toISOString(),
+            expiresAt: null,
+          },
+        ],
+      })
+    );
+    expect(onSendPrompt).toHaveBeenCalledTimes(1);
+    expect(onSendPrompt.mock.calls[0][1]).toContain('后台发送');
+    expect(onSendPrompt.mock.calls[0][1]).not.toContain('保留新草稿');
+    expect(screen.queryByLabelText('预览 background.txt')).not.toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/随心输入/i)).toHaveValue('保留新草稿');
+  });
+
+  it('keeps the new conversation draft when switching during prompt admission', async () => {
+    const admission = deferred<boolean>();
+    const onSendPrompt = vi.fn().mockReturnValue(admission.promise);
+    const { container, rerenderSession } = renderSessionPanel({ onSendPrompt });
+    fireEvent.change(screen.getByPlaceholderText(/随心输入/i), { target: { value: '旧请求' } });
+    fireEvent.click(container.querySelector('button.ant-btn-primary') as HTMLButtonElement);
+    await waitFor(() => expect(onSendPrompt).toHaveBeenCalledTimes(1));
+    rerenderSession(makeSession({ session_id: 'session-2' }));
+    fireEvent.change(screen.getByPlaceholderText(/随心输入/i), { target: { value: '保留新会话' } });
+    fireEvent.drop(screen.getByLabelText('当前对话文件拖放区域'), {
+      dataTransfer: { types: ['Files'], files: [new File(['x'], 'keep.txt')] },
+    });
+    await waitFor(() => expect(screen.getByLabelText('预览 keep.txt')).toBeInTheDocument());
+    await act(async () => admission.resolve(true));
+    expect(screen.getByPlaceholderText(/随心输入/i)).toHaveValue('保留新会话');
+    expect(screen.getByLabelText('预览 keep.txt')).toBeInTheDocument();
   });
 
   it('removes the optimistic attachment state as soon as the admitted task is visible', async () => {

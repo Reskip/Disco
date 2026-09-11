@@ -472,14 +472,22 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
     uploading: composerAttachmentUploading,
     uploadProgress: composerAttachmentUploadProgress,
     uploadingRef: composerAttachmentUploadingRef,
+    sendingRef: composerSendInFlightRef,
     validationError: composerAttachmentValidationError,
     setValidationError: setComposerAttachmentValidationError,
   } = useComposerAttachments({
     sessionId: session?.session_id ?? null,
+    userId: currentUserId,
     showError,
     uploadPolicy,
   });
-  const composerSendInFlightRef = React.useRef(false);
+  const composerMountedRef = React.useRef(true);
+  React.useEffect(() => {
+    composerMountedRef.current = true;
+    return () => {
+      composerMountedRef.current = false;
+    };
+  }, []);
 
   React.useEffect(() => {
     setPendingComposerSend((pending) =>
@@ -838,11 +846,18 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
     }
 
     composerSendInFlightRef.current = true;
+    const sendStartSessionId = session.session_id;
+    const sendStartComposerIdentity = composerSessionIdentityRef.current;
+    const clearPendingSend = () =>
+      setPendingComposerSend((pending) =>
+        pending?.sessionId === sendStartSessionId &&
+        pending.generation === sendStartComposerIdentity.generation
+          ? null
+          : pending
+      );
     let sendValueForRecovery = '';
     let sendSessionForRecovery: SessionID | null = null;
     try {
-      const sendStartSessionId = session.session_id;
-      const sendStartComposerIdentity = composerSessionIdentityRef.current;
       const value = promptRef.current?.getValue() ?? '';
       sendValueForRecovery = value;
       sendSessionForRecovery = sendStartSessionId;
@@ -884,7 +899,8 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
         sendStartSessionId
       );
       const promptAttachments = uploadedFiles;
-      const composerStillOwnsSend =
+      const composerStillOwnsSend = () =>
+        composerMountedRef.current &&
         composerSessionIdentityRef.current.sessionId === sendStartSessionId &&
         composerSessionIdentityRef.current.generation === sendStartComposerIdentity.generation;
       // Sending while an upload is active freezes the visible message at click
@@ -901,18 +917,22 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
         ? await onSendPrompt?.(sendStartSessionId, promptToSend, permissionMode, { steer: true })
         : await onSendPrompt?.(sendStartSessionId, promptToSend, permissionMode);
       if (sendResult === false) {
-        setPendingComposerSend(null);
-        if (composerStillOwnsSend && value.trim() && !promptRef.current?.getValue().trim()) {
+        clearPendingSend();
+        if (composerStillOwnsSend() && value.trim() && !promptRef.current?.getValue().trim()) {
           promptRef.current?.insertText(value);
+        } else if (!composerStillOwnsSend() && value.trim() && !getDraft(sendStartSessionId)) {
+          saveDraft(sendStartSessionId, value);
         }
         return;
       }
 
-      if (composerStillOwnsSend) {
+      // The upload/send callbacks belong to the original draft. Remove only
+      // the submitted files, including when its view is no longer mounted.
+      clearComposerAttachments(attachmentsAtSendStart.map((attachment) => attachment.id));
+      setComposerAttachmentValidationError(null);
+      if (composerStillOwnsSend()) {
         if (!hasAttachments) promptRef.current?.clear();
-        clearComposerAttachments();
-        setComposerAttachmentValidationError(null);
-      } else {
+      } else if (!hasAttachments && getDraft(sendStartSessionId) === value) {
         // The old composer is no longer live; clear only its saved draft so the
         // successfully sent snapshot does not reappear when the user returns.
         // Never call promptRef.current?.clear() here because it now belongs to
@@ -923,7 +943,7 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
       // Re-engage the bottom lock so a scrolled-up user follows their just-sent
       // message and the streaming reply (behavior 3). `scrollToBottom` is the
       // function ConversationView exposed via onScrollRef.
-      if (composerStillOwnsSend) scrollToBottom?.();
+      if (composerStillOwnsSend()) scrollToBottom?.();
       if (sendResult && typeof sendResult === 'object') {
         const admittedTaskId =
           'message' in sendResult ? sendResult.message.task_id : sendResult.taskId;
@@ -939,22 +959,30 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
                 admittedMessageId,
                 admittedAt: Date.now(),
               }
-            : null
+            : pending
         );
       } else {
         // Compatibility for embedding callers that still return a boolean.
-        setPendingComposerSend(null);
+        clearPendingSend();
       }
     } catch (error) {
       console.error('Composer send failed — keeping prompt and files in composer:', error);
-      setPendingComposerSend(null);
+      clearPendingSend();
       const pendingBelongsToCurrentComposer =
+        composerMountedRef.current &&
         composerSessionIdentityRef.current.sessionId === sendSessionForRecovery;
       if (
         pendingBelongsToCurrentComposer &&
         (promptRef.current?.getValue() ?? '').trim().length === 0
       ) {
         if (sendValueForRecovery.trim()) promptRef.current?.insertText(sendValueForRecovery);
+      } else if (
+        !pendingBelongsToCurrentComposer &&
+        sendSessionForRecovery &&
+        sendValueForRecovery.trim() &&
+        !getDraft(sendSessionForRecovery)
+      ) {
+        saveDraft(sendSessionForRecovery, sendValueForRecovery);
       }
       showError(error instanceof Error ? error.message : '消息发送失败');
     } finally {

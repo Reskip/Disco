@@ -2,7 +2,6 @@ import { MessageOutlined, PlusOutlined, RobotOutlined } from '@ant-design/icons'
 import { Button, Layout, Typography, theme } from 'antd';
 import { memo, useState } from 'react';
 import { useLocale } from '../../contexts/LocaleContext';
-import { useDiscoStore } from '../../store/discoStore';
 import { FilingNotice } from '../FilingNotice/FilingNotice';
 import { WorkspaceTeammateCreateModal } from '../WorkspaceShell/WorkspaceTeammateCreateModal';
 import { HomeTokenUsageCard } from './HomeTokenUsageCard';
@@ -15,11 +14,9 @@ export const HomePage = memo(function HomePage(props: HomePageProps) {
   const { token } = theme.useToken();
   const { t } = useLocale();
   const [agentCreateOpen, setAgentCreateOpen] = useState(false);
-  const currentUserName = useDiscoStore((state) =>
-    props.currentUserId ? state.userById.get(props.currentUserId)?.name : undefined
-  );
-  const name = currentUserName || t('user');
-  const [greeting, subtitle] = useDailyHomeGreeting(props.currentUserId, name);
+  // Share the sidebar's resolved identity, available before directory hydration.
+  const name = props.currentUser?.name || props.currentUser?.username || t('user');
+  const [greeting, subtitle] = useDailyHomeGreeting(props.currentUser?.user_id, name);
   const workspaceReady = props.connected;
 
   return (
@@ -112,7 +109,7 @@ export const HomePage = memo(function HomePage(props: HomePageProps) {
             <HomeTokenUsageCard
               client={props.client}
               connected={props.connected}
-              currentUserId={props.currentUserId}
+              currentUserId={props.currentUser?.user_id}
             />
 
             <div

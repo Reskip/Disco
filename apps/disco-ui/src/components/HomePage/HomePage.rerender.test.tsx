@@ -43,7 +43,7 @@ const noop = () => {};
 const STABLE_HOME_PROPS = {
   client: null,
   connected: true,
-  currentUserId: 'u1',
+  currentUser: user,
   onSessionClick: noop,
   onNewSession: noop,
   onOpenSettings: noop,
@@ -92,7 +92,7 @@ describe('HomePage store-selector re-render isolation', () => {
     expect(homeRenders).toBe(baseline);
   });
 
-  it('a current-user patch re-renders HomePage', async () => {
+  it('user-directory hydration does not re-render the authenticated home greeting', async () => {
     renderHome();
     await waitFor(() => expect(homeRenders).toBeGreaterThanOrEqual(1));
     const baseline = homeRenders;
@@ -101,7 +101,7 @@ describe('HomePage store-selector re-render isolation', () => {
       discoStore.setState({ userById: new Map([[user.user_id, user]]) });
     });
 
-    await waitFor(() => expect(homeRenders).toBeGreaterThan(baseline));
+    expect(homeRenders).toBe(baseline);
   });
 });
 

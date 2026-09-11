@@ -718,7 +718,7 @@ export const App: React.FC<AppProps> = ({
             <HomePage
               client={client}
               connected={connected}
-              currentUserId={user?.user_id}
+              currentUser={user}
               availableAgents={availableAgents}
               creating={creatingConversation}
               onSessionClick={handleSessionClick}

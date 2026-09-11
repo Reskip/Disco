@@ -21,7 +21,6 @@ describe('HomePage mobile simplification', () => {
           <HomePage
             client={null}
             connected
-            currentUserId="user-1"
             mobileMinimal
             onSessionClick={() => {}}
             onNewSession={onNewSession}

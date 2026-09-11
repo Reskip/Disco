@@ -7,6 +7,7 @@ import { FilingNotice } from '../FilingNotice/FilingNotice';
 import { WorkspaceTeammateCreateModal } from '../WorkspaceShell/WorkspaceTeammateCreateModal';
 import { HomeTokenUsageCard } from './HomeTokenUsageCard';
 import type { HomePageProps } from './types';
+import { useDailyHomeGreeting } from './useDailyHomeGreeting';
 
 const { Content } = Layout;
 
@@ -18,6 +19,7 @@ export const HomePage = memo(function HomePage(props: HomePageProps) {
     props.currentUserId ? state.userById.get(props.currentUserId)?.name : undefined
   );
   const name = currentUserName || t('user');
+  const [greeting, subtitle] = useDailyHomeGreeting(props.currentUserId, name);
   const workspaceReady = props.connected;
 
   return (
@@ -59,13 +61,13 @@ export const HomePage = memo(function HomePage(props: HomePageProps) {
                     fontWeight: 650,
                   }}
                 >
-                  {t('greeting', { name })}
+                  {greeting}
                 </Typography.Title>
                 <Typography.Text
                   type="secondary"
                   style={{ display: 'block', marginTop: 4, fontSize: 'clamp(13px, 1vw, 15px)' }}
                 >
-                  从左侧选择智能体或最近对话，也可以直接开始一个独立对话。
+                  {subtitle}
                 </Typography.Text>
               </div>
               <div

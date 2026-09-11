@@ -21,18 +21,19 @@ vi.mock('@disco-live/client', () => ({
   shortId: () => 'short-id',
 }));
 
-// use-stick-to-bottom owns the actual scroll physics (persistent
-// ResizeObserver, spring animation). jsdom has no real layout, so we don't
-// unit-test the library here — instead we mock it and assert OUR integration
-// wiring: onScrollRef exposes the hook's scrollToBottom + a working
-// scrollToTop, the open/session-switch effect calls scrollToBottom, and the
-// new-task expand logic honors the hook's SYNCHRONOUS live `state`
-// (`state.escapedFromLock`), not the lagging returned `isAtBottom`.
+// jsdom has no layout or paint cycle. Mock the library's live lock state to
+// test our pre-paint positioning, resize integration, public scroll controls,
+// and expand policy independently of its requestAnimationFrame scheduling.
 //
 // `mockState` is a mutable object mirroring the library's live `state`: the
 // real hook mutates `state.escapedFromLock`/`state.isAtBottom` synchronously,
 // so tests flip these fields to drive the expand logic deterministically.
-let mockState: { escapedFromLock: boolean; isAtBottom: boolean };
+let mockState: {
+  escapedFromLock: boolean;
+  isAtBottom: boolean;
+  scrollTop: number;
+  calculatedTargetScrollTop: number;
+};
 const mockScrollToBottom = vi.fn();
 const mockStopScroll = vi.fn();
 type CallbackRef = ((el: HTMLElement | null) => void) & { current: HTMLElement | null };
@@ -47,6 +48,9 @@ function makeCallbackRef(): CallbackRef {
 
 let mockScrollRef: CallbackRef;
 let mockContentRef: CallbackRef;
+let resizeCallbacks: Array<() => void>;
+let transcriptHeight: number;
+let viewportHeight: number;
 
 vi.mock('use-stick-to-bottom', () => ({
   useStickToBottom: () => ({
@@ -128,15 +132,41 @@ function makeState(overrides: Record<string, unknown>): any {
 
 describe('ConversationView auto-scroll integration', () => {
   beforeEach(() => {
-    mockState = { escapedFromLock: false, isAtBottom: true };
+    transcriptHeight = 1600;
+    viewportHeight = 600;
+    mockState = {
+      escapedFromLock: false,
+      isAtBottom: true,
+      get scrollTop() {
+        return mockScrollRef.current?.scrollTop ?? 0;
+      },
+      set scrollTop(value) {
+        if (mockScrollRef.current) mockScrollRef.current.scrollTop = value;
+      },
+      get calculatedTargetScrollTop() {
+        return transcriptHeight - viewportHeight - 1;
+      },
+    };
     mockScrollToBottom.mockClear();
     mockStopScroll.mockClear();
     mockScrollRef = makeCallbackRef();
     mockContentRef = makeCallbackRef();
+    resizeCallbacks = [];
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        constructor(callback: () => void) {
+          resizeCallbacks.push(callback);
+        }
+        observe() {}
+        disconnect() {}
+      }
+    );
   });
 
   afterEach(() => {
     mockUseSharedReactiveSession.mockReset();
+    vi.unstubAllGlobals();
   });
 
   it('exposes a working scrollToBottom and scrollToTop via onScrollRef', () => {
@@ -274,6 +304,45 @@ describe('ConversationView auto-scroll integration', () => {
 
     expect(mockState.escapedFromLock).toBe(false);
     expect(mockScrollToBottom).toHaveBeenCalledTimes(1);
+  });
+
+  it('positions the loaded transcript before the first animation frame', () => {
+    const state = makeState({ tasks: [makeTask('task-1', 'latest')] });
+    mockUseSharedReactiveSession.mockImplementation(() => ({ handle: null, state }));
+    render(<ConversationView client={null} sessionId={'session-1' as any} />);
+    expect(screen.getByTestId('conversation-scroll-container').scrollTop).toBe(999);
+  });
+
+  it('corrects late content and viewport resizes before the observer callback returns', () => {
+    const state = makeState({ tasks: [makeTask('task-1', 'latest')] });
+    mockUseSharedReactiveSession.mockImplementation(() => ({ handle: null, state }));
+    render(<ConversationView client={null} sessionId={'session-1' as any} />);
+    const scroller = screen.getByTestId('conversation-scroll-container');
+    transcriptHeight += 360;
+    act(() => {
+      for (const callback of resizeCallbacks) callback();
+    });
+    expect(scroller.scrollTop).toBe(1359);
+    viewportHeight -= 80;
+    act(() => {
+      for (const callback of resizeCallbacks) callback();
+    });
+    expect(scroller.scrollTop).toBe(1439);
+  });
+
+  it('leaves a manually scrolled transcript in place through late content growth', () => {
+    const state = makeState({ tasks: [makeTask('task-1', 'latest')] });
+    mockUseSharedReactiveSession.mockImplementation(() => ({ handle: null, state }));
+    render(<ConversationView client={null} sessionId={'session-1' as any} />);
+    const scroller = screen.getByTestId('conversation-scroll-container');
+    scroller.scrollTop = 250;
+    mockState.escapedFromLock = true;
+    mockState.isAtBottom = false;
+    transcriptHeight += 360;
+    act(() => {
+      for (const callback of resizeCallbacks) callback();
+    });
+    expect(scroller.scrollTop).toBe(250);
   });
 
   it('collapses older tasks and focuses the new one when the user is at bottom', () => {

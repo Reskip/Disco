@@ -160,13 +160,9 @@ export const ConversationView = React.memo<ConversationViewProps>(
     pendingComposerSubmission = null,
     onTaskPlanChange,
   }) => {
-    // use-stick-to-bottom owns the entire auto-scroll lifecycle. It keeps a
-    // PERSISTENT ResizeObserver on the content element, so any late content
-    // growth (images, lazy markdown/code, fonts, async tool output) keeps the
-    // viewport pinned while the user is at bottom — and stops the moment the
-    // user scrolls up. `scrollRef` goes on the scroll container, `contentRef`
-    // on the inner content wrapper. `initial`/`resize: 'instant'` avoids
-    // smooth-scroll animation jank on first paint and on layout growth.
+    // The library owns the bottom lock and user escape detection. Even its
+    // "instant" scroll waits for requestAnimationFrame, so layout corrections
+    // also need to use that same state synchronously before the browser paints.
     const { scrollRef, contentRef, scrollToBottom, stopScroll, state } = useStickToBottom({
       initial: 'instant',
       resize: 'instant',
@@ -183,6 +179,7 @@ export const ConversationView = React.memo<ConversationViewProps>(
       // Clearing the escape on an explicit go-to-bottom intent lets the pin
       // survive until the round-tripped/streamed content actually arrives.
       state.escapedFromLock = false;
+      state.scrollTop = Math.max(0, state.calculatedTargetScrollTop);
       scrollToBottom({ animation: 'instant' });
     }, [state, scrollToBottom]);
 
@@ -245,6 +242,26 @@ export const ConversationView = React.memo<ConversationViewProps>(
     const error = currentReactiveState?.error || null;
     const isTerminalError = !!currentReactiveState?.terminal;
     const [isReloading, setIsReloading] = useState(false);
+
+    const pinBeforePaint = useCallback(() => {
+      if (!isActive || !state.isAtBottom || state.escapedFromLock) return;
+      const target = Math.max(0, state.calculatedTargetScrollTop);
+      if (state.scrollTop !== target) state.scrollTop = target;
+    }, [isActive, state]);
+
+    // React commits and late child layout (markdown, images, fonts) can both
+    // change height. Correct in ResizeObserver, before paint. Do not pin on
+    // every render: the library renders once before its scroll-up handler
+    // releases the lock, and pinning then would undo the user's wheel input.
+    useLayoutEffect(() => {
+      const scroll = scrollRef.current;
+      const content = contentRef.current;
+      if (error || !isActive || !scroll || !content) return;
+      const observer = new ResizeObserver(pinBeforePaint);
+      observer.observe(content);
+      observer.observe(scroll);
+      return () => observer.disconnect();
+    }, [contentRef, error, isActive, pinBeforePaint, scrollRef]);
 
     const streamingMessagesByTask = useStreamingMessagesByTask(allStreamingMessages);
 
@@ -353,9 +370,8 @@ export const ConversationView = React.memo<ConversationViewProps>(
       [reactiveSession]
     );
 
-    // Streaming auto-scroll, manual scroll-away detection, and lazy-content
-    // re-pinning are all handled by use-stick-to-bottom's persistent
-    // ResizeObserver — no manual scroll listeners or streaming effect needed.
+    // All scroll writes share the library's live lock state, including the
+    // pre-paint correction. A user who scrolls up remains free to read history.
 
     if (error) {
       // Deterministic escape hatch when auto-recovery (socket-reconnect resync,

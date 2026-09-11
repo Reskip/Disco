@@ -1,121 +1,115 @@
-import type { Board, Session } from '@disco-live/client';
+import type { Session } from '@disco-live/client';
 import { describe, expect, it } from 'vitest';
-import { buildById, buildSessionMaps, reconcileByIdMap } from './discoMaps';
+import {
+  buildById,
+  buildSessionMaps,
+  reconcileByIdMap,
+  reconcileSessionSnapshot,
+} from './discoMaps';
 
-// These guard the "reference-stable rebuild" contract: a wholesale rebuild of
-// already-loaded data (the background "load whole store" hydration, reconnect
-// resync) must reuse prior references so it doesn't re-render the whole board.
-// See the home→board load regression investigation.
-
-const makeSession = (id: string, branchId: string, status = 'running'): Session =>
+const makeSession = (id: string, status: Session['status'] = 'running'): Session =>
   ({
     session_id: id,
-    branch_id: branchId,
     status,
     archived: false,
-    created_at: '2026-06-24T00:00:00.000Z',
-    last_updated: '2026-06-24T00:00:00.000Z',
-  }) as unknown as Session;
+    created_at: '2026-09-11T00:00:00.000Z',
+    last_updated: '2026-09-11T00:00:00.000Z',
+  }) as Session;
 
-const makeBoard = (id: string, name = 'Board'): Board =>
-  ({ board_id: id, name, slug: id, archived: false }) as unknown as Board;
+const makeRecord = (id: string, name = 'Original') => ({ id, name });
 
 describe('reconcileByIdMap', () => {
   it('returns the prior map when nothing changed', () => {
-    const prev = buildById([makeBoard('a'), makeBoard('b')], 'board_id');
-    const next = new Map(prev); // same refs, different map object
-    expect(reconcileByIdMap(prev, next)).toBe(prev);
+    const previous = buildById([makeRecord('a'), makeRecord('b')], 'id');
+    expect(reconcileByIdMap(previous, new Map(previous))).toBe(previous);
   });
 
-  it('reuses prior refs for value-equal rows and only the map identity changes', () => {
-    const a = makeBoard('a');
-    const b = makeBoard('b');
-    const prev = buildById([a, b], 'board_id');
-
-    // Fresh objects with identical values (mirrors a wholesale refetch).
+  it('retains unchanged rows when another row changes', () => {
+    const a = makeRecord('a');
+    const b = makeRecord('b');
+    const previous = buildById([a, b], 'id');
     const next = new Map([
-      ['a', makeBoard('a')],
-      ['b', makeBoard('b', 'B renamed')],
+      ['a', makeRecord('a')],
+      ['b', makeRecord('b', 'Renamed')],
     ]);
-    const result = reconcileByIdMap(prev, next);
-
-    expect(result).not.toBe(prev); // b changed → new map
-    expect(result.get('a')).toBe(a); // unchanged row keeps its ref
-    expect(result.get('b')).not.toBe(b); // changed row is the new ref
-    expect(result.get('b')?.name).toBe('B renamed');
+    const result = reconcileByIdMap(previous, next);
+    expect(result).not.toBe(previous);
+    expect(result.get('a')).toBe(a);
+    expect(result.get('b')).not.toBe(b);
+    expect(result.get('b')?.name).toBe('Renamed');
   });
 
-  it('treats added/removed keys as a change', () => {
-    const prev = buildById([makeBoard('a')], 'board_id');
-    const next = new Map([
-      ['a', makeBoard('a')],
-      ['c', makeBoard('c')],
-    ]);
-    expect(reconcileByIdMap(prev, next)).not.toBe(prev);
+  it('treats added and removed keys as changes', () => {
+    const previous = buildById([makeRecord('a')], 'id');
+    expect(reconcileByIdMap(previous, new Map())).not.toBe(previous);
+    expect(reconcileByIdMap(previous, new Map([...previous, ['c', makeRecord('c')]]))).not.toBe(
+      previous
+    );
   });
 });
 
 describe('buildSessionMaps reference stability', () => {
-  it('rebuilding identical data against prev returns the prior maps', () => {
-    const sessions = [makeSession('s1', 'A'), makeSession('s2', 'B')];
-    const prev = buildSessionMaps(sessions);
-
-    // Fresh session objects, identical values — the wholesale-hydration case.
-    const rebuilt = buildSessionMaps([makeSession('s1', 'A'), makeSession('s2', 'B')], prev);
-
-    expect(rebuilt.sessionById).toBe(prev.sessionById);
-    expect(rebuilt.sessionsByBranch).toBe(prev.sessionsByBranch);
+  it('reuses the session map after an identical refetch', () => {
+    const previous = buildSessionMaps([makeSession('s1'), makeSession('s2')]);
+    const rebuilt = buildSessionMaps([makeSession('s1'), makeSession('s2')], previous);
+    expect(rebuilt.sessionById).toBe(previous.sessionById);
   });
 
-  it('only the changed branch bucket gets a new array; others are preserved', () => {
-    const prev = buildSessionMaps([makeSession('s1', 'A'), makeSession('s2', 'B')]);
-    const bucketABefore = prev.sessionsByBranch.get('A');
-    const bucketBBefore = prev.sessionsByBranch.get('B');
-
-    // s2 (branch B) changes status; branch A untouched.
-    const rebuilt = buildSessionMaps(
-      [makeSession('s1', 'A'), makeSession('s2', 'B', 'completed')],
-      prev
-    );
-
-    expect(rebuilt.sessionsByBranch).not.toBe(prev.sessionsByBranch); // B changed
-    expect(rebuilt.sessionsByBranch.get('A')).toBe(bucketABefore); // A bucket ref preserved
-    expect(rebuilt.sessionsByBranch.get('B')).not.toBe(bucketBBefore); // B bucket rebuilt
-    expect(rebuilt.sessionById.get('s1')).toBe(prev.sessionById.get('s1')); // unchanged session ref kept
+  it('updates a changed session while preserving other row references', () => {
+    const previous = buildSessionMaps([makeSession('s1'), makeSession('s2')]);
+    const rebuilt = buildSessionMaps([makeSession('s1'), makeSession('s2', 'idle')], previous);
+    expect(rebuilt.sessionById).not.toBe(previous.sessionById);
+    expect(rebuilt.sessionById.get('s1')).toBe(previous.sessionById.get('s1'));
+    expect(rebuilt.sessionById.get('s2')?.status).toBe('idle');
   });
 
-  it('behaves like a plain build when no prev is supplied', () => {
-    const built = buildSessionMaps([makeSession('s1', 'A')]);
-    expect(built.sessionById.get('s1')?.session_id).toBe('s1');
-    expect(built.sessionsByBranch.get('A')).toHaveLength(1);
+  it('builds the current flat conversation index without a previous snapshot', () => {
+    const session = makeSession('s1');
+    const built = buildSessionMaps([session]);
+    expect(built.sessionById.get('s1')).toBe(session);
+    expect(built.sessionById.size).toBe(1);
+  });
+});
+
+describe('reconcileSessionSnapshot', () => {
+  it('keeps a completion received after the request began', () => {
+    const running = makeSession('s1');
+    const completed = { ...running, status: 'idle' as const, ready_for_prompt: true };
+    const baseline = new Map([['s1', running]]);
+    const current = new Map([['s1', completed]]);
+    const result = reconcileSessionSnapshot([running], current, baseline, true);
+    expect(result).toBe(current);
+    expect(result.get('s1')).toBe(completed);
   });
 
-  it('preserves remote surrogate rows when rebuilding against prev', () => {
-    const source = {
-      ...makeSession('source', 'A'),
-      remote_relationships: {
-        as_source: [
-          {
-            relationship_type: 'remote_create',
-            source_session_id: 'source',
-            target_session_id: 'target',
-          },
-        ],
-      },
-    } as unknown as Session;
-    const target = makeSession('target', 'B');
-    const prev = buildSessionMaps([source, target]);
+  it('does not overwrite a newer run with an older completion response', () => {
+    const completed = makeSession('s1', 'idle');
+    const running = makeSession('s1');
+    const baseline = new Map([['s1', completed]]);
+    const current = new Map([['s1', running]]);
+    expect(reconcileSessionSnapshot([completed], current, baseline).get('s1')).toBe(running);
+  });
 
-    const rebuilt = buildSessionMaps([{ ...source }, { ...target }], prev);
-    const sourceBucket = rebuilt.sessionsByBranch.get('A') ?? [];
-    const surrogate = sourceBucket.find(
-      (session) => session.session_id === 'target' && session.remote_surrogate
-    );
+  it('retains unrelated sessions during a partial status refresh', () => {
+    const current = new Map([
+      ['s1', makeSession('s1')],
+      ['s2', makeSession('s2')],
+    ]);
+    const result = reconcileSessionSnapshot([makeSession('s1', 'idle')], current, current);
+    expect(result.get('s1')?.status).toBe('idle');
+    expect(result.get('s2')).toBe(current.get('s2'));
+  });
 
-    expect(surrogate).toBeDefined();
-    expect(surrogate?.branch_id).toBe('A');
-    expect(surrogate?.genealogy?.parent_session_id).toBe('source');
-    expect(surrogate?.remote_surrogate?.source_session_id).toBe('source');
-    expect(surrogate?.remote_surrogate?.target_branch_id).toBe('B');
+  it('evicts unchanged rows absent from an authoritative workspace snapshot', () => {
+    const current = new Map([['old', makeSession('old')]]);
+    const result = reconcileSessionSnapshot([makeSession('current')], current, current, true);
+    expect(result.has('old')).toBe(false);
+    expect(result.has('current')).toBe(true);
+  });
+
+  it('does not resurrect a session removed while a snapshot was in flight', () => {
+    const removed = makeSession('removed');
+    const baseline = new Map([['removed', removed]]);
+    expect(reconcileSessionSnapshot([removed], new Map(), baseline, true).size).toBe(0);
   });
 });

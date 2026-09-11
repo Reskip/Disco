@@ -76,6 +76,24 @@ export function buildSessionMaps(
   return { sessionById: buildById(sessions, 'session_id', previous?.sessionById) };
 }
 
+/** Merge a server snapshot without undoing mutations observed after its request began. */
+export function reconcileSessionSnapshot(
+  sessions: readonly Session[],
+  current: Map<string, Session>,
+  atRequestStart: Map<string, Session>,
+  replaceMissing = false
+): Map<string, Session> {
+  const next = replaceMissing ? new Map<string, Session>() : new Map(current);
+  for (const session of sessions) next.set(session.session_id, session);
+  for (const [id, session] of current) {
+    if (session !== atRequestStart.get(id)) next.set(id, session);
+  }
+  for (const id of atRequestStart.keys()) {
+    if (!current.has(id)) next.delete(id);
+  }
+  return reconcileByIdMap(current, next);
+}
+
 export function buildSessionMcpMap(
   relationships: readonly { session_id: string; mcp_server_id: string }[]
 ): Map<string, string[]> {

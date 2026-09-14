@@ -16,6 +16,8 @@ import type {
   CreateAgenticToolPreset,
   CreateSessionInput,
   DiscoSkillInstallInput,
+  ExecutorTranscriptRequest,
+  ExecutorTranscriptResponse,
   Group,
   GroupMembership,
   LeaderboardEntry,
@@ -444,6 +446,9 @@ export interface DiscoClient extends Omit<Application<ServiceTypes>, 'service'> 
   service(path: 'sessions'): SessionsService;
   service(path: 'tasks'): TasksService;
   service(path: 'messages'): MessagesService;
+  service(
+    path: 'executor-transcripts'
+  ): Pick<DiscoService<ExecutorTranscriptResponse, ExecutorTranscriptRequest>, 'create'>;
   service(path: 'schedules'): SchedulesService;
   service(path: 'agentic-tool-settings'): AgenticToolSettingsService;
   service(path: 'agentic-tool-presets'): AgenticToolPresetsService;

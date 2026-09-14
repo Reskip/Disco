@@ -111,6 +111,7 @@ import { createConfigService } from './services/config.js';
 import { createCopilotModelsService } from './services/copilot-models.js';
 import { createCursorModelsService } from './services/cursor-models.js';
 import { prepareSessionForExecutorStart } from './services/executor-startup.js';
+import { ExecutorTranscriptsService } from './services/executor-transcripts.js';
 import { createFilesService } from './services/files.js';
 import { createLeaderboardService } from './services/leaderboard.js';
 import { createMCPCatalogService } from './services/mcp-catalog.js';
@@ -210,6 +211,14 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
 
   const appRecord = app as unknown as Record<string, unknown>;
   appRecord.sessionTokenService = sessionTokenService;
+
+  app.use(
+    '/executor-transcripts',
+    new ExecutorTranscriptsService(sessionTokenService, () => app.service('messages')),
+    { methods: ['create'] }
+  );
+  app.service('/executor-transcripts').hooks({ before: { all: [ctx.requireAuth] } });
+  app.service('/executor-transcripts').publish(() => []);
 
   // Initialize MCP token module.
   const { initMcpTokens } = await import('./mcp/tokens.js');

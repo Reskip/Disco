@@ -1,8 +1,6 @@
-import type { DiscoClient } from '@disco/core/api';
 import type { Message } from '@disco/core/types';
 import { describe, expect, it, vi } from 'vitest';
 import type { MessagesRepository, SessionRepository } from '../../db/feathers-repositories.js';
-import { registerExecutorClientHooks } from '../../services/feathers-client.js';
 import type { MessagesService, TasksService } from '../base/index.js';
 import { appendCodexTokenUsageSample, CodexTool } from './codex-tool.js';
 import type { CodexStreamEvent } from './prompt-service.js';
@@ -75,22 +73,14 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 describe('CodexTool ordered transcript persistence', () => {
-  it('continues past a large skill input and result through the real transport guard', async () => {
-    let guard!: (context: Record<string, unknown>) => Promise<unknown>;
-    registerExecutorClientHooks({
-      hooks(config: { before: { all: (typeof guard)[] } }) {
-        guard = config.before.all[0];
-      },
-    } as unknown as DiscoClient);
+  it('persists large skill parameters and results in full before continuing', async () => {
     const written: Array<Partial<Message>> = [];
     const messagesService: MessagesService = {
       create: vi.fn(async (data: Partial<Message>) => {
-        await guard({ path: 'messages', method: 'create', data });
         written.push(data);
         return data as Message;
       }),
       patch: vi.fn(async (_id: string, data: Partial<Message>) => {
-        await guard({ path: 'messages', method: 'patch', data });
         written.push(data);
         return data as Message;
       }),
@@ -131,10 +121,18 @@ describe('CodexTool ordered transcript persistence', () => {
     const start = written.find(
       (record) => Array.isArray(record.content) && record.content[0]?.id === invocation.id
     );
-    expect(start?.tool_uses).toBeUndefined();
+    expect(start?.tool_uses?.[0].input).toBe(input);
     expect(Array.isArray(start?.content) && start.content[0]?.input).toBe(input);
     expect(invocation.input.arguments.files[0].content).toHaveLength(475_000);
-    expect(output).not.toContain('truncated');
+    const completion = written.find(
+      (record) =>
+        Array.isArray(record.content) &&
+        record.content.some((block) => block.type === 'tool_result')
+    );
+    expect(
+      Array.isArray(completion?.content) &&
+        completion.content.find((block) => block.type === 'tool_result')?.content
+    ).toBe(output);
   });
 
   it('shows one localized retry status and removes it after the provider recovers', async () => {

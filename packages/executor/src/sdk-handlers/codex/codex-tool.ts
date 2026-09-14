@@ -18,7 +18,6 @@ import type {
   SessionRepository,
   UsersRepository,
 } from '../../db/feathers-repositories.js';
-import { prepareToolTranscript } from '../../services/tool-transcript.js';
 import type { NormalizedSdkResponse, RawSdkResponse } from '../../types/sdk-response.js';
 import type { TokenUsage } from '../../types/token-usage.js';
 import {
@@ -682,14 +681,11 @@ export class CodexTool implements ITool {
 
           const existingToolMessageId = pendingToolMessageIds.get(event.toolUse.id);
           if (existingToolMessageId) {
-            await this.messagesService?.patch(
-              existingToolMessageId,
-              prepareToolTranscript({
-                content: toolContent as Message['content'],
-                content_preview:
-                  typeof toolResultContent === 'string' ? toolResultContent.substring(0, 200) : '',
-              })
-            );
+            await this.messagesService?.patch(existingToolMessageId, {
+              content: toolContent as Message['content'],
+              content_preview:
+                typeof toolResultContent === 'string' ? toolResultContent.substring(0, 200) : '',
+            });
             pendingToolMessageIds.delete(event.toolUse.id);
           } else {
             // Fallback path if start event wasn't observed.
@@ -944,11 +940,10 @@ export class CodexTool implements ITool {
       metadata: buildAssistantMessageMetadata({ model: resolvedModel, tokenUsage }),
     };
 
-    const prepared = prepareToolTranscript(message);
-    await this.messagesService?.create(prepared);
+    await this.messagesService?.create(message);
     await patchTaskModelIfKnown(this.tasksService, taskId, resolvedModel);
 
-    return prepared;
+    return message;
   }
 
   /**

@@ -89,6 +89,9 @@ export const WEBSOCKET = {
 /** Shared Socket.IO packet ceiling used by the daemon transport. */
 export const SOCKET_IO_MAX_BUFFER_SIZE_BYTES = 1_000_000;
 
+/** Raw bytes per transcript packet. Larger messages are transferred in full in chunks. */
+export const EXECUTOR_TRANSCRIPT_CHUNK_BYTES = 256 * 1024;
+
 /**
  * Pagination Constants
  *

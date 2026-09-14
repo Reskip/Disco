@@ -5,9 +5,11 @@
  * Uses session token for authentication instead of user credentials.
  */
 
-import { type DiscoClient, createClient } from '@disco/core/api';
-import { SOCKET_IO_MAX_BUFFER_SIZE_BYTES } from '@disco/core/config';
+import { randomUUID } from 'node:crypto';
+import { createClient, type DiscoClient } from '@disco/core/api';
+import { EXECUTOR_TRANSCRIPT_CHUNK_BYTES } from '@disco/core/config';
 import { createAuthRetryAroundHook, createSingleFlight } from './feathers-auth-retry.js';
+import { transferTranscript } from './transcript-transport.js';
 
 // Re-export DiscoClient type for use in other executor files
 export type { DiscoClient } from '@disco/core/api';
@@ -21,15 +23,13 @@ const SERVER_DISCONNECT_RECONNECT_MAX_ATTEMPTS = 8;
 const SERVER_DISCONNECT_RECONNECT_MAX_AUTH_FAILURES = 3;
 const EXECUTOR_ACK_TIMEOUT_MS = 60_000;
 
-export const EXECUTOR_REQUEST_DATA_BUDGET_BYTES = SOCKET_IO_MAX_BUFFER_SIZE_BYTES - 200_000;
-
 function feathersClientDebug(...args: unknown[]): void {
   if (DEBUG_FEATHERS_CLIENT) {
     console.debug(...args);
   }
 }
 
-export function registerExecutorClientHooks(client: DiscoClient): void {
+export function registerExecutorClientHooks(client: DiscoClient, sessionToken: string): void {
   client.hooks({
     before: {
       all: [
@@ -39,20 +39,22 @@ export function registerExecutorClientHooks(client: DiscoClient): void {
             path === 'messages' && (context.method === 'create' || context.method === 'patch');
           if (!isTranscriptWrite) return context;
 
-          let byteSize: number;
-          try {
-            byteSize = Buffer.byteLength(JSON.stringify(context.data), 'utf8');
-          } catch {
-            throw new Error(
-              `Executor transcript data could not be serialized (${path}.${context.method})`
-            );
+          let bytes = Buffer.from(JSON.stringify(context.data), 'utf8');
+          if (bytes.length <= EXECUTOR_TRANSCRIPT_CHUNK_BYTES) return context;
+          const method = context.method as 'create' | 'patch';
+          const messageId =
+            method === 'patch' ? context.id : (context.data?.message_id ?? randomUUID());
+          if (typeof messageId !== 'string') throw new Error('Transcript message ID is required');
+          if (method === 'create' && !context.data?.message_id) {
+            bytes = Buffer.from(JSON.stringify({ ...context.data, message_id: messageId }), 'utf8');
           }
-          if (byteSize > EXECUTOR_REQUEST_DATA_BUDGET_BYTES) {
-            throw new Error(
-              `Executor transcript data is ${byteSize} bytes, exceeding the ${EXECUTOR_REQUEST_DATA_BUDGET_BYTES}-byte transport budget (${path}.${context.method}). ` +
-                `Reduce the tool result size at the source (e.g. pagination, filtering, or result limits).`
-            );
-          }
+          context.result = await transferTranscript(
+            (request) => client.service('executor-transcripts').create(request),
+            sessionToken,
+            method,
+            messageId,
+            bytes
+          );
           return context;
         },
       ],
@@ -129,7 +131,7 @@ export async function createExecutorClient(
     ackTimeout: EXECUTOR_ACK_TIMEOUT_MS,
     authStorage: storage,
   });
-  registerExecutorClientHooks(client);
+  registerExecutorClientHooks(client, sessionToken);
 
   // Keep the executor JWT available for daemon endpoints that need an explicit
   // task-scoped proof. Socket.io auth can preserve the session creator user

@@ -7,11 +7,11 @@ type ToolHandler = (args: Record<string, unknown>) => Promise<{
   content: Array<{ type: string; text: string }>;
 }>;
 
-function captureHandler(ctx: McpContext): ToolHandler {
+function captureHandler(ctx: McpContext, method = 'disco_agent_memory_save'): ToolHandler {
   let handler: ToolHandler | undefined;
   const server = {
     registerTool(name: string, _config: unknown, callback: ToolHandler) {
-      if (name === 'disco_agent_memory_save') handler = callback;
+      if (name === method) handler = callback;
     },
   } as unknown as McpServer;
   registerMemoryTools(server, ctx);
@@ -21,10 +21,11 @@ function captureHandler(ctx: McpContext): ToolHandler {
 
 function createContext(agentId?: string) {
   const saveMemory = vi.fn(async () => ({ id: 'memory-1', kind: 'memory' }));
+  const reviewLearning = vi.fn(async () => ({ reviewed: true }));
   const ctx = {
     app: {
       service(name: string) {
-        if (name === 'agent-capabilities') return { create: saveMemory };
+        if (name === 'agent-capabilities') return { create: saveMemory, reviewLearning };
         throw new Error(`Unexpected service: ${name}`);
       },
     },
@@ -41,10 +42,36 @@ function createContext(agentId?: string) {
       user: { user_id: 'user-1', role: 'member' },
     },
   } as unknown as McpContext;
-  return { ctx, saveMemory };
+  return { ctx, saveMemory, reviewLearning };
 }
 
 describe('Disco agent memory MCP tool', () => {
+  it('routes learning checkpoints through current-agent authorization and rejects standalone', async () => {
+    const context = createContext('agent-1');
+    await captureHandler(
+      context.ctx,
+      'disco_agent_learning_review'
+    )({ taskId: 'task-1', phase: 'inspect' });
+    expect(context.saveMemory).toHaveBeenCalledWith(
+      {
+        taskId: 'task-1',
+        phase: 'inspect',
+        kind: 'learning-review',
+        source_session_id: 'session-1',
+      },
+      expect.objectContaining({ query: { agent_id: 'agent-1' } })
+    );
+    expect(context.reviewLearning).not.toHaveBeenCalled();
+    const standalone = createContext();
+    await expect(
+      captureHandler(
+        standalone.ctx,
+        'disco_agent_learning_review'
+      )({ taskId: 'task-1', phase: 'complete' })
+    ).rejects.toThrow(/persistent agent/u);
+    expect(standalone.reviewLearning).not.toHaveBeenCalled();
+    expect(standalone.saveMemory).not.toHaveBeenCalled();
+  });
   it('saves memory into the current persistent agent through the managed service', async () => {
     const context = createContext('agent-1');
     const result = await captureHandler(context.ctx)({

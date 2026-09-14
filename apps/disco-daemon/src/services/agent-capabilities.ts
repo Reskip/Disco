@@ -12,24 +12,35 @@ import {
 import path from 'node:path';
 import {
   createDefaultDiscoAgentProfile,
+  type DiscoAgentProfile,
   normalizeDiscoAgentProfile,
   reconcileDiscoAgentProfile,
   renderDiscoAgentProfileFiles,
-  type DiscoAgentProfile,
 } from '@disco/core';
 import {
+  type AgentLearningReviewInput,
+  type AgentLearningReviewRequest,
+  type AgentLearningReviewResult,
+  completeAgentLearningReview,
+  getAgentLearningStatus,
+  readDiscoAgentMemories,
+  recordAgentMemoryChange,
+} from '@disco/core/agent-runtime';
+import {
   AgentRepository,
+  SessionRepository,
   SkillLifecycleRepository,
+  TaskRepository,
   type TenantScopeAwareDatabase,
 } from '@disco/core/db';
 import { BadRequest, NotAuthenticated, NotFound } from '@disco/core/feathers';
 import type {
+  Agent,
   AgentCapabilityEntry,
   AgentCapabilityKind,
-  Agent,
+  AgentCapabilityPatch,
   AgentID,
   AgentMemoryUpsertInput,
-  AgentCapabilityPatch,
   AuthenticatedParams,
   DiscoSkillInstallInput,
   UserID,
@@ -162,6 +173,7 @@ function safeMemoryBasename(topic: string): string {
     .normalize('NFKC')
     .trim()
     .toLowerCase()
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: Windows filenames must exclude control characters.
     .replace(/[<>:"/\\|?*\u0000-\u001F]/gu, '-')
     .replace(/\s+/gu, '-')
     .replace(/-+/gu, '-')
@@ -179,15 +191,18 @@ function renderStructuredMemory(options: {
   confidence: number;
   createdAt: string;
   updatedAt: string;
+  status?: string;
+  provenance?: string;
 }): string {
   return `---
 version: 1
 topic: ${JSON.stringify(options.topic)}
 source: ${options.source}
 confidence: ${options.confidence}
-status: active
+status: ${options.status ?? 'active'}
 created_at: ${options.createdAt}
 updated_at: ${options.updatedAt}
+provenance: ${options.provenance ?? '[]'}
 ---
 # ${options.topic}
 
@@ -212,7 +227,7 @@ function upsertAgentMemory(agent: Agent, input: AgentMemoryUpsertInput): AgentCa
 
   const memoryRoot = path.join(workspacePath, '.disco', 'memory');
   mkdirSync(memoryRoot, { recursive: true });
-  const existingPath = safeMarkdownFiles(memoryRoot, 2).find(candidate => {
+  const existingPath = safeMarkdownFiles(memoryRoot, 2).find((candidate) => {
     const existing = readFileSync(candidate, 'utf8').replace(/^\uFEFF/u, '');
     return (
       frontmatterScalar(existing, 'topic')?.localeCompare(topic, undefined, {
@@ -232,6 +247,12 @@ function upsertAgentMemory(agent: Agent, input: AgentMemoryUpsertInput): AgentCa
     ? readFileSync(target, 'utf8').replace(/^\uFEFF/u, '')
     : '';
   const previousBody = memoryBody(existingContent);
+  if (
+    input.expected_updated_at !== undefined &&
+    input.expected_updated_at !== frontmatterScalar(existingContent, 'updated_at')
+  ) {
+    throw new BadRequest('Memory changed since it was inspected; read it again before replacing');
+  }
   const operation = input.operation ?? 'append';
   const nextBody =
     operation === 'replace'
@@ -241,30 +262,53 @@ function upsertAgentMemory(agent: Agent, input: AgentMemoryUpsertInput): AgentCa
         : previousBody.includes(incomingBody)
           ? previousBody
           : `${previousBody}\n\n${incomingBody}`;
-  const now = new Date().toISOString();
+  const previousUpdatedAt = Date.parse(frontmatterScalar(existingContent, 'updated_at') ?? '');
+  const now = new Date(
+    Math.max(Date.now(), Number.isFinite(previousUpdatedAt) ? previousUpdatedAt + 1 : 0)
+  ).toISOString();
   const createdAt = frontmatterScalar(existingContent, 'created_at') ?? now;
+  const changed =
+    previousBody !== nextBody ||
+    frontmatterScalar(existingContent, 'source') !== source ||
+    Number(frontmatterScalar(existingContent, 'confidence')) !== confidence;
+  let provenance: unknown[] = [];
+  try {
+    const parsed = JSON.parse(frontmatterScalar(existingContent, 'provenance') ?? '[]') as unknown;
+    if (Array.isArray(parsed)) provenance = parsed;
+  } catch {
+    /* Legacy documents have no provenance array. */
+  }
+  if (changed) {
+    provenance.push({
+      source,
+      confidence,
+      session_id: input.source_session_id ?? null,
+      operation,
+      recorded_at: now,
+      content_hash: createHash('sha256').update(incomingBody).digest('hex'),
+    });
+  }
   const nextContent = renderStructuredMemory({
     topic,
     body: nextBody,
     source,
     confidence,
     createdAt,
+    status: frontmatterScalar(existingContent, 'status') ?? 'active',
+    provenance: JSON.stringify(provenance),
     updatedAt:
-      existingContent &&
-      previousBody === nextBody &&
-      frontmatterScalar(existingContent, 'source') === source
-        ? (frontmatterScalar(existingContent, 'updated_at') ?? now)
-        : now,
+      existingContent && !changed ? (frontmatterScalar(existingContent, 'updated_at') ?? now) : now,
   });
   writeManagedWorkspaceFile(target, nextContent);
 
   const relativePath = normalizeRelative(path.relative(workspacePath, target));
   const settings = readAgentCapabilitySettings(workspacePath);
-  settings.enabled[capabilityKey('memory', relativePath)] = true;
+  settings.enabled[capabilityKey('memory', relativePath)] ??= true;
   writeAgentCapabilitySettings(workspacePath, settings);
   renderMemoryIndex(workspacePath);
+  recordAgentMemoryChange(workspacePath, readDiscoAgentMemories(workspacePath));
   const entry = discoverAgentCapabilityFiles(agent.agent_id, workspacePath).find(
-    candidate => candidate.kind === 'memory' && candidate.relative_path === relativePath
+    (candidate) => candidate.kind === 'memory' && candidate.relative_path === relativePath
   );
   if (!entry) throw new NotFound('Memory was saved but could not be rediscovered');
   return publicCapability(entry);
@@ -274,7 +318,7 @@ function renderMemoryIndex(workspacePath: string): void {
   const memoryRoot = path.join(workspacePath, '.disco', 'memory');
   const settings = readAgentCapabilitySettings(workspacePath);
   const lines = safeMarkdownFiles(memoryRoot, 2)
-    .map(absolutePath => {
+    .map((absolutePath) => {
       const relativePath = normalizeRelative(path.relative(workspacePath, absolutePath));
       if (settings.enabled[capabilityKey('memory', relativePath)] === false) return null;
       const content = readFileSync(absolutePath, 'utf8').replace(/^\uFEFF/u, '');
@@ -305,8 +349,7 @@ export function ensureAgentProfileScaffoldForWorkspace(
   const workspacePath = input.workspacePath;
   const discoDirectory = path.join(workspacePath, '.disco');
   const displayName = input.displayName.trim() || '智能体';
-  const responsibilities =
-    input.responsibilities?.trim() || '根据用户后续指示维护自己的长期职责。';
+  const responsibilities = input.responsibilities?.trim() || '根据用户后续指示维护自己的长期职责。';
 
   mkdirSync(path.join(discoDirectory, 'memory'), { recursive: true });
   mkdirSync(path.join(workspacePath, 'skills'), { recursive: true });
@@ -390,7 +433,7 @@ function markdownMetadata(content: string, fallbackName: string) {
       .replace(/<!--[\s\S]*?-->/gu, '')
       .replace(/^#.*$/gmu, '')
       .split(/\r?\n\s*\r?\n/u)
-      .map(part => part.replace(/\s+/gu, ' ').trim())
+      .map((part) => part.replace(/\s+/gu, ' ').trim())
       .find(Boolean) ||
     '暂无说明。';
   return {
@@ -465,7 +508,9 @@ export function discoverAgentCapabilityFiles(
         enabled: settings.enabled[capabilityKey(kind, relativePath)] !== false,
         editable: true,
         removable,
-        updated_at: stats.mtime.toISOString(),
+        updated_at:
+          (kind === 'memory' ? frontmatterScalar(content, 'updated_at') : undefined) ??
+          stats.mtime.toISOString(),
         absolutePath: resolved,
       };
     })
@@ -487,7 +532,7 @@ async function authorizedAgent(
     throw new BadRequest('agent_id query is required');
   }
   const agent = await new AgentRepository(db).findOwnedById(agentId, user.user_id);
-  if (!agent || agent.state !== 'ready') throw new NotFound('Agent workspace not found');
+  if (agent?.state !== 'ready' || agent.archived) throw new NotFound('Agent workspace not found');
   // Agent memory and self-authored capabilities are personal data. Admin roles
   // manage accounts, not another user's private agent mind, so there is no
   // elevated-role bypass here.
@@ -510,13 +555,13 @@ async function capabilitiesWithLifecycle(
 ): Promise<AgentCapabilityEntry[]> {
   const discovered = discoverAgentCapabilityFiles(agent.agent_id, agent.workspace_path);
   const records = (await new SkillLifecycleRepository(db).findRecords()).filter(
-    record =>
+    (record) =>
       record.scope === 'agent' &&
       record.agent_id === agent.agent_id &&
       record.status !== 'uninstalled'
   );
   const byRelativePath = new Map(
-    records.map(record => [normalizeRelative(record.relative_path).toLowerCase(), record])
+    records.map((record) => [normalizeRelative(record.relative_path).toLowerCase(), record])
   );
   for (const entry of discovered) {
     const relativePath = normalizeRelative(entry.relative_path).toLowerCase();
@@ -532,7 +577,7 @@ async function capabilitiesWithLifecycle(
     });
     byRelativePath.set(relativePath, adopted);
   }
-  return discovered.map(entry => {
+  return discovered.map((entry) => {
     const lifecycle =
       entry.kind === 'skill'
         ? byRelativePath.get(normalizeRelative(entry.relative_path).toLowerCase())
@@ -571,6 +616,44 @@ function updateProfileDocument(workspacePath: string, relativePath: string, cont
 export class AgentCapabilitiesService {
   constructor(private db: TenantScopeAwareDatabase) {}
 
+  /** Called inside create's standard authentication and tenant database hooks. */
+  private async reviewLearning(
+    input: AgentLearningReviewInput,
+    sessionId: string,
+    params?: AuthenticatedParams
+  ): Promise<AgentLearningReviewResult> {
+    const agent = await authorizedAgent(this.db, params);
+    const [task, session] = await Promise.all([
+      new TaskRepository(this.db).findById(input.taskId),
+      new SessionRepository(this.db).findById(sessionId),
+    ]);
+    if (
+      !session ||
+      session.agent_id !== agent.agent_id ||
+      session.created_by !== agent.created_by ||
+      !task ||
+      task.task_id !== input.taskId ||
+      task.session_id !== sessionId ||
+      task.created_by !== agent.created_by ||
+      task.status !== 'running'
+    ) {
+      throw new BadRequest(
+        'Learning review requires the current running task of this agent session'
+      );
+    }
+    const memories = readDiscoAgentMemories(agent.workspace_path);
+    if (input.phase === 'inspect') {
+      return { ...getAgentLearningStatus(agent.workspace_path, memories), memories };
+    }
+    const result = completeAgentLearningReview({
+      workspace: agent.workspace_path,
+      memories,
+      sessionId,
+      input,
+    });
+    return { ...result, reviewed: true };
+  }
+
   async find(params?: AuthenticatedParams): Promise<AgentCapabilityEntry[]> {
     const agent = await authorizedAgent(this.db, params);
     return capabilitiesWithLifecycle(this.db, agent);
@@ -579,7 +662,7 @@ export class AgentCapabilitiesService {
   async get(id: string, params?: AuthenticatedParams): Promise<AgentCapabilityEntry> {
     const agent = await authorizedAgent(this.db, params);
     const entry = (await capabilitiesWithLifecycle(this.db, agent)).find(
-      candidate => candidate.id === id
+      (candidate) => candidate.id === id
     );
     if (!entry) throw new NotFound(`Agent capability not found: ${id}`);
     return entry;
@@ -588,7 +671,18 @@ export class AgentCapabilitiesService {
   async create(
     data: DiscoSkillInstallInput | AgentMemoryUpsertInput,
     params?: AuthenticatedParams
-  ): Promise<AgentCapabilityEntry> {
+  ): Promise<AgentCapabilityEntry>;
+  async create(
+    data: AgentLearningReviewRequest,
+    params?: AuthenticatedParams
+  ): Promise<AgentLearningReviewResult>;
+  async create(
+    data: DiscoSkillInstallInput | AgentMemoryUpsertInput | AgentLearningReviewRequest,
+    params?: AuthenticatedParams
+  ): Promise<AgentCapabilityEntry | AgentLearningReviewResult> {
+    if ('kind' in data && data.kind === 'learning-review') {
+      return this.reviewLearning(data, data.source_session_id, params);
+    }
     const agent = await authorizedAgent(this.db, params);
     const actorUserId = params?.user?.user_id as UserID | undefined;
     if (!actorUserId) throw new NotAuthenticated('Authentication required');
@@ -609,7 +703,7 @@ export class AgentCapabilitiesService {
       sourceSessionId: skillData.source_session_id ?? null,
     });
     const entry = (await capabilitiesWithLifecycle(this.db, agent)).find(
-      candidate => candidate.lifecycle?.id === record.id
+      (candidate) => candidate.lifecycle?.id === record.id
     );
     if (!entry) throw new NotFound(`Installed agent skill not found: ${record.id}`);
     return entry;
@@ -622,10 +716,10 @@ export class AgentCapabilitiesService {
   ): Promise<AgentCapabilityEntry> {
     const agent = await authorizedAgent(this.db, params);
     const entry = discoverAgentCapabilityFiles(agent.agent_id, agent.workspace_path).find(
-      candidate => candidate.id === id
+      (candidate) => candidate.id === id
     );
     const entryView = (await capabilitiesWithLifecycle(this.db, agent)).find(
-      candidate => candidate.id === id
+      (candidate) => candidate.id === id
     );
     if (!entry || !entryView) throw new NotFound(`Agent capability not found: ${id}`);
     if (data.content === undefined && data.enabled === undefined && data.action === undefined) {
@@ -649,7 +743,7 @@ export class AgentCapabilitiesService {
         return { ...entryView, enabled: false, lifecycle: updatedLifecycle };
       }
       const updated = (await capabilitiesWithLifecycle(this.db, agent)).find(
-        candidate => candidate.lifecycle?.id === updatedLifecycle.id
+        (candidate) => candidate.lifecycle?.id === updatedLifecycle.id
       );
       if (!updated) throw new NotFound(`Agent skill not found after update: ${id}`);
       return updated;
@@ -673,9 +767,12 @@ export class AgentCapabilitiesService {
       settings.enabled[capabilityKey(entry.kind, entry.relative_path)] = data.enabled;
       writeAgentCapabilitySettings(agent.workspace_path, settings);
     }
-    if (entry.kind === 'memory') renderMemoryIndex(agent.workspace_path);
+    if (entry.kind === 'memory') {
+      renderMemoryIndex(agent.workspace_path);
+      recordAgentMemoryChange(agent.workspace_path, readDiscoAgentMemories(agent.workspace_path));
+    }
     const updated = (await capabilitiesWithLifecycle(this.db, agent)).find(
-      candidate => candidate.id === id
+      (candidate) => candidate.id === id
     );
     if (!updated) throw new NotFound(`Agent capability not found after update: ${id}`);
     return updated;
@@ -684,7 +781,7 @@ export class AgentCapabilitiesService {
   async remove(id: string, params?: AuthenticatedParams): Promise<AgentCapabilityEntry> {
     const agent = await authorizedAgent(this.db, params);
     const entry = discoverAgentCapabilityFiles(agent.agent_id, agent.workspace_path).find(
-      candidate => candidate.id === id
+      (candidate) => candidate.id === id
     );
     if (!entry) throw new NotFound(`Agent capability not found: ${id}`);
     if (!entry.removable) throw new BadRequest('The primary long-term memory cannot be deleted');
@@ -692,7 +789,10 @@ export class AgentCapabilitiesService {
       throw new BadRequest('Use the confirmed uninstall action to remove a skill');
     }
     rmSync(entry.absolutePath);
-    if (entry.kind === 'memory') renderMemoryIndex(agent.workspace_path);
+    if (entry.kind === 'memory') {
+      renderMemoryIndex(agent.workspace_path);
+      recordAgentMemoryChange(agent.workspace_path, readDiscoAgentMemories(agent.workspace_path));
+    }
     return publicCapability(entry);
   }
 }

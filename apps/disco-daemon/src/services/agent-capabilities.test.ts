@@ -1,12 +1,17 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {
+  prepareDiscoAgentRuntimeContext,
+  readDiscoAgentLearningStatus,
+} from '@disco/core/agent-runtime';
+import {
   AgentRepository,
+  SessionRepository,
   SkillLifecycleRepository,
+  TaskRepository,
   type TenantScopeAwareDatabase,
 } from '@disco/core/db';
-import { prepareDiscoAgentRuntimeContext } from '@disco/core/agent-runtime';
 import type { Agent, AuthenticatedParams, DiscoSkillLifecycleRecord } from '@disco/core/types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -46,6 +51,139 @@ function agentFixture(agentId: string, workspacePath: string, owner = 'user-1'):
 }
 
 describe('agent capabilities', () => {
+  it('records provenance, rejects stale corrections and preserves disabled memories', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'disco-memory-provenance-'));
+    const agent = agentFixture('agent-1', root);
+    vi.spyOn(AgentRepository.prototype, 'findOwnedById').mockResolvedValue(agent);
+    vi.spyOn(SkillLifecycleRepository.prototype, 'findRecords').mockResolvedValue([]);
+    const service = new AgentCapabilitiesService({} as TenantScopeAwareDatabase);
+    try {
+      const first = await service.create(
+        {
+          kind: 'memory',
+          topic: '回复偏好',
+          content: '先说结论。',
+          source: 'user-explicit',
+          source_session_id: 's1',
+        },
+        params('agent-1')
+      );
+      expect(first.content).toContain('"session_id":"s1"');
+      expect(readDiscoAgentLearningStatus(root).pendingUpdates).toBe(1);
+      await service.create(
+        {
+          kind: 'memory',
+          topic: '回复偏好',
+          content: '先说结论。',
+          source: 'user-explicit',
+          source_session_id: 's2',
+        },
+        params('agent-1')
+      );
+      expect(readDiscoAgentLearningStatus(root).pendingUpdates).toBe(1);
+      await expect(
+        service.create(
+          {
+            kind: 'memory',
+            topic: '回复偏好',
+            content: '多解释。',
+            operation: 'replace',
+            expected_updated_at: 'stale',
+          },
+          params('agent-1')
+        )
+      ).rejects.toThrow(/Memory changed/u);
+      const corrected = await service.create(
+        {
+          kind: 'memory',
+          topic: '回复偏好',
+          content: '先说结论，最多两条依据。',
+          operation: 'replace',
+          expected_updated_at: first.updated_at,
+          source: 'user-explicit',
+          source_session_id: 's2',
+        },
+        params('agent-1')
+      );
+      expect(corrected.content).toContain('最多两条依据');
+      expect(corrected.updated_at > first.updated_at).toBe(true);
+      await service.patch(first.id, { enabled: false }, params('agent-1'));
+      const updated = await service.create(
+        { kind: 'memory', topic: '回复偏好', content: '偏好示例。', source_session_id: 's2' },
+        params('agent-1')
+      );
+      expect(updated.enabled).toBe(false);
+      expect(updated.content).toContain('"session_id":"s1"');
+      expect(updated.content).toContain('"session_id":"s2"');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('authorizes the exact current task and agent before recording a learning review', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'disco-review-owner-'));
+    const agent = agentFixture('agent-1', root);
+    vi.spyOn(AgentRepository.prototype, 'findOwnedById').mockImplementation(async (_id, owner) =>
+      owner === 'user-1' ? agent : null
+    );
+    const task = vi.spyOn(TaskRepository.prototype, 'findById').mockResolvedValue({
+      task_id: 'task-1',
+      session_id: 'session-1',
+      created_by: 'user-1',
+      status: 'running',
+    } as never);
+    const session = vi.spyOn(SessionRepository.prototype, 'findById').mockResolvedValue({
+      session_id: 'session-1',
+      agent_id: 'agent-1',
+      created_by: 'user-1',
+    } as never);
+    const service = new AgentCapabilitiesService({} as TenantScopeAwareDatabase);
+    const input = {
+      kind: 'learning-review' as const,
+      source_session_id: 'session-1',
+      taskId: 'task-1',
+      phase: 'complete' as const,
+      memoryDecision: '无稳定新事实',
+      skillDecision: '无已验证新方法',
+    };
+    try {
+      await expect(
+        service.create(input, params('agent-1', 'user-2', 'superadmin'))
+      ).rejects.toThrow(/not found/u);
+      session.mockResolvedValueOnce({
+        session_id: 'session-1',
+        agent_id: 'agent-other',
+        created_by: 'user-1',
+      } as never);
+      await expect(service.create(input, params('agent-1'))).rejects.toThrow(
+        /current running task/u
+      );
+      task.mockResolvedValueOnce({
+        task_id: 'task-1',
+        session_id: 'session-other',
+        created_by: 'user-1',
+        status: 'running',
+      } as never);
+      await expect(service.create(input, params('agent-1'))).rejects.toThrow(
+        /current running task/u
+      );
+      task.mockResolvedValueOnce({
+        task_id: 'task-1',
+        session_id: 'session-1',
+        created_by: 'user-1',
+        status: 'completed',
+      } as never);
+      await expect(service.create(input, params('agent-1'))).rejects.toThrow(
+        /current running task/u
+      );
+      expect((await service.create(input, params('agent-1'))).reviews).toHaveLength(1);
+      await service.create(input, params('agent-1'));
+      expect(readDiscoAgentLearningStatus(root).reviews).toHaveLength(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('discovers, edits, disables and removes only the selected agent files', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'disco-agent-capabilities-'));
     const skillPath = path.join(root, 'skills', 'summarize', 'SKILL.md');
@@ -69,19 +207,19 @@ describe('agent capabilities', () => {
     );
 
     const agent = agentFixture('agent-1', root);
-    vi.spyOn(AgentRepository.prototype, 'findOwnedById').mockImplementation(
-      async (id, owner) => (id === agent.agent_id && owner === agent.created_by ? agent : null)
+    vi.spyOn(AgentRepository.prototype, 'findOwnedById').mockImplementation(async (id, owner) =>
+      id === agent.agent_id && owner === agent.created_by ? agent : null
     );
     let lifecycleRecords: DiscoSkillLifecycleRecord[] = [];
     vi.spyOn(SkillLifecycleRepository.prototype, 'findRecords').mockImplementation(
       async () => lifecycleRecords
     );
     vi.spyOn(SkillLifecycleRepository.prototype, 'findRecord').mockImplementation(
-      async id => lifecycleRecords.find(record => record.id === id) ?? null
+      async (id) => lifecycleRecords.find((record) => record.id === id) ?? null
     );
-    vi.spyOn(SkillLifecycleRepository.prototype, 'setRecord').mockImplementation(async record => {
+    vi.spyOn(SkillLifecycleRepository.prototype, 'setRecord').mockImplementation(async (record) => {
       lifecycleRecords = [
-        ...lifecycleRecords.filter(candidate => candidate.id !== record.id),
+        ...lifecycleRecords.filter((candidate) => candidate.id !== record.id),
         record,
       ];
       return record;
@@ -134,14 +272,14 @@ describe('agent capabilities', () => {
       );
       expect(await readFile(path.join(root, '.disco', 'SOUL.md'), 'utf8')).toContain('性格与原则');
       expect(await readFile(path.join(root, '.disco', 'USER.md'), 'utf8')).toContain('用户偏好');
-      const soul = initial.find(entry => entry.relative_path === '.disco/SOUL.md')!;
+      const soul = initial.find((entry) => entry.relative_path === '.disco/SOUL.md')!;
       await service.patch(soul.id, { content: '# 性格与原则\n\n先给结论。\n' }, params('agent-1'));
       expect(
         JSON.parse(await readFile(path.join(root, '.disco', 'agent.json'), 'utf8')).documents.soul
       ).toContain('先给结论');
       expect(await readFile(path.join(root, '.disco', 'SOUL.md'), 'utf8')).toContain('先给结论');
 
-      const memory = initial.find(entry => entry.relative_path.endsWith('preferences.md'))!;
+      const memory = initial.find((entry) => entry.relative_path.endsWith('preferences.md'))!;
       await service.patch(memory.id, { content: '# 用户偏好\n\n使用中文。\n' }, params('agent-1'));
       const storedMemory = await readFile(memoryPath, 'utf8');
       expect(storedMemory).toContain('source: user-explicit');
@@ -149,7 +287,7 @@ describe('agent capabilities', () => {
       expect(await readFile(path.join(root, '.disco', 'MEMORY.md'), 'utf8')).toContain(
         'memory/preferences.md'
       );
-      const skill = initial.find(entry => entry.kind === 'skill')!;
+      const skill = initial.find((entry) => entry.kind === 'skill')!;
 
       const sessionWorkspace = path.join(root, 'sessions', 'session-after-edit');
       await mkdir(sessionWorkspace, { recursive: true });
@@ -212,9 +350,10 @@ describe('agent capabilities', () => {
     );
 
     try {
-      const responsibilities = discoverAgentCapabilityFiles('agent-1' as Agent['agent_id'], root).find(
-        entry => entry.relative_path === '.disco/RESPONSIBILITIES.md'
-      );
+      const responsibilities = discoverAgentCapabilityFiles(
+        'agent-1' as Agent['agent_id'],
+        root
+      ).find((entry) => entry.relative_path === '.disco/RESPONSIBILITIES.md');
       expect(responsibilities?.description).toBe('维护自己的长期职责。');
       expect(responsibilities?.description).not.toContain('disco:summary');
     } finally {
@@ -225,8 +364,8 @@ describe('agent capabilities', () => {
   it('rejects another member and an unavailable Agent', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'disco-agent-auth-'));
     const agent = agentFixture('agent-2', root, 'owner');
-    vi.spyOn(AgentRepository.prototype, 'findOwnedById').mockImplementation(
-      async (id, owner) => (id === agent.agent_id && owner === agent.created_by ? agent : null)
+    vi.spyOn(AgentRepository.prototype, 'findOwnedById').mockImplementation(async (id, owner) =>
+      id === agent.agent_id && owner === agent.created_by ? agent : null
     );
     vi.spyOn(SkillLifecycleRepository.prototype, 'findRecords').mockResolvedValue([]);
     const service = new AgentCapabilitiesService({} as TenantScopeAwareDatabase);
@@ -245,8 +384,8 @@ describe('agent capabilities', () => {
   it('saves structured memory by topic without duplicate files or no-op rewrites', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'disco-agent-memory-'));
     const agent = agentFixture('agent-memory', root);
-    vi.spyOn(AgentRepository.prototype, 'findOwnedById').mockImplementation(
-      async (id, owner) => (id === agent.agent_id && owner === agent.created_by ? agent : null)
+    vi.spyOn(AgentRepository.prototype, 'findOwnedById').mockImplementation(async (id, owner) =>
+      id === agent.agent_id && owner === agent.created_by ? agent : null
     );
     vi.spyOn(SkillLifecycleRepository.prototype, 'findRecords').mockResolvedValue([]);
     const service = new AgentCapabilitiesService({} as TenantScopeAwareDatabase);
@@ -283,7 +422,7 @@ describe('agent capabilities', () => {
       expect(duplicate.id).toBe(created.id);
       expect((await stat(target)).mtimeMs).toBe(firstMtime);
       expect(
-        (await readdir(path.join(root, '.disco', 'memory'))).filter(name => name.endsWith('.md'))
+        (await readdir(path.join(root, '.disco', 'memory'))).filter((name) => name.endsWith('.md'))
       ).toHaveLength(1);
 
       const replaced = await service.create(

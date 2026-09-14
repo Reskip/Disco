@@ -9,8 +9,15 @@ import {
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
-
+import {
+  AGENT_LEARNING_PATH,
+  type AgentLearningStatus,
+  type AgentMemoryDocument,
+  getAgentLearningStatus,
+} from './agent-learning.js';
 import { type DiscoAgentProfile, normalizeDiscoAgentProfile } from './agent-profile.js';
+
+export * from './agent-learning.js';
 
 const RUNTIME_DIRECTORY = '.disco-runtime';
 const RUNTIME_CONTEXT_FILE = 'agent-context.md';
@@ -168,6 +175,21 @@ function readCanonicalProfile(agentWorkspace: string): DiscoAgentProfile {
   });
 }
 
+export function readDiscoAgentMemories(agentWorkspace: string): AgentMemoryDocument[] {
+  const settings = readCapabilitySettings(agentWorkspace);
+  return markdownFiles(path.join(agentWorkspace, '.disco', 'memory'), 2).flatMap((absolutePath) => {
+    const content = readFileSync(absolutePath, 'utf8');
+    const relativePath = normalizeRelative(path.relative(agentWorkspace, absolutePath));
+    return capabilityEnabled(settings, 'memory', relativePath) && activeMemoryDocument(content)
+      ? [{ relativePath, content }]
+      : [];
+  });
+}
+
+export function readDiscoAgentLearningStatus(agentWorkspace: string): AgentLearningStatus {
+  return getAgentLearningStatus(agentWorkspace, readDiscoAgentMemories(agentWorkspace));
+}
+
 function section(title: string, content: string): string {
   return `## ${title}\n\n${readableDocumentBody(content) || '尚未记录。'}`;
 }
@@ -177,7 +199,9 @@ function memoryTitle(relativePath: string, content: string): string {
   const frontmatter = normalized.match(/^---\s*\r?\n([\s\S]*?)\r?\n---/u)?.[1] ?? '';
   const topic = frontmatter.match(/^topic:\s*(.+)$/mu)?.[1];
   if (topic) return frontmatterScalar(topic);
-  const heading = withoutFrontmatter(normalized).match(/^#\s+(.+)$/mu)?.[1]?.trim();
+  const heading = withoutFrontmatter(normalized)
+    .match(/^#\s+(.+)$/mu)?.[1]
+    ?.trim();
   return heading || path.basename(relativePath, path.extname(relativePath));
 }
 
@@ -231,10 +255,12 @@ function renderRuntimeContext(options: {
   profileDocuments: Array<{ title: string; content: string }>;
   memories: Array<{ relativePath: string; content: string }>;
   skills: Array<{ relativePath: string; name: string; description: string }>;
+  learning: AgentLearningStatus;
 }): string {
   const { profileDocuments, memories, skills } = options;
-  const memoryContent =
-    memories.length > 0
+  const memoryContent = options.learning.summary
+    ? `${options.learning.summary.content}\n\n整理时间：${options.learning.summary.updatedAt}。原始依据按需读取：\n${options.learning.summary.sourcePaths.map((source) => `- ${source}`).join('\n')}`
+    : memories.length > 0
       ? memories
           .map(
             (entry) =>
@@ -245,10 +271,7 @@ function renderRuntimeContext(options: {
   const skillContent =
     skills.length > 0
       ? skills
-          .map(
-            (entry) =>
-              `- **${entry.name}**：${entry.description.slice(0, 300)}`
-          )
+          .map((entry) => `- **${entry.name}**：${entry.description.slice(0, 300)}`)
           .join('\n\n')
       : '当前没有已启用技能。';
 
@@ -267,6 +290,10 @@ ${memoryContent}
 ${skillContent}
 
 完整技能说明在任务相关时按需加载。
+
+## 记忆整理状态
+
+距上次整理累计 ${options.learning.pendingUpdates} 次有效变化。${options.learning.consolidationDue ? '已达到整理条件：本轮工作完成后，通过托管复盘方法检查最新原文并提交有来源的精简摘要。' : '未达到集中整理条件；新偏好、明确纠正和已验证的跨会话事实仍应当轮记录。'}
 `;
 }
 
@@ -345,6 +372,7 @@ export function prepareDiscoAgentRuntimeContext(options: {
   const sourceFingerprint = sourceContentFingerprint(agentWorkspace, [
     profilePath,
     capabilitySettingsPath,
+    path.join(agentWorkspace, AGENT_LEARNING_PATH),
     ...memoryPaths,
     ...skillPaths,
   ]);
@@ -405,6 +433,7 @@ export function prepareDiscoAgentRuntimeContext(options: {
     profileDocuments,
     memories,
     skills,
+    learning: getAgentLearningStatus(agentWorkspace, memories),
   });
   const fingerprint = createHash('sha256').update(content).digest('hex');
   const preparedAt = options.now ?? new Date().toISOString();

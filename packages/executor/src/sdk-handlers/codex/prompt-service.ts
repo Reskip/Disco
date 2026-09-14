@@ -34,6 +34,7 @@ import {
 } from '@disco/core';
 import {
   prepareDiscoAgentRuntimeContext,
+  readDiscoAgentLearningStatus,
   writeDiscoAgentPreloadFailure,
 } from '@disco/core/agent-runtime';
 import { loadManagedAgenticToolSdk } from '@disco/core/agentic-integrations';
@@ -78,6 +79,7 @@ import type { TokenUsage } from '../../types/token-usage.js';
 import type { PermissionMode, SessionID, TaskID, UserID } from '../../types.js';
 import { resolveContextUserId } from '../base/context-user.js';
 import type { TasksService } from '../base/index.js';
+import { buildAgentLearningInstruction, withAgentLearningReview } from './agent-learning.js';
 import { forkCodexThreadViaAppServer } from './app-server-client.js';
 import {
   CodexAppServerThread,
@@ -278,7 +280,7 @@ export function buildDiscoManagedLifecycleInstruction(
 
 安装、更新或自生成技能时，使用本次运行提供的 Disco 托管技能方法；不要直接写入技能目录或 Codex Runtime Home。${options.agentSession ? '默认目标是当前智能体。' : '默认目标是当前用户的 Disco 共享技能。'}
 
-${options.agentSession ? '用户明确要求“记住”时，使用 Disco 托管记忆方法；不要通过 Shell 直接修改长期记忆文件。' : '独立会话不保存人格或长期记忆。'}
+${options.agentSession ? `使用 Disco 托管记忆方法；不要通过 Shell 直接修改长期记忆文件。\n\n${buildAgentLearningInstruction()}` : '独立会话不保存人格或长期记忆。'}
 
 向用户交付本地文件时，使用 Disco 托管文件发布方法。只有该操作成功返回的文件才算已交付；仅在回复中写文件名或路径不算发送。
 
@@ -330,7 +332,7 @@ function parsePublicationPayload(value: unknown): UploadPromptAttachment[] {
   const payload = value as Record<string, unknown>;
   if (payload.type !== 'disco_file_publication' || payload.published !== true) return [];
   if (!Array.isArray(payload.files)) return [];
-  return payload.files.flatMap(file => {
+  return payload.files.flatMap((file) => {
     if (!file || typeof file !== 'object' || Array.isArray(file)) return [];
     const candidate = file as Record<string, unknown>;
     if (
@@ -428,7 +430,7 @@ export function appendExplicitlyPublishedOutputs(input: {
   excludedRefs?: ReadonlySet<string>;
 }): void {
   const published = extractExplicitlyPublishedAttachments(input.toolUses).filter(
-    attachment => !input.excludedRefs?.has(attachment.ref)
+    (attachment) => !input.excludedRefs?.has(attachment.ref)
   );
   const failed = countFailedExplicitPublications(input.toolUses);
   if (failed > 0) {
@@ -620,6 +622,8 @@ export class CodexPromptService {
   private useNativeAuth: boolean;
   private instructionsFilePaths = new Map<SessionID, string>();
   private activeAppServerThreads = new Map<SessionID, CodexAppServerThread>();
+  private activeLearningReviews = new Set<SessionID>();
+  private steeredLearningReviews = new Set<SessionID>();
   private commandPurposeClassifiers = new Map<string, CommandPurposeClassifier>();
 
   /**
@@ -698,7 +702,7 @@ export class CodexPromptService {
     // (also true for Gemini/Copilot — broader gap). This sweep self-heals
     // long-running daemons that accumulate stale `disco-codex-instructions-*`
     // across crashes / unclean shutdowns / never-fired close hooks.
-    void this.sweepStaleInstructionsFiles().catch(err => {
+    void this.sweepStaleInstructionsFiles().catch((err) => {
       console.warn('⚠️  [Codex] Stale-instructions-file sweep failed:', err);
     });
   }
@@ -1150,15 +1154,15 @@ export class CodexPromptService {
       { toolFiltering: 'exclude' }
     );
 
-    const mcpServers = serversWithSource.map(s => s.server);
+    const mcpServers = serversWithSource.map((s) => s.server);
 
     codexDebug(`📊 [Codex MCP] Found ${mcpServers.length} MCP server(s) for session`);
     if (mcpServers.length > 0) {
-      codexDebug(`   Servers: ${mcpServers.map(s => `${s.name} (${s.transport})`).join(', ')}`);
+      codexDebug(`   Servers: ${mcpServers.map((s) => `${s.name} (${s.transport})`).join(', ')}`);
     }
 
-    const stdioServers = mcpServers.filter(s => s.transport === 'stdio');
-    const httpServers = mcpServers.filter(s => s.transport === 'http' || s.transport === 'sse');
+    const stdioServers = mcpServers.filter((s) => s.transport === 'stdio');
+    const httpServers = mcpServers.filter((s) => s.transport === 'http' || s.transport === 'sse');
 
     codexDebug(
       `   📊 [Codex MCP] Transport breakdown: ${stdioServers.length} STDIO, ${httpServers.length} HTTP/SSE`
@@ -1318,7 +1322,7 @@ export class CodexPromptService {
       return null;
     }
 
-    const firstIncompleteIndex = items.findIndex(todo => !todo.completed);
+    const firstIncompleteIndex = items.findIndex((todo) => !todo.completed);
 
     return {
       todos: items.map((todo, index) => ({
@@ -1601,6 +1605,61 @@ export class CodexPromptService {
     abortController?: AbortController,
     onActivity?: SdkActivityCallback
   ): AsyncGenerator<CodexStreamEvent> {
+    yield* withAgentLearningReview({
+      prompt,
+      taskId,
+      abortController,
+      stopped: () => this.stopRequested.has(sessionId),
+      onReviewStart: () => {
+        this.activeLearningReviews.add(sessionId);
+        this.steeredLearningReviews.delete(sessionId);
+      },
+      onReviewEnd: () => {
+        this.activeLearningReviews.delete(sessionId);
+        this.steeredLearningReviews.delete(sessionId);
+      },
+      wasReviewSteered: () => this.steeredLearningReviews.has(sessionId),
+      run: (text, controller) =>
+        this.promptSessionTurnStreaming(
+          sessionId,
+          text,
+          taskId,
+          permissionMode,
+          controller,
+          onActivity
+        ),
+      loadStatus: async () => {
+        const session = await this.sessionsRepo.findById(sessionId);
+        if (!session?.agent_id || !this.agentsRepo) return null;
+        const agent = await this.agentsRepo.findById(session.agent_id);
+        if (
+          !agent ||
+          agent.created_by !== session.created_by ||
+          agent.state !== 'ready' ||
+          agent.archived
+        )
+          return null;
+        const root =
+          session.working_directory && resolveDiscoUserWorkspaceRoot(session.working_directory);
+        if (
+          !root ||
+          !isPathInsideDiscoUserWorkspace(root, agent.workspace_path) ||
+          !isPathInsideDiscoUserWorkspace(agent.workspace_path, session.working_directory!)
+        )
+          return null;
+        return readDiscoAgentLearningStatus(agent.workspace_path);
+      },
+    });
+  }
+
+  private async *promptSessionTurnStreaming(
+    sessionId: SessionID,
+    prompt: string,
+    taskId?: TaskID,
+    permissionMode?: PermissionMode,
+    abortController?: AbortController,
+    onActivity?: SdkActivityCallback
+  ): AsyncGenerator<CodexStreamEvent> {
     // Get session to check for existing thread ID and working directory
     const session = await this.sessionsRepo.findById(sessionId);
     if (!session) {
@@ -1646,6 +1705,8 @@ export class CodexPromptService {
           agentWorkspace: agent.workspace_path,
           sessionWorkspace: workingDirectory,
         }).content;
+        if (taskId)
+          agentRuntimeContext += `\n本轮 taskId：${taskId}。有学习价值或复杂任务结束前，通过 ${DISCO_MCP_METHOD_NAMES.agentLearningReview} 的 complete 记录记忆与技能评估；需要纠正原文或集中整理时才先 inspect。用户要求只读或不要记录时跳过。\n`;
       } catch (error) {
         try {
           writeDiscoAgentPreloadFailure(workingDirectory, error);
@@ -1690,7 +1751,8 @@ export class CodexPromptService {
     // The short runtime-only boundary in model_instructions_file prevents
     // accidental cross-user access without pretending to be a hard sandbox.
     const sandboxModeEnvOverride = process.env.DISCO_CODEX_SANDBOX_MODE as
-      CodexSandboxMode | undefined;
+      | CodexSandboxMode
+      | undefined;
     const configuredSandboxMode = codexConfig?.sandboxMode ?? defaults.sandboxMode;
     // When Disco wraps the whole executor in its own OS-level sandbox (SRT), do
     // NOT let Codex start its own nested bwrap — run full-access INSIDE Disco's
@@ -2038,7 +2100,7 @@ export class CodexPromptService {
               filePaths: [filePath],
             });
             const attachment = extractExplicitlyPublishedAttachments(publicationToolUses).find(
-              candidate => candidate.mimeType.toLowerCase().startsWith('image/')
+              (candidate) => candidate.mimeType.toLowerCase().startsWith('image/')
             );
             if (!attachment) return unavailableImageView(filePath);
             return {
@@ -2121,7 +2183,7 @@ export class CodexPromptService {
         if (
           hasVisibleAssistantText ||
           currentMessage.some(
-            block =>
+            (block) =>
               (block.type === 'text' && typeof block.text === 'string' && block.text.trim()) ||
               block.type === 'file_citation'
           )
@@ -2143,8 +2205,8 @@ export class CodexPromptService {
       while (true) {
         let pollTimer: ReturnType<typeof setTimeout> | undefined;
         const winner = await Promise.race([
-          pendingEvent.then(result => ({ kind: 'sdk' as const, result })),
-          new Promise<{ kind: 'poll' }>(resolve => {
+          pendingEvent.then((result) => ({ kind: 'sdk' as const, result })),
+          new Promise<{ kind: 'poll' }>((resolve) => {
             pollTimer = setTimeout(
               () => resolve({ kind: 'poll' }),
               CODEX_ROLLOUT_USAGE_POLL_INTERVAL_MS
@@ -2360,7 +2422,7 @@ export class CodexPromptService {
                 ? eventPayload.last_agent_message
                 : '';
             const hasSameTextContent = currentMessage.some(
-              block => block.type === 'text' && block.text === lastAgentMessage
+              (block) => block.type === 'text' && block.text === lastAgentMessage
             );
             if (lastAgentMessage && !hasSameTextContent) {
               currentMessage.push({ type: 'text', text: lastAgentMessage });
@@ -2422,17 +2484,17 @@ export class CodexPromptService {
                 if (commandPurpose.needsModel) {
                   const nearbyContext = currentMessage
                     .filter(
-                      block =>
+                      (block) =>
                         block.type === 'text' &&
                         typeof block.text === 'string' &&
                         block.text.trim().length > 0
                     )
                     .slice(-2)
-                    .map(block => block.text as string)
+                    .map((block) => block.text as string)
                     .join(' ');
                   void commandPurposeClassifier
                     .refine(event.item.command, nearbyContext)
-                    .then(refined => {
+                    .then((refined) => {
                       if (!completedCommandPurposeIds.has(event.item.id)) {
                         commandPurposes.set(event.item.id, refined);
                       }
@@ -2763,7 +2825,7 @@ export class CodexPromptService {
     const deadline = Date.now() + 15_000;
     let thread = this.activeAppServerThreads.get(sessionId);
     while (!thread && Date.now() < deadline) {
-      await new Promise(resolve => setTimeout(resolve, 25));
+      await new Promise((resolve) => setTimeout(resolve, 25));
       thread = this.activeAppServerThreads.get(sessionId);
     }
     if (!thread) throw new Error('No active Codex turn found for this session');
@@ -2775,7 +2837,14 @@ export class CodexPromptService {
     const workingDirectory = path.resolve(session.working_directory);
     await fs.mkdir(workingDirectory, { recursive: true });
     const input = await this.buildTurnInput(sessionId, prompt, workingDirectory);
-    await thread.steer(input);
+    const reviewing = this.activeLearningReviews.has(sessionId);
+    if (reviewing) this.steeredLearningReviews.add(sessionId);
+    try {
+      await thread.steer(input);
+    } catch (error) {
+      if (reviewing) this.steeredLearningReviews.delete(sessionId);
+      throw error;
+    }
   }
 
   /**

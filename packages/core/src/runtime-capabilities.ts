@@ -5,11 +5,7 @@ import { createHash } from 'node:crypto';
  * Disco session. This catalog deliberately includes non-callable protocol
  * events and UI-only features so they cannot be confused with Agent tools.
  */
-export type RuntimeCapabilityProvider =
-  | 'codex-native'
-  | 'disco-mcp'
-  | 'client-dynamic'
-  | 'ui-only';
+export type RuntimeCapabilityProvider = 'codex-native' | 'disco-mcp' | 'client-dynamic' | 'ui-only';
 
 export type RuntimeCapabilityKind = 'operation' | 'method' | 'event' | 'feature';
 
@@ -79,6 +75,7 @@ export const DISCO_MCP_METHOD_NAMES = {
   filesPublish: 'disco_files_publish',
   skillsInstall: 'disco_skills_install',
   agentMemorySave: 'disco_agent_memory_save',
+  agentLearningReview: 'disco_agent_learning_review',
 } as const;
 
 /** Product-critical managed operations that must never become ghost methods. */
@@ -86,6 +83,7 @@ export const REQUIRED_DISCO_MANAGED_METHOD_NAMES = [
   DISCO_MCP_METHOD_NAMES.filesPublish,
   DISCO_MCP_METHOD_NAMES.skillsInstall,
   DISCO_MCP_METHOD_NAMES.agentMemorySave,
+  DISCO_MCP_METHOD_NAMES.agentLearningReview,
 ] as const;
 
 function stableValue(value: unknown): unknown {
@@ -102,7 +100,7 @@ function stableCatalogEntries(
   entries: readonly RuntimeCapabilityDefinition[]
 ): RuntimeCapabilityDefinition[] {
   return entries
-    .map(entry => ({
+    .map((entry) => ({
       ...entry,
       audiences: [...entry.audiences].sort(),
       outputKinds: [...entry.outputKinds].sort(),
@@ -152,7 +150,7 @@ export function assertValidRuntimeCapabilities(
 export function buildRuntimeCapabilityCatalog(
   ...sources: ReadonlyArray<readonly RuntimeCapabilityDefinition[]>
 ): RuntimeCapabilityCatalog {
-  const entries = stableCatalogEntries(sources.flatMap(source => [...source]));
+  const entries = stableCatalogEntries(sources.flatMap((source) => [...source]));
   assertValidRuntimeCapabilities(entries);
   const fingerprint = createHash('sha256')
     .update(JSON.stringify({ schemaVersion: 1, entries }))
@@ -333,7 +331,8 @@ export const DISCO_UI_ONLY_RUNTIME_CAPABILITIES: RuntimeCapabilityDefinition[] =
     provider: 'ui-only',
     kind: 'feature',
     exposure: 'ui-only',
-    description: 'View account usage, cost summaries, activity charts, and leaderboards in the Disco UI.',
+    description:
+      'View account usage, cost summaries, activity charts, and leaderboards in the Disco UI.',
     audiences: ['admin', 'ui'],
     ownership: 'current-user',
     outputKinds: ['interactive', 'state'],

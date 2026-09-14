@@ -1,5 +1,5 @@
-import type { AgentID } from './id';
 import type { DiscoSkillLifecycleRecord } from './codex-skill';
+import type { AgentID } from './id';
 
 export type AgentCapabilityKind = 'profile' | 'memory' | 'skill';
 
@@ -33,4 +33,6 @@ export interface AgentMemoryUpsertInput {
   source?: 'user-explicit' | 'agent-inference';
   confidence?: number;
   source_session_id?: string | null;
+  /** Reject replacing a topic changed since it was inspected. */
+  expected_updated_at?: string;
 }

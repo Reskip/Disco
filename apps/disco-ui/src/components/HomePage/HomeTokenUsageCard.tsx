@@ -374,16 +374,19 @@ export function resampleTokenSeries(values: number[], targetPoints: number): num
   });
 }
 
-export function smoothTokenSeries(values: number[], radius = 1): number[] {
-  if (radius <= 0 || values.length < 3) return [...values];
+export function smoothTokenSeries(values: number[], standardDeviation = 2): number[] {
+  if (standardDeviation <= 0 || values.length < 3) return [...values];
+  // A finite Gaussian kernel rounds short bursts; triangular weights turn them into pointed tents.
+  const radius = Math.ceil(standardDeviation * 3);
+  const weights = Array.from({ length: radius * 2 + 1 }, (_, index) =>
+    Math.exp(-0.5 * ((index - radius) / standardDeviation) ** 2)
+  );
+  const weightTotal = weights.reduce((sum, weight) => sum + weight, 0);
   return values.map((_, index) => {
     let weightedTotal = 0;
-    let weightTotal = 0;
     for (let offset = -radius; offset <= radius; offset += 1) {
       const sourceIndex = Math.min(values.length - 1, Math.max(0, index + offset));
-      const weight = radius + 1 - Math.abs(offset);
-      weightedTotal += values[sourceIndex] * weight;
-      weightTotal += weight;
+      weightedTotal += values[sourceIndex] * weights[offset + radius];
     }
     return weightedTotal / weightTotal;
   });
@@ -782,7 +785,7 @@ const RealtimeWaveform: React.FC<{
   const values = useMemo(() => {
     const raw = buildThirtySecondTokenSeries(entries, range === '1h' ? 120 : 2880);
     const display = range === '1h' ? raw : resampleTokenSeries(raw, 144);
-    return smoothTokenSeries(display, range === '1h' ? 2 : 3);
+    return smoothTokenSeries(display);
   }, [entries, range]);
   const width = 520;
   const height = 132;

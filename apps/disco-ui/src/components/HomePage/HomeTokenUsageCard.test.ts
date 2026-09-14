@@ -10,8 +10,8 @@ import {
   buildThirtySecondTokenSeries,
   clearTokenDashboardCacheForTests,
   estimateUserLeaderboardCostsCny,
-  readCachedTokenDashboardData,
   rankingFlipKeyframes,
+  readCachedTokenDashboardData,
   resampleTokenSeries,
   smoothTokenSeries,
   tokenIntensityLevel,
@@ -218,9 +218,11 @@ describe('token dashboard time series', () => {
       outputTokens: 10,
       cacheTokens: 7,
     });
-    expect(
-      aggregateTokenUsageInWindow([recent, older], 24 * 60 * 60 * 1000, now)
-    ).toMatchObject({ inputTokens: 70, outputTokens: 30, cacheTokens: 16 });
+    expect(aggregateTokenUsageInWindow([recent, older], 24 * 60 * 60 * 1000, now)).toMatchObject({
+      inputTokens: 70,
+      outputTokens: 30,
+      cacheTokens: 16,
+    });
   });
 
   it('reduces a full day to a render-efficient curve without dropping usage', () => {
@@ -233,6 +235,49 @@ describe('token dashboard time series', () => {
       raw.reduce((sum, value) => sum + value, 0)
     );
     expect(smoothed).toHaveLength(144);
+  });
+
+  it('rounds an isolated burst instead of producing triangular shoulders', () => {
+    const raw = Array.from({ length: 61 }, (_, index) => (index === 30 ? 100 : 0));
+    const smoothed = smoothTokenSeries(raw);
+    const peak = smoothed[30];
+
+    expect(smoothed[29] / peak).toBeGreaterThan(0.85);
+    expect(smoothed[31] / peak).toBeGreaterThan(0.85);
+    const halfHeightWidth = smoothed.filter((value) => value >= peak / 2).length;
+    expect(halfHeightWidth).toBeGreaterThanOrEqual(5);
+    expect(halfHeightWidth).toBeLessThanOrEqual(7);
+    expect(smoothed.reduce((sum, value) => sum + value, 0)).toBeCloseTo(100);
+    expect(raw[30]).toBe(100);
+  });
+
+  it('keeps two short bursts distinct and leaves the long inactive tail at zero', () => {
+    const raw = Array<number>(120).fill(0);
+    raw[1] = 180_000;
+    raw[2] = 190_000;
+    raw[10] = 240_000;
+    const smoothed = smoothTokenSeries(raw);
+    const peaks = smoothed.filter(
+      (value, index) =>
+        index > 0 &&
+        index < smoothed.length - 1 &&
+        value > smoothed[index - 1] &&
+        value > smoothed[index + 1]
+    );
+
+    expect(peaks).toHaveLength(2);
+    expect(Math.min(...smoothed.slice(5, 9))).toBeLessThan(Math.min(...peaks) * 0.6);
+    expect(smoothed.slice(17).every((value) => value === 0)).toBe(true);
+    expect(smoothed.every((value) => Number.isFinite(value) && value >= 0)).toBe(true);
+  });
+
+  it('keeps constant activity flat at both window edges', () => {
+    expect(smoothTokenSeries([])).toEqual([]);
+    expect(smoothTokenSeries([3])).toEqual([3]);
+    expect(smoothTokenSeries([0, 0, 0])).toEqual([0, 0, 0]);
+    for (const value of smoothTokenSeries(Array<number>(120).fill(500))) {
+      expect(value).toBeCloseTo(500);
+    }
   });
 
   it('uses four non-zero intensity bands', () => {

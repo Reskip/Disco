@@ -7,12 +7,13 @@ import {
   buildDailyTokenCells,
   buildHourlyTokenSeries,
   buildMinuteTokenSeries,
-  buildRealtimeTokenSeries,
   buildThirtySecondTokenSeries,
   clearTokenDashboardCacheForTests,
   estimateUserLeaderboardCostsCny,
   rankingFlipKeyframes,
   readCachedTokenDashboardData,
+  resampleTokenSeries,
+  smoothTokenSeries,
   tokenIntensityLevel,
   weeksForHeatmapWidth,
   writeCachedTokenDashboardData,
@@ -224,35 +225,16 @@ describe('token dashboard time series', () => {
     });
   });
 
-  it.each(['1h', '1d'] as const)(
-    'preserves the exact 30-second usage and idle buckets in %s',
-    (range) => {
-      const now = new Date('2026-08-23T12:42:45.000Z');
-      const entries = [
-        entry('2026-08-23T12:40:00.000Z', 300),
-        entry('2026-08-23T12:41:30.000Z', 900),
-      ];
-      const { values, startTime } = buildRealtimeTokenSeries(entries, range, now);
-      expect(values).toHaveLength(range === '1h' ? 120 : 2880);
-      expect(values.filter((value) => value > 0)).toEqual([300, 900]);
-      expect(values.reduce((sum, value) => sum + value, 0)).toBe(1200);
-      expect(values.at(-6)).toBe(300);
-      expect(values.at(-3)).toBe(900);
-      expect(startTime + (values.length - 1) * 30_000).toBe(Date.parse('2026-08-23T12:42:30.000Z'));
-    }
-  );
+  it('reduces a full day to a render-efficient curve without dropping usage', () => {
+    const raw = Array.from({ length: 2880 }, (_, index) => (index % 20 === 0 ? 5 : 0));
+    const sampled = resampleTokenSeries(raw, 144);
+    const smoothed = smoothTokenSeries(sampled, 2);
 
-  it('does not change preceding buckets when a later burst arrives', () => {
-    const now = new Date('2026-08-23T12:42:45.000Z');
-    const entries = [entry('2026-08-23T12:30:00.000Z', 300)];
-    const before = buildRealtimeTokenSeries(entries, '1d', now);
-    const after = buildRealtimeTokenSeries(
-      [...entries, entry('2026-08-23T12:42:30.000Z', 900)],
-      '1d',
-      now
+    expect(sampled).toHaveLength(144);
+    expect(sampled.reduce((sum, value) => sum + value, 0)).toBe(
+      raw.reduce((sum, value) => sum + value, 0)
     );
-    expect(after.values.slice(0, -1)).toEqual(before.values.slice(0, -1));
-    expect(after.values.at(-1)).toBe(900);
+    expect(smoothed).toHaveLength(144);
   });
 
   it('uses four non-zero intensity bands', () => {

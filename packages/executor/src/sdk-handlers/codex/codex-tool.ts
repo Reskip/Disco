@@ -18,7 +18,7 @@ import type {
   SessionRepository,
   UsersRepository,
 } from '../../db/feathers-repositories.js';
-import { truncateContentIfNeeded } from '../../services/tool-result-truncator.js';
+import { prepareToolTranscript } from '../../services/tool-transcript.js';
 import type { NormalizedSdkResponse, RawSdkResponse } from '../../types/sdk-response.js';
 import type { TokenUsage } from '../../types/token-usage.js';
 import {
@@ -680,19 +680,16 @@ export class CodexTool implements ITool {
           clearToolInvocationState(event.toolUse.id, snapshotContext);
           pendingSnapshotToolIds.delete(event.toolUse.id);
 
-          // Truncate oversized tool results before persisting
-          const toolUseRefs = [
-            { id: event.toolUse.id, name: event.toolUse.name, input: event.toolUse.input },
-          ];
-          const { blocks: safeToolContent } = truncateContentIfNeeded(toolContent, toolUseRefs);
-
           const existingToolMessageId = pendingToolMessageIds.get(event.toolUse.id);
           if (existingToolMessageId) {
-            await this.messagesService?.patch(existingToolMessageId, {
-              content: safeToolContent as Message['content'],
-              content_preview:
-                typeof toolResultContent === 'string' ? toolResultContent.substring(0, 200) : '',
-            });
+            await this.messagesService?.patch(
+              existingToolMessageId,
+              prepareToolTranscript({
+                content: toolContent as Message['content'],
+                content_preview:
+                  typeof toolResultContent === 'string' ? toolResultContent.substring(0, 200) : '',
+              })
+            );
             pendingToolMessageIds.delete(event.toolUse.id);
           } else {
             // Fallback path if start event wasn't observed.
@@ -700,7 +697,7 @@ export class CodexTool implements ITool {
             await this.createAssistantMessage(
               sessionId,
               toolMessageId,
-              safeToolContent as Array<{
+              toolContent as Array<{
                 type: string;
                 text?: string;
                 id?: string;
@@ -727,7 +724,7 @@ export class CodexTool implements ITool {
           // Filter out tool_use and tool_result blocks (already saved via tool_complete events),
           // but keep text + thinking blocks so Codex reasoning is visible in the UI.
           const nonToolContent = event.content.filter(
-            block =>
+            (block) =>
               block.type === 'text' || block.type === 'thinking' || block.type === 'file_citation'
           );
 
@@ -735,12 +732,12 @@ export class CodexTool implements ITool {
           if (nonToolContent.length > 0) {
             // Extract full text for streaming callback
             const fullText = nonToolContent
-              .filter(block => block.type === 'text')
-              .map(block => (block as { text?: string }).text || '')
+              .filter((block) => block.type === 'text')
+              .map((block) => (block as { text?: string }).text || '')
               .join('');
             const fullThinking = nonToolContent
-              .filter(block => block.type === 'thinking')
-              .map(block => (block as { text?: string }).text || '')
+              .filter((block) => block.type === 'thinking')
+              .map((block) => (block as { text?: string }).text || '')
               .join('');
 
             // Use existing message ID from streaming (if any) or generate new
@@ -868,7 +865,7 @@ export class CodexTool implements ITool {
     const deadline = Date.now() + 15_000;
     let handler = this.activeSteerHandlers.get(sessionId);
     while (!handler && Date.now() < deadline) {
-      await new Promise(resolve => setTimeout(resolve, 25));
+      await new Promise((resolve) => setTimeout(resolve, 25));
       handler = this.activeSteerHandlers.get(sessionId);
     }
     if (!handler) throw new Error('Codex turn is not ready to receive supplemental guidance');
@@ -925,11 +922,11 @@ export class CodexTool implements ITool {
     tokenUsage?: TokenUsage
   ): Promise<Message> {
     // Extract preview text (prefer normal text, then thinking text)
-    const textBlocks = content.filter(b => b.type === 'text').map(b => b.text || '');
+    const textBlocks = content.filter((b) => b.type === 'text').map((b) => b.text || '');
     const fullTextContent = textBlocks.join('');
     const fallbackThinking = content
-      .filter(b => b.type === 'thinking')
-      .map(b => b.text || '')
+      .filter((b) => b.type === 'thinking')
+      .map((b) => b.text || '')
       .join('');
     const contentPreview = (fullTextContent || fallbackThinking).substring(0, 200);
 
@@ -947,10 +944,11 @@ export class CodexTool implements ITool {
       metadata: buildAssistantMessageMetadata({ model: resolvedModel, tokenUsage }),
     };
 
-    await this.messagesService?.create(message);
+    const prepared = prepareToolTranscript(message);
+    await this.messagesService?.create(prepared);
     await patchTaskModelIfKnown(this.tasksService, taskId, resolvedModel);
 
-    return message;
+    return prepared;
   }
 
   /**

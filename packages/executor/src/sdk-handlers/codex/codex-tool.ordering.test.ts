@@ -1,6 +1,8 @@
+import type { DiscoClient } from '@disco/core/api';
 import type { Message } from '@disco/core/types';
 import { describe, expect, it, vi } from 'vitest';
 import type { MessagesRepository, SessionRepository } from '../../db/feathers-repositories.js';
+import { registerExecutorClientHooks } from '../../services/feathers-client.js';
 import type { MessagesService, TasksService } from '../base/index.js';
 import { appendCodexTokenUsageSample, CodexTool } from './codex-tool.js';
 import type { CodexStreamEvent } from './prompt-service.js';
@@ -73,6 +75,68 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 describe('CodexTool ordered transcript persistence', () => {
+  it('continues past a large skill input and result through the real transport guard', async () => {
+    let guard!: (context: Record<string, unknown>) => Promise<unknown>;
+    registerExecutorClientHooks({
+      hooks(config: { before: { all: (typeof guard)[] } }) {
+        guard = config.before.all[0];
+      },
+    } as unknown as DiscoClient);
+    const written: Array<Partial<Message>> = [];
+    const messagesService: MessagesService = {
+      create: vi.fn(async (data: Partial<Message>) => {
+        await guard({ path: 'messages', method: 'create', data });
+        written.push(data);
+        return data as Message;
+      }),
+      patch: vi.fn(async (_id: string, data: Partial<Message>) => {
+        await guard({ path: 'messages', method: 'patch', data });
+        written.push(data);
+        return data as Message;
+      }),
+    };
+    const tool = new CodexTool(
+      {
+        findInitialUserMessagesByTaskId: vi.fn().mockResolvedValue([]),
+        getNextIndexBySessionId: vi.fn().mockResolvedValue(0),
+      } as unknown as MessagesRepository,
+      {
+        findById: vi.fn().mockResolvedValue(null),
+        update: vi.fn().mockResolvedValue(undefined),
+      } as unknown as SessionRepository,
+      undefined,
+      undefined,
+      messagesService
+    );
+    const input = {
+      tool_name: 'disco_skills_install',
+      arguments: { files: [{ content: 'x'.repeat(475_000) }] },
+    };
+    const output = '工具结果😀\n'.repeat(100_000);
+    const invocation = { id: 'large-skill', name: 'disco.disco_execute_tool', input };
+    const promptService = {
+      async *promptSessionStreaming(): AsyncGenerator<CodexStreamEvent> {
+        yield { type: 'tool_start', toolUse: invocation };
+        yield { type: 'tool_complete', toolUse: { ...invocation, output, status: 'completed' } };
+        yield { type: 'complete', content: [{ type: 'text', text: '任务继续并完成。' }] };
+      },
+    };
+    (tool as unknown as { promptService: typeof promptService }).promptService = promptService;
+    await tool.executePromptWithStreaming(
+      '018f0000-0000-7000-8000-000000000051' as never,
+      '大技能参数回归',
+      '018f0000-0000-7000-8000-000000000052' as never
+    );
+    expect(written.some((record) => record.content_preview === '任务继续并完成。')).toBe(true);
+    const start = written.find(
+      (record) => Array.isArray(record.content) && record.content[0]?.id === invocation.id
+    );
+    expect(start?.tool_uses).toBeUndefined();
+    expect(Array.isArray(start?.content) && start.content[0]?.input).toBe(input);
+    expect(invocation.input.arguments.files[0].content).toHaveLength(475_000);
+    expect(output).not.toContain('truncated');
+  });
+
   it('shows one localized retry status and removes it after the provider recovers', async () => {
     const created: Array<Partial<Message>> = [];
     const removed: string[] = [];
@@ -99,13 +163,7 @@ describe('CodexTool ordered transcript persistence', () => {
       findById: vi.fn().mockResolvedValue(null),
       update: vi.fn().mockResolvedValue(undefined),
     } as unknown as SessionRepository;
-    const tool = new CodexTool(
-      messagesRepo,
-      sessionsRepo,
-      undefined,
-      undefined,
-      messagesService
-    );
+    const tool = new CodexTool(messagesRepo, sessionsRepo, undefined, undefined, messagesService);
     const promptService = {
       async *promptSessionStreaming(): AsyncGenerator<CodexStreamEvent> {
         yield { type: 'capacity_retry', attempt: 1, maxAttempts: 5, delayMs: 1_000 };
@@ -126,10 +184,8 @@ describe('CodexTool ordered transcript persistence', () => {
       '018f0000-0000-7000-8000-000000000032' as never
     );
 
-    const retryMessage = created.find(message => message.content_preview?.includes('重试 1/5'));
-    expect(retryMessage?.content).toEqual([
-      { type: 'thinking', text: '模型繁忙，正在重试 1/5' },
-    ]);
+    const retryMessage = created.find((message) => message.content_preview?.includes('重试 1/5'));
+    expect(retryMessage?.content).toEqual([{ type: 'thinking', text: '模型繁忙，正在重试 1/5' }]);
     expect(patches).toContainEqual({
       id: retryMessage?.message_id,
       data: {
@@ -138,7 +194,7 @@ describe('CodexTool ordered transcript persistence', () => {
       },
     });
     expect(removed).toEqual([retryMessage?.message_id]);
-    expect(created.some(message => message.content_preview === '恢复后完成。')).toBe(true);
+    expect(created.some((message) => message.content_preview === '恢复后完成。')).toBe(true);
   });
 
   it('keeps one durable retry projection on the same task so a refresh can hydrate it', async () => {
@@ -173,13 +229,7 @@ describe('CodexTool ordered transcript persistence', () => {
       findById: vi.fn().mockResolvedValue(null),
       update: vi.fn().mockResolvedValue(undefined),
     } as unknown as SessionRepository;
-    const tool = new CodexTool(
-      messagesRepo,
-      sessionsRepo,
-      undefined,
-      undefined,
-      messagesService
-    );
+    const tool = new CodexTool(messagesRepo, sessionsRepo, undefined, undefined, messagesService);
     const promptService = {
       async *promptSessionStreaming(): AsyncGenerator<CodexStreamEvent> {
         yield { type: 'capacity_retry', attempt: 1, maxAttempts: 5, delayMs: 1_000 };
@@ -230,8 +280,7 @@ describe('CodexTool ordered transcript persistence', () => {
     ).toHaveLength(0);
     expect(
       Array.from(persisted.values()).some(
-        (message) =>
-          message.task_id === taskId && message.content_preview === '恢复后完成。'
+        (message) => message.task_id === taskId && message.content_preview === '恢复后完成。'
       )
     ).toBe(true);
   });
@@ -253,13 +302,7 @@ describe('CodexTool ordered transcript persistence', () => {
       findById: vi.fn().mockResolvedValue(null),
       update: vi.fn().mockResolvedValue(undefined),
     } as unknown as SessionRepository;
-    const tool = new CodexTool(
-      messagesRepo,
-      sessionsRepo,
-      undefined,
-      undefined,
-      messagesService
-    );
+    const tool = new CodexTool(messagesRepo, sessionsRepo, undefined, undefined, messagesService);
     const promptService = {
       async *promptSessionStreaming(): AsyncGenerator<CodexStreamEvent> {
         yield { type: 'context_compacted', threadId: 'thread-1' };
@@ -278,7 +321,7 @@ describe('CodexTool ordered transcript persistence', () => {
       '018f0000-0000-7000-8000-000000000022' as never
     );
 
-    expect(created.map(message => ({ type: message.type, index: message.index }))).toEqual([
+    expect(created.map((message) => ({ type: message.type, index: message.index }))).toEqual([
       { type: 'user', index: 0 },
       { type: 'system', index: 1 },
       { type: 'assistant', index: 2 },
@@ -337,13 +380,7 @@ describe('CodexTool ordered transcript persistence', () => {
     const sessionsRepo = {
       findById: vi.fn().mockResolvedValue(null),
     } as unknown as SessionRepository;
-    const tool = new CodexTool(
-      messagesRepo,
-      sessionsRepo,
-      undefined,
-      undefined,
-      messagesService
-    );
+    const tool = new CodexTool(messagesRepo, sessionsRepo, undefined, undefined, messagesService);
     const events: CodexStreamEvent[] = [
       {
         type: 'tool_start',
@@ -500,8 +537,8 @@ describe('CodexTool ordered transcript persistence', () => {
       .mocked(tasksService.patch)
       .mock.calls.filter(([, data]) => 'normalized_sdk_response' in data);
     expect(usagePatches).toHaveLength(2);
-    expect(usagePatches.map(([, data]) => data.normalized_sdk_response.tokenUsage.totalTokens)).toEqual([
-      110, 310,
-    ]);
+    expect(
+      usagePatches.map(([, data]) => data.normalized_sdk_response.tokenUsage.totalTokens)
+    ).toEqual([110, 310]);
   });
 });

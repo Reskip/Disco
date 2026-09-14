@@ -20,7 +20,8 @@
  *
  * Critical security invariant: the `applySubmit` handler is the ONLY place
  * the raw submit body reaches; from `result_meta` onward, no
- * caller-supplied values flow back into the agent context. See §5.1 of the
+ * submitted secrets flow back into the agent context. Ordinary question answers
+ * intentionally travel in result_meta. See §5.1 of the
  * design doc for the path-by-path enumeration.
  */
 

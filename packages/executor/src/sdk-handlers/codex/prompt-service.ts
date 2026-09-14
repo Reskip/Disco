@@ -284,6 +284,8 @@ ${options.agentSession ? `使用 Disco 托管记忆方法；不要通过 Shell �
 
 向用户交付本地文件时，使用 Disco 托管文件发布方法。只有该操作成功返回的文件才算已交付；仅在回复中写文件名或路径不算发送。
 
+需要补充信息或选择时，用 ${DISCO_MCP_METHOD_NAMES.askQuestions} 显示提问卡片，不用原生 request_user_input / AskUserQuestion。返回等待状态不代表作答或批准；继续独立工作，依赖答案时结束本轮，用户提交后自动继续。勿重复列题，凭据用环境变量表单。
+
 Windows PowerShell 读写文本时显式指定 UTF-8。
 
 具体方法名和输入结构以当前 Disco 工具目录为准。`;
@@ -452,6 +454,23 @@ function methodFailureIdentity(toolUse: CompletedToolUse): { key: string; displa
       : undefined;
   const displayName = nestedName ?? toolUse.name;
   const methodInput = nestedName ? (toolUse.input.arguments ?? {}) : toolUse.input;
+  // A corrected summary completes the same review even when its payload differs.
+  // Keep task and phase separate: inspecting or reviewing another task cannot
+  // recover a failed complete. Other methods still require identical arguments.
+  if (
+    (nestedName ?? operation) === DISCO_MCP_METHOD_NAMES.agentLearningReview &&
+    methodInput &&
+    typeof methodInput === 'object' &&
+    'taskId' in methodInput &&
+    typeof methodInput.taskId === 'string' &&
+    'phase' in methodInput &&
+    (methodInput.phase === 'inspect' || methodInput.phase === 'complete')
+  ) {
+    return {
+      key: `${DISCO_MCP_METHOD_NAMES.agentLearningReview}\u0000${methodInput.taskId}\u0000${methodInput.phase}`,
+      displayName: DISCO_MCP_METHOD_NAMES.agentLearningReview,
+    };
+  }
   return {
     key: `${displayName}\u0000${JSON.stringify(methodInput)}`,
     displayName,
@@ -459,7 +478,7 @@ function methodFailureIdentity(toolUse: CompletedToolUse): { key: string; displa
 }
 
 export function unrecoveredMethodFailureNames(toolUses: ReadonlyArray<CompletedToolUse>): string[] {
-  const recovered = new Set<string>();
+  const settled = new Set<string>();
   const failures = new Map<string, string>();
   for (let index = toolUses.length - 1; index >= 0; index -= 1) {
     const toolUse = toolUses[index]!;
@@ -469,15 +488,16 @@ export function unrecoveredMethodFailureNames(toolUses: ReadonlyArray<CompletedT
     // assistant prose.
     if (!toolUse.name.includes('.')) continue;
     const { key, displayName } = methodFailureIdentity(toolUse);
+    if (settled.has(key)) continue;
     if (toolUse.status === 'failed' || toolUse.status === 'error') {
-      if (!recovered.has(key) && /^[\w.:-]{1,120}$/u.test(displayName)) {
+      settled.add(key);
+      if (/^[\w.:-]{1,120}$/u.test(displayName)) {
         failures.set(key, displayName);
       }
       continue;
     }
     if (toolUse.status && toolUse.status !== 'started' && toolUse.status !== 'in_progress') {
-      recovered.add(key);
-      failures.delete(key);
+      settled.add(key);
     }
   }
   return [...new Set(failures.values())].sort().slice(0, 5);

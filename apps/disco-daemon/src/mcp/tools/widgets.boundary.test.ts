@@ -178,6 +178,25 @@ describe('widget MCP/service boundary', () => {
     vi.mocked(appendSystemMessage).mockClear();
   });
 
+  it('creates question cards through MCP with tenant context and the final task binding', async () => {
+    const fixture = makeBoundaryApp();
+    const result = await callThroughMcp(fixture.app, 'disco_ask_questions', {
+      questions: [
+        { id: 'mode', question: '选择哪种方案？', options: [{ label: 'A' }, { label: 'B' }] },
+      ],
+    });
+    const response = JSON.parse(result.content[0].text);
+    expect(response.status).toBe('waiting_for_user');
+    expect(fixture.rows.get(response.widget_id)).toMatchObject({
+      task_id: 'task-host-1',
+      session_id: 'sess-1',
+      metadata: {
+        widget: { widget_id: response.widget_id, widget_type: 'questions', status: 'pending' },
+      },
+    });
+    expect(fixture.createdEvents).toHaveLength(1);
+  });
+
   it('creates env widgets with their final ID through the real message boundary', async () => {
     const fixture = makeBoundaryApp();
     const result = await callThroughMcp(fixture.app, 'disco_widgets_request_env_vars', {

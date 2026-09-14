@@ -2,8 +2,8 @@
  * Widget Types
  *
  * In-conversation interactive widgets — small UI primitives that agents
- * render inline in a session's transcript to capture user input without that
- * input ever entering the LLM's context.
+ * render inline in a session's transcript. Credential widgets keep values
+ * outside the LLM context; ordinary question cards return the user's answers.
  *
  * Architecture lives in `docs/internal/in-conversation-widgets-design-2026-05-19.md`.
  * The MCP tool fires and returns; the widget message persists in the
@@ -12,6 +12,28 @@
  */
 
 import type { MessageID, UserID } from './id';
+
+/** Ordinary clarification answers are intentionally returned to the agent. */
+export interface UserQuestion {
+  id: string;
+  question: string;
+  header?: string;
+  options?: Array<{ label: string; description?: string }>;
+  multiSelect?: boolean;
+}
+
+export interface QuestionsParams {
+  questions: UserQuestion[];
+}
+
+export interface QuestionAnswer {
+  selected: string[];
+  text: string;
+}
+
+export interface QuestionsResult {
+  answers: Record<string, QuestionAnswer>;
+}
 
 /** Lifecycle status of a widget request. */
 export type WidgetStatus = 'pending' | 'resolving' | 'submitted' | 'dismissed' | 'already_present';

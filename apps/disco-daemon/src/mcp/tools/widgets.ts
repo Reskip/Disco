@@ -39,6 +39,7 @@ import {
 import type { McpContext } from '../server.js';
 import { sessionContextRequiredResult, textResult } from '../server.js';
 import { runWithMcpTenantDatabaseScope } from '../tenant-scope.js';
+import { registerQuestionTools } from './questions.js';
 
 /**
  * Build a short, user-visible message body for the widget transcript row.
@@ -70,6 +71,7 @@ function allNamesPresentInScope(
 }
 
 export function registerWidgetTools(server: McpServer, ctx: McpContext): void {
+  registerQuestionTools(server, ctx);
   server.registerTool(
     'disco_widgets_request_env_vars',
     {

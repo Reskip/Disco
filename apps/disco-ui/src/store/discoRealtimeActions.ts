@@ -1,5 +1,6 @@
 import type { MCPServer, Session, User } from '@disco-live/client';
 import { clearComposerAttachmentDrafts } from '../components/SessionPanel/composerAttachmentStore';
+import { clearQuestionDrafts } from '../components/Widgets/questionDrafts';
 import { replaceIfChanged } from './discoMaps';
 import { type DiscoState, discoStore } from './discoStore';
 
@@ -13,6 +14,7 @@ export const sessionPatched = sessionCreated;
 
 export function sessionRemoved(session: Session): void {
   clearComposerAttachmentDrafts(session.session_id);
+  clearQuestionDrafts(session.session_id);
   setMap('sessionById', (previous) => {
     if (!previous.has(session.session_id)) return previous;
     const next = new Map(previous);

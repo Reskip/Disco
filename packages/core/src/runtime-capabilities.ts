@@ -76,6 +76,7 @@ export const DISCO_MCP_METHOD_NAMES = {
   skillsInstall: 'disco_skills_install',
   agentMemorySave: 'disco_agent_memory_save',
   agentLearningReview: 'disco_agent_learning_review',
+  askQuestions: 'disco_ask_questions',
 } as const;
 
 /** Product-critical managed operations that must never become ghost methods. */
@@ -84,6 +85,7 @@ export const REQUIRED_DISCO_MANAGED_METHOD_NAMES = [
   DISCO_MCP_METHOD_NAMES.skillsInstall,
   DISCO_MCP_METHOD_NAMES.agentMemorySave,
   DISCO_MCP_METHOD_NAMES.agentLearningReview,
+  DISCO_MCP_METHOD_NAMES.askQuestions,
 ] as const;
 
 function stableValue(value: unknown): unknown {

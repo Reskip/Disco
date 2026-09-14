@@ -472,6 +472,72 @@ describe('Codex generated output discovery', () => {
     ).toEqual([]);
   });
 
+  it('recognizes a corrected learning summary as a retry of the same task and phase', () => {
+    const failed = {
+      id: 'review-first',
+      name: 'disco.disco_execute_tool',
+      status: 'failed',
+      input: {
+        tool_name: 'disco_agent_learning_review',
+        arguments: { taskId: 'task-a', phase: 'complete', memoryDecision: 'saved' },
+      },
+      output: 'Memory consolidation is due',
+    };
+    const success = {
+      ...failed,
+      id: 'review-retry',
+      status: 'completed',
+      output: '{"reviewed":true}',
+      input: {
+        ...failed.input,
+        arguments: {
+          taskId: 'task-a',
+          phase: 'complete',
+          memoryDecision: 'consolidated',
+          consolidation: { content: 'summary' },
+        },
+      },
+    };
+    expect(unrecoveredMethodFailureNames([failed, success])).toEqual([]);
+    expect(unrecoveredMethodFailureNames([success, failed])).toEqual([
+      'disco_agent_learning_review',
+    ]);
+    expect(
+      unrecoveredMethodFailureNames([
+        failed,
+        {
+          ...success,
+          input: { ...success.input, arguments: { taskId: 'task-a', phase: 'inspect' } },
+        },
+      ])
+    ).toEqual(['disco_agent_learning_review']);
+    expect(
+      unrecoveredMethodFailureNames([
+        failed,
+        {
+          ...success,
+          input: { ...success.input, arguments: { taskId: 'task-b', phase: 'complete' } },
+        },
+      ])
+    ).toEqual(['disco_agent_learning_review']);
+  });
+
+  it('does not use an earlier success to hide a later failed method call', () => {
+    const use = {
+      id: 'one',
+      name: 'github.get_repository',
+      input: { owner: 'reskip', repo: 'Disco' },
+      output: 'ok',
+      status: 'completed',
+    };
+    expect(
+      unrecoveredMethodFailureNames([
+        use,
+        { ...use, id: 'two', output: 'forbidden', status: 'failed' },
+      ])
+    ).toEqual(['github.get_repository']);
+  });
+
   it('adds a final truth notice for an unrecovered method failure', () => {
     const content = [{ type: 'text', text: '仓库信息已读取。' }];
     appendVerifiedToolOutcomeNotices({
@@ -2513,7 +2579,7 @@ describe('CodexPromptService - event_msg terminal handling (issue #1749)', () =>
         )
     );
     expect(final).toBeDefined();
-    const visibleText = (final?.content as Array<{ type?: string; text?: string }>)
+    const visibleText = ((final?.content ?? []) as Array<{ type?: string; text?: string }>)
       .filter((block) => block.type === 'text')
       .map((block) => block.text ?? '')
       .join('\n');

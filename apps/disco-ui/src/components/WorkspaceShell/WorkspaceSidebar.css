@@ -318,6 +318,7 @@
 }
 
 .disco-workspace-account {
+  position: relative;
   flex: 0 0 auto;
   padding: 8px 10px 10px;
   border-top: 1px solid var(--ant-color-border-secondary);
@@ -391,14 +392,9 @@
   }
 }
 
-.disco-workspace-mobile-account-menu {
-  width: calc(min(calc(var(--disco-effective-vw, 100vw) * 0.88), 340px) - 20px);
-  max-width: calc(var(--disco-effective-vw, 100vw) - 32px);
-}
-
-.disco-workspace-mobile-account-menu .ant-dropdown-menu,
-.disco-workspace-mobile-account-menu .ant-dropdown-menu-item {
-  width: 100%;
+.disco-workspace-account-menu {
+  /* The local account container shares the sidebar's responsive width and zoom. */
+  width: calc(100% - 20px);
 }
 
 @media (hover: none), (pointer: coarse) {

@@ -17,6 +17,7 @@ import type { Agent, Session, User } from '@disco-live/client';
 import {
   Avatar,
   Button,
+  ConfigProvider,
   Dropdown,
   Input,
   Modal,
@@ -26,6 +27,7 @@ import {
   theme,
 } from 'antd';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useOptionalTheme } from '../../contexts/ThemeContext';
 import { useDiscoStore } from '../../store/discoStore';
 import { selectSessionById } from '../../store/selectors';
 import { getDiscoPortalContainer } from '../../utils/portalContainer';
@@ -284,6 +286,7 @@ export const WorkspaceSidebar: React.FC<WorkspaceSidebarProps> = ({
   onLogout,
 }) => {
   const { token } = theme.useToken();
+  const isDark = useOptionalTheme()?.isDark ?? false;
   const sessionById = useDiscoStore(selectSessionById);
   const [collapsedAgents, setCollapsedAgents] = useState<Set<string>>(() => new Set());
   const [collapsedStandalone, setCollapsedStandalone] = useState(false);
@@ -730,49 +733,79 @@ export const WorkspaceSidebar: React.FC<WorkspaceSidebarProps> = ({
       </div>
 
       <div className="disco-workspace-account">
-        <Dropdown
-          trigger={['click']}
-          placement="topLeft"
-          overlayClassName={mobile ? 'disco-workspace-mobile-account-menu' : undefined}
-          menu={{
-            items: mobile
-              ? [{ key: 'logout', icon: <LogoutOutlined />, label: '退出登录', danger: true }]
-              : [
-                  { key: 'settings', icon: <SettingOutlined />, label: '设置' },
-                  { type: 'divider' },
-                  { key: 'logout', icon: <LogoutOutlined />, label: '退出登录', danger: true },
-                ],
-            onClick: ({ key }) => {
-              if (key === 'settings') onOpenSettings();
-              if (key === 'logout') onLogout?.();
+        <ConfigProvider
+          theme={{
+            components: {
+              Dropdown: isDark
+                ? {
+                    // Keep the destructive action readable on the lifted surface and on hover.
+                    colorError: `color-mix(in srgb, ${token.colorErrorTextHover}, ${token.colorText})`,
+                    colorTextLightSolid: token.colorBgContainer,
+                  }
+                : {},
             },
           }}
         >
-          <Button
-            type="text"
-            block={!mobile}
-            className={`disco-workspace-account-button${mobile ? ' is-mobile' : ''}`}
-            aria-label={mobile ? '打开账号菜单' : undefined}
+          <Dropdown
+            trigger={['click']}
+            placement="topLeft"
+            getPopupContainer={(trigger) => trigger.parentElement ?? getDiscoPortalContainer()}
+            classNames={{
+              root: `disco-workspace-account-menu${mobile ? ' disco-workspace-mobile-account-menu' : ''}`,
+            }}
+            styles={{ item: { minHeight: mobile ? 44 : token.controlHeightLG } }}
+            menu={{
+              style: {
+                // Lift this surface above the sidebar without changing other dropdowns.
+                background: isDark
+                  ? `linear-gradient(${token.colorFillSecondary}, ${token.colorFillSecondary}), ${token.colorBgElevated}`
+                  : token.colorBgElevated,
+                border: `${token.lineWidth}px solid ${token.colorBorder}`,
+                boxShadow: token.boxShadow,
+                padding: token.paddingXS,
+              },
+              items: mobile
+                ? [{ key: 'logout', icon: <LogoutOutlined />, label: '退出登录', danger: true }]
+                : [
+                    { key: 'settings', icon: <SettingOutlined />, label: '设置' },
+                    { type: 'divider' },
+                    { key: 'logout', icon: <LogoutOutlined />, label: '退出登录', danger: true },
+                  ],
+              onClick: ({ key }) => {
+                if (key === 'settings') onOpenSettings();
+                if (key === 'logout') onLogout?.();
+              },
+            }}
           >
-            <Avatar
-              size={28}
-              src={currentUser?.avatar_url || undefined}
-              style={{ background: token.colorFillSecondary, color: token.colorText }}
+            <Button
+              type="text"
+              block={!mobile}
+              className={`disco-workspace-account-button${mobile ? ' is-mobile' : ''}`}
+              aria-label={mobile ? '打开账号菜单' : undefined}
             >
-              {!currentUser?.avatar_url && (currentUser?.emoji || <UserOutlined />)}
-            </Avatar>
-            {!mobile && (
-              <span style={{ minWidth: 0, textAlign: 'left' }}>
-                <Typography.Text ellipsis style={{ display: 'block', maxWidth: 170, fontSize: 13 }}>
-                  {currentUser?.name || currentUser?.username || '用户'}
-                </Typography.Text>
-                <Typography.Text type="secondary" className="disco-workspace-account-caption">
-                  账号与设置
-                </Typography.Text>
-              </span>
-            )}
-          </Button>
-        </Dropdown>
+              <Avatar
+                size={28}
+                src={currentUser?.avatar_url || undefined}
+                style={{ background: token.colorFillSecondary, color: token.colorText }}
+              >
+                {!currentUser?.avatar_url && (currentUser?.emoji || <UserOutlined />)}
+              </Avatar>
+              {!mobile && (
+                <span style={{ minWidth: 0, textAlign: 'left' }}>
+                  <Typography.Text
+                    ellipsis
+                    style={{ display: 'block', maxWidth: 170, fontSize: 13 }}
+                  >
+                    {currentUser?.name || currentUser?.username || '用户'}
+                  </Typography.Text>
+                  <Typography.Text type="secondary" className="disco-workspace-account-caption">
+                    账号与设置
+                  </Typography.Text>
+                </span>
+              )}
+            </Button>
+          </Dropdown>
+        </ConfigProvider>
       </div>
 
       <Modal

@@ -1,5 +1,5 @@
-import type { DiscoClient, LeaderboardEntry, TokenPricingPreferences } from '@disco-live/client';
 import { ReloadOutlined } from '@ant-design/icons';
+import type { DiscoClient, LeaderboardEntry, TokenPricingPreferences } from '@disco-live/client';
 import { Avatar, Button, Card, Empty, Segmented, Tooltip, Typography, theme } from 'antd';
 import type React from 'react';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
@@ -7,6 +7,7 @@ import { useLocale } from '../../contexts/LocaleContext';
 import { useDiscoStore } from '../../store/discoStore';
 import { formatTokenCount } from '../../utils/formatTokenCount';
 import { estimateEntriesCostCny, formatEstimatedCny } from '../../utils/tokenPricing';
+import { buildTokenWaveform } from './tokenWaveform';
 
 const { Text } = Typography;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -199,7 +200,7 @@ export function aggregateTokenUsageInWindow(
   const end = now.getTime();
   const start = end - durationMs;
   return aggregateTokenUsage(
-    entries.filter(entry => {
+    entries.filter((entry) => {
       if (!entry.bucket) return false;
       const timestamp = new Date(entry.bucket).getTime();
       return Number.isFinite(timestamp) && timestamp >= start && timestamp <= end;
@@ -540,7 +541,7 @@ const TokenHeatmap: React.FC<{
               lineHeight: '14px',
             }}
           >
-            {monthLabels.map(month => (
+            {monthLabels.map((month) => (
               <span
                 key={month.date.toISOString()}
                 style={{
@@ -564,7 +565,7 @@ const TokenHeatmap: React.FC<{
               gap: HEATMAP_CELL_GAP,
             }}
           >
-            {cells.map(cell =>
+            {cells.map((cell) =>
               cell.future ? (
                 <span
                   key={cell.dateKey}
@@ -619,7 +620,7 @@ const TokenHeatmap: React.FC<{
         <Text type="secondary" style={{ fontSize: 10 }}>
           {t('less')}
         </Text>
-        {colors.map(color => (
+        {colors.map((color) => (
           <span
             key={color}
             aria-hidden
@@ -644,7 +645,7 @@ const ModelUsageList: React.FC<{
   const rankedEntries = useMemo(
     () =>
       entries
-        .filter(entry => Boolean(entry.model?.trim()) && entry.totalTokens > 0)
+        .filter((entry) => Boolean(entry.model?.trim()) && entry.totalTokens > 0)
         .sort((left, right) => {
           const tokenDifference = right.totalTokens - left.totalTokens;
           if (tokenDifference !== 0) return tokenDifference;
@@ -781,26 +782,16 @@ const RealtimeWaveform: React.FC<{
   const values = useMemo(() => {
     const raw = buildThirtySecondTokenSeries(entries, range === '1h' ? 120 : 2880);
     const display = range === '1h' ? raw : resampleTokenSeries(raw, 144);
-    return smoothTokenSeries(display, range === '1h' ? 1 : 2);
+    return smoothTokenSeries(display, range === '1h' ? 2 : 3);
   }, [entries, range]);
-  const max = Math.max(1, ...values);
   const width = 520;
   const height = 132;
   const padding = 10;
-  const points = values.map((value, index) => {
-    const x = padding + (index / Math.max(1, values.length - 1)) * (width - padding * 2);
-    const normalized = value <= 0 ? 0 : Math.log1p(value) / Math.log1p(max);
-    const y = height - padding - normalized * (height - padding * 2);
-    return { x, y, value };
-  });
-  const path = points.reduce((result, point, index) => {
-    if (index === 0) return `M ${point.x} ${point.y}`;
-    const previous = points[index - 1];
-    const controlX = (previous.x + point.x) / 2;
-    return `${result} C ${controlX} ${previous.y}, ${controlX} ${point.y}, ${point.x} ${point.y}`;
-  }, '');
-  const area = `${path} L ${width - padding} ${height - padding} L ${padding} ${height - padding} Z`;
-  const active = values.some(value => value > 0);
+  const { points, path, area } = useMemo(
+    () => buildTokenWaveform(values, width, height, padding),
+    [values]
+  );
+  const active = values.some((value) => value > 0);
   const hoverPoint = hoverIndex === null ? undefined : points[hoverIndex];
   const hoverTime =
     hoverIndex === null
@@ -832,7 +823,7 @@ const RealtimeWaveform: React.FC<{
             size="middle"
             shape="round"
             value={range}
-            onChange={value => setRange(value as '1h' | '1d')}
+            onChange={(value) => setRange(value as '1h' | '1d')}
             options={[
               {
                 label: <span style={{ display: 'inline-block', minWidth: 28 }}>1h</span>,
@@ -866,7 +857,7 @@ const RealtimeWaveform: React.FC<{
           viewBox={`0 0 ${width} ${height}`}
           preserveAspectRatio="none"
           style={{ display: 'block', width: '100%', height: '100%', cursor: 'crosshair' }}
-          onMouseMove={event => {
+          onMouseMove={(event) => {
             const bounds = event.currentTarget.getBoundingClientRect();
             const ratio = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width));
             setHoverIndex(Math.round(ratio * Math.max(0, values.length - 1)));
@@ -875,11 +866,11 @@ const RealtimeWaveform: React.FC<{
         >
           <defs>
             <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor={token.colorPrimary} stopOpacity="0.3" />
+              <stop offset="0%" stopColor={token.colorPrimary} stopOpacity="0.2" />
               <stop offset="100%" stopColor={token.colorPrimary} stopOpacity="0" />
             </linearGradient>
           </defs>
-          {[0.25, 0.5, 0.75].map(ratio => (
+          {[0.25, 0.5, 0.75].map((ratio) => (
             <line
               key={ratio}
               x1="0"
@@ -897,7 +888,7 @@ const RealtimeWaveform: React.FC<{
             d={path}
             fill="none"
             stroke={token.colorPrimary}
-            strokeWidth="2.5"
+            strokeWidth="2"
             strokeLinecap="round"
             strokeLinejoin="round"
             vectorEffect="non-scaling-stroke"
@@ -1047,6 +1038,7 @@ export function useRankingFlipAnimation(
     else elements.current.delete(key);
   }, []);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: new entries change rendered row positions, so refresh the DOM measurements before the next range transition.
   useLayoutEffect(() => {
     for (const animation of animations.current.values()) animation.cancel();
     animations.current.clear();
@@ -1165,7 +1157,7 @@ const UserRanking: React.FC<{
             return (
               <div
                 key={entryKey}
-                ref={element => setRankingElement(entryKey, element)}
+                ref={(element) => setRankingElement(entryKey, element)}
                 className="disco-token-user-row"
                 data-testid="token-user-row"
                 data-user-key={entryKey}
@@ -1254,11 +1246,12 @@ export const HomeTokenUsageCard: React.FC<{
 }> = ({ client, connected, currentUserId }) => {
   const { token } = theme.useToken();
   const { locale, t } = useLocale();
-  const currentUser = useDiscoStore(state =>
+  const currentUser = useDiscoStore((state) =>
     currentUserId ? state.userById.get(currentUserId) : undefined
   );
   const tokenPricing = currentUser?.preferences?.tokenPricing as
-    TokenPricingPreferences | undefined;
+    | TokenPricingPreferences
+    | undefined;
   const [data, setData] = useState<TokenDashboardData>(
     () => readCachedTokenDashboardData(currentUserId) ?? EMPTY_DATA
   );
@@ -1410,12 +1403,12 @@ export const HomeTokenUsageCard: React.FC<{
         todayModels,
         weekModels,
       ];
-      if (results.every(result => result.status === 'rejected')) {
+      if (results.every((result) => result.status === 'rejected')) {
         throw allUserModels.status === 'rejected'
           ? allUserModels.reason
           : new Error('Token data unavailable');
       }
-      setData(previous => {
+      setData((previous) => {
         const nextAllUserModels =
           allUserModels.status === 'fulfilled' ? allUserModels.value.data : previous.userModels;
         const nextTodayUserModels =
@@ -1456,7 +1449,7 @@ export const HomeTokenUsageCard: React.FC<{
         writeCachedTokenDashboardData(currentUserId, next);
         return next;
       });
-      if (results.some(result => result.status === 'rejected')) {
+      if (results.some((result) => result.status === 'rejected')) {
         setError(t('tokenUsageLoadFailed'));
       }
     } catch {

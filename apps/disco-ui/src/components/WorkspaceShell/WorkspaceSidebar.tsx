@@ -738,8 +738,8 @@ export const WorkspaceSidebar: React.FC<WorkspaceSidebarProps> = ({
             components: {
               Dropdown: isDark
                 ? {
-                    // Keep the destructive action readable on the lifted surface and on hover.
-                    colorError: `color-mix(in srgb, ${token.colorErrorTextHover}, ${token.colorText})`,
+                    // Use a restrained red that stays readable on the dark menu surface.
+                    colorError: token.colorErrorTextHover,
                     colorTextLightSolid: token.colorBgContainer,
                   }
                 : {},
@@ -753,16 +753,17 @@ export const WorkspaceSidebar: React.FC<WorkspaceSidebarProps> = ({
             classNames={{
               root: `disco-workspace-account-menu${mobile ? ' disco-workspace-mobile-account-menu' : ''}`,
             }}
-            styles={{ item: { minHeight: mobile ? 44 : token.controlHeightLG } }}
+            styles={{ item: { minHeight: mobile ? 44 : token.controlHeight } }}
             menu={{
               style: {
-                // Lift this surface above the sidebar without changing other dropdowns.
+                // Keep a subtle separation from the sidebar without a bright panel.
                 background: isDark
-                  ? `linear-gradient(${token.colorFillSecondary}, ${token.colorFillSecondary}), ${token.colorBgElevated}`
+                  ? `linear-gradient(${token.colorFillQuaternary}, ${token.colorFillQuaternary}), ${token.colorBgElevated}`
                   : token.colorBgElevated,
-                border: `${token.lineWidth}px solid ${token.colorBorder}`,
-                boxShadow: token.boxShadow,
-                padding: token.paddingXS,
+                border: `${token.lineWidth}px solid ${token.colorBorderSecondary}`,
+                borderRadius: token.borderRadius,
+                boxShadow: token.boxShadowSecondary,
+                padding: token.paddingXXS,
               },
               items: mobile
                 ? [{ key: 'logout', icon: <LogoutOutlined />, label: '退出登录', danger: true }]

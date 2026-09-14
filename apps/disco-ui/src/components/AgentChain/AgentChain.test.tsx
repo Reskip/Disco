@@ -66,6 +66,34 @@ function completedToolMessages(
 }
 
 describe('AgentChain', () => {
+  it('renders large transcripts only after expansion and preserves every character', async () => {
+    const input = '完整输入🙂\n'.repeat(150_000);
+    const output = '完整结果🙂\n'.repeat(150_000);
+    const messages = completedToolMessages('Bash', { command: input, title: '检查完整记录' });
+    messages[1] = {
+      ...messages[1],
+      content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: output }],
+    };
+    const { container } = render(
+      <ConfigProvider>
+        <AgentChain messages={messages} isTaskRunning={false} isLatest={false} />
+      </ConfigProvider>
+    );
+    const summary = screen.getByRole('button');
+    expect(container.querySelector('.disco-agent-chain-details')).toBeNull();
+    expect(container.querySelector('pre')).toBeNull();
+    fireEvent.click(summary);
+    expect(container.querySelector('.disco-tool-block-header')).not.toBeNull();
+    expect(container.querySelector('pre')).toBeNull();
+    fireEvent.click(screen.getByText('检查完整记录', { selector: 'strong' }));
+    const sections = container.querySelectorAll('.disco-tool-io pre');
+    expect(sections[0].textContent).toBe(input);
+    expect(sections[1].textContent).toBe(output.trim());
+    fireEvent.click(summary);
+    await waitFor(() => expect(container.querySelector('.disco-agent-chain-details')).toBeNull());
+    expect(container.querySelector('pre')).toBeNull();
+  });
+
   it('keeps an intermediate failure neutral in the outer summary and local to its detail', () => {
     render(
       <ConfigProvider>
@@ -403,6 +431,7 @@ describe('AgentChain', () => {
     );
 
     expect(screen.getByRole('button')).toHaveTextContent('查看了图片');
+    expect(fetch).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button'));
 
     const thumbnail = await screen.findByRole('img', { name: 'schedule.png' });

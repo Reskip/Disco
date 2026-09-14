@@ -11,6 +11,7 @@ import { DownOutlined, RightOutlined } from '@ant-design/icons';
 import { Typography, theme } from 'antd';
 import type React from 'react';
 import { useState } from 'react';
+import { useCollapsibleContent } from '../../hooks/useCollapsibleContent';
 
 export interface ToolBlockProps {
   /** Tool/block icon (Ant Design icon element) */
@@ -44,6 +45,7 @@ export const ToolBlock: React.FC<ToolBlockProps> = ({
   children,
 }) => {
   const [expanded, setExpanded] = useState(expandedByDefault);
+  const renderBody = useCollapsibleContent(expanded);
   const { token } = theme.useToken();
   const hasBody = !!children;
 
@@ -137,7 +139,9 @@ export const ToolBlock: React.FC<ToolBlockProps> = ({
                 maxWidth: '100%',
               }}
             >
-              {children}
+              {/* CSS clipping still lays out large output and mounts rich renderers.
+                  Keep the full payload in props; render it only while open. */}
+              {renderBody && children}
             </div>
           </div>
         </div>

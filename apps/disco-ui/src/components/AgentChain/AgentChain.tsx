@@ -17,6 +17,7 @@ import { BulbOutlined, CheckCircleOutlined, DownOutlined, RightOutlined } from '
 import type { ContentBlock as CoreContentBlock, DiffEnrichment, Message } from '@disco-live/client';
 import { Spin, Typography, theme } from 'antd';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useCollapsibleContent } from '../../hooks/useCollapsibleContent';
 import { getToolDisplayName } from '../../utils/toolDisplayName';
 import { CollapsibleText } from '../CollapsibleText';
 import {
@@ -145,7 +146,7 @@ function packageNamesFromInstallCommand(command: string): string | undefined {
   if (!match?.[1]) return undefined;
   const packages = match[1]
     .split(/\s+/u)
-    .filter(value => value && !value.startsWith('-'))
+    .filter((value) => value && !value.startsWith('-'))
     .slice(0, 3)
     .join('、');
   return packages ? compactActivityText(packages, 36) : undefined;
@@ -460,6 +461,7 @@ export const AgentChain = React.memo<AgentChainProps>(
   ({ messages, isTaskRunning = false, isLatest }) => {
     const { token } = theme.useToken();
     const [expanded, setExpanded] = useState(false);
+    const renderDetails = useCollapsibleContent(expanded);
     const chainRef = useRef<HTMLDivElement | null>(null);
     const anchorFrameRef = useRef<number | null>(null);
 
@@ -477,7 +479,7 @@ export const AgentChain = React.memo<AgentChainProps>(
       );
       const anchoredBottom = chain?.getBoundingClientRect().bottom;
 
-      setExpanded(value => !value);
+      setExpanded((value) => !value);
       if (!chain || !scrollContainer || anchoredBottom === undefined) return;
 
       if (anchorFrameRef.current !== null) cancelAnimationFrame(anchorFrameRef.current);
@@ -536,7 +538,7 @@ export const AgentChain = React.memo<AgentChainProps>(
         // globalToolResultMap. Rendering them again as thoughts duplicates the
         // entire output and is the main cause of overlong activity timelines.
         if (message.role === 'user') {
-          const toolResults = message.content.filter(b => b.type === 'tool_result');
+          const toolResults = message.content.filter((b) => b.type === 'tool_result');
           if (toolResults.length > 0) {
             continue;
           }
@@ -802,10 +804,10 @@ export const AgentChain = React.memo<AgentChainProps>(
                 activeForm?: unknown;
                 status?: unknown;
               }>
-            ).filter(todo => typeof todo.content === 'string')
+            ).filter((todo) => typeof todo.content === 'string')
           : [];
-      const currentTodoIndex = todos.findIndex(todo => todo.status === 'in_progress');
-      const firstPendingTodoIndex = todos.findIndex(todo => todo.status !== 'completed');
+      const currentTodoIndex = todos.findIndex((todo) => todo.status === 'in_progress');
+      const firstPendingTodoIndex = todos.findIndex((todo) => todo.status !== 'completed');
       const allTodosComplete = todos.length > 0 && firstPendingTodoIndex === -1;
       const visibleTodoIndex =
         currentTodoIndex >= 0
@@ -833,7 +835,7 @@ export const AgentChain = React.memo<AgentChainProps>(
                   : `第 ${visibleTodoIndex + 1}/${todos.length} 步`}
               </div>
               <ol>
-                {todos.map(todo => (
+                {todos.map((todo) => (
                   <li
                     key={`${toolUse.id}-todo-${String(todo.content)}-${String(todo.status)}`}
                     className={
@@ -951,18 +953,20 @@ export const AgentChain = React.memo<AgentChainProps>(
           aria-hidden={!expanded}
         >
           <div className="disco-agent-chain-collapse-inner">
-            <div className="disco-agent-chain-details">
-              {chainItems.map(renderChainItem)}
-              {waitingForNextAction && betweenActionLabel && (
-                <ToolBlock
-                  key="between-actions-thinking"
-                  icon={null}
-                  showIcon={false}
-                  name={betweenActionLabel}
-                  status="pending"
-                />
-              )}
-            </div>
+            {renderDetails && (
+              <div className="disco-agent-chain-details">
+                {chainItems.map(renderChainItem)}
+                {waitingForNextAction && betweenActionLabel && (
+                  <ToolBlock
+                    key="between-actions-thinking"
+                    icon={null}
+                    showIcon={false}
+                    name={betweenActionLabel}
+                    status="pending"
+                  />
+                )}
+              </div>
+            )}
           </div>
         </div>
       </div>

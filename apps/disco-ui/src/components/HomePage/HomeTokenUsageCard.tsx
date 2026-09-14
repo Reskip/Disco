@@ -7,7 +7,7 @@ import { useLocale } from '../../contexts/LocaleContext';
 import { useDiscoStore } from '../../store/discoStore';
 import { formatTokenCount } from '../../utils/formatTokenCount';
 import { estimateEntriesCostCny, formatEstimatedCny } from '../../utils/tokenPricing';
-import { buildTokenWaveform } from './tokenWaveform';
+import { buildTokenWaveform, findTokenWaveformHoverIndex } from './tokenWaveform';
 
 const { Text } = Typography;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -363,33 +363,18 @@ export function buildThirtySecondTokenSeries(
   return buildTokenSeries(entries, intervals, THIRTY_SECONDS_MS, now);
 }
 
-export function resampleTokenSeries(values: number[], targetPoints: number): number[] {
-  if (targetPoints <= 0 || values.length === 0) return [];
-  if (values.length <= targetPoints) return [...values];
-  const bucketSize = values.length / targetPoints;
-  return Array.from({ length: targetPoints }, (_, targetIndex) => {
-    const start = Math.floor(targetIndex * bucketSize);
-    const end = Math.max(start + 1, Math.floor((targetIndex + 1) * bucketSize));
-    return values.slice(start, end).reduce((sum, value) => sum + value, 0);
-  });
-}
-
-export function smoothTokenSeries(values: number[], standardDeviation = 2): number[] {
-  if (standardDeviation <= 0 || values.length < 3) return [...values];
-  // A finite Gaussian kernel rounds short bursts; triangular weights turn them into pointed tents.
-  const radius = Math.ceil(standardDeviation * 3);
-  const weights = Array.from({ length: radius * 2 + 1 }, (_, index) =>
-    Math.exp(-0.5 * ((index - radius) / standardDeviation) ** 2)
-  );
-  const weightTotal = weights.reduce((sum, weight) => sum + weight, 0);
-  return values.map((_, index) => {
-    let weightedTotal = 0;
-    for (let offset = -radius; offset <= radius; offset += 1) {
-      const sourceIndex = Math.min(values.length - 1, Math.max(0, index + offset));
-      weightedTotal += values[sourceIndex] * weights[offset + radius];
-    }
-    return weightedTotal / weightTotal;
-  });
+export function buildRealtimeTokenSeries(
+  entries: LeaderboardEntry[],
+  range: '1h' | '1d',
+  now = new Date()
+) {
+  const values = buildThirtySecondTokenSeries(entries, range === '1h' ? 120 : 2880, now);
+  return {
+    values,
+    startTime:
+      Math.floor(now.getTime() / THIRTY_SECONDS_MS) * THIRTY_SECONDS_MS -
+      (values.length - 1) * THIRTY_SECONDS_MS,
+  };
 }
 
 function startOfLocalDay(now: Date): Date {
@@ -782,11 +767,10 @@ const RealtimeWaveform: React.FC<{
     () => aggregateTokenUsageInWindow(entries, durationMs),
     [durationMs, entries]
   );
-  const values = useMemo(() => {
-    const raw = buildThirtySecondTokenSeries(entries, range === '1h' ? 120 : 2880);
-    const display = range === '1h' ? raw : resampleTokenSeries(raw, 144);
-    return smoothTokenSeries(display);
-  }, [entries, range]);
+  const { values, startTime } = useMemo(
+    () => buildRealtimeTokenSeries(entries, range),
+    [entries, range]
+  );
   const width = 520;
   const height = 132;
   const padding = 10;
@@ -797,14 +781,8 @@ const RealtimeWaveform: React.FC<{
   const active = values.some((value) => value > 0);
   const hoverPoint = hoverIndex === null ? undefined : points[hoverIndex];
   const hoverTime =
-    hoverIndex === null
-      ? undefined
-      : new Date(
-          Date.now() -
-            ((values.length - 1 - hoverIndex) / Math.max(1, values.length - 1)) *
-              (range === '1h' ? HOUR_MS : 24 * HOUR_MS)
-        );
-  const hoverRatio = hoverIndex === null ? 0 : hoverIndex / Math.max(1, values.length - 1);
+    hoverIndex === null ? undefined : new Date(startTime + hoverIndex * THIRTY_SECONDS_MS);
+  const hoverRatio = hoverPoint ? hoverPoint.x / width : 0;
   const hoverTransform =
     hoverRatio < 0.2
       ? 'translateX(6px)'
@@ -817,7 +795,12 @@ const RealtimeWaveform: React.FC<{
     <div>
       <div style={{ marginBottom: 8 }}>
         <div
-          style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 8,
+          }}
         >
           <Text strong style={{ display: 'block', fontSize: 14 }}>
             {t('realtimeActivity')}
@@ -859,11 +842,16 @@ const RealtimeWaveform: React.FC<{
           aria-label={t('realtimeActivity')}
           viewBox={`0 0 ${width} ${height}`}
           preserveAspectRatio="none"
-          style={{ display: 'block', width: '100%', height: '100%', cursor: 'crosshair' }}
+          style={{
+            display: 'block',
+            width: '100%',
+            height: '100%',
+            cursor: 'crosshair',
+          }}
           onMouseMove={(event) => {
             const bounds = event.currentTarget.getBoundingClientRect();
-            const ratio = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width));
-            setHoverIndex(Math.round(ratio * Math.max(0, values.length - 1)));
+            const x = ((event.clientX - bounds.left) / bounds.width) * width;
+            setHoverIndex(findTokenWaveformHoverIndex(points, x, width / bounds.width));
           }}
           onMouseLeave={() => setHoverIndex(null)}
         >
@@ -961,6 +949,7 @@ const RealtimeWaveform: React.FC<{
                 day: 'numeric',
                 hour: '2-digit',
                 minute: '2-digit',
+                second: '2-digit',
               }).format(hoverTime)}
             </div>
             <strong>{formatTokenCount(hoverPoint.value)} Token</strong>
@@ -969,9 +958,10 @@ const RealtimeWaveform: React.FC<{
       </div>
       <div style={{ display: 'flex', marginTop: 5 }}>
         <Text type="secondary" style={{ fontSize: 10 }}>
-          {new Intl.DateTimeFormat(locale, { hour: '2-digit', minute: '2-digit' }).format(
-            new Date(Date.now() - (range === '1h' ? HOUR_MS : 24 * HOUR_MS))
-          )}
+          {new Intl.DateTimeFormat(locale, {
+            hour: '2-digit',
+            minute: '2-digit',
+          }).format(new Date(startTime))}
         </Text>
       </div>
       <div

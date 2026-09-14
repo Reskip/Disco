@@ -7,13 +7,12 @@ import {
   buildDailyTokenCells,
   buildHourlyTokenSeries,
   buildMinuteTokenSeries,
+  buildRealtimeTokenSeries,
   buildThirtySecondTokenSeries,
   clearTokenDashboardCacheForTests,
   estimateUserLeaderboardCostsCny,
   rankingFlipKeyframes,
   readCachedTokenDashboardData,
-  resampleTokenSeries,
-  smoothTokenSeries,
   tokenIntensityLevel,
   weeksForHeatmapWidth,
   writeCachedTokenDashboardData,
@@ -225,59 +224,35 @@ describe('token dashboard time series', () => {
     });
   });
 
-  it('reduces a full day to a render-efficient curve without dropping usage', () => {
-    const raw = Array.from({ length: 2880 }, (_, index) => (index % 20 === 0 ? 5 : 0));
-    const sampled = resampleTokenSeries(raw, 144);
-    const smoothed = smoothTokenSeries(sampled, 2);
-
-    expect(sampled).toHaveLength(144);
-    expect(sampled.reduce((sum, value) => sum + value, 0)).toBe(
-      raw.reduce((sum, value) => sum + value, 0)
-    );
-    expect(smoothed).toHaveLength(144);
-  });
-
-  it('rounds an isolated burst instead of producing triangular shoulders', () => {
-    const raw = Array.from({ length: 61 }, (_, index) => (index === 30 ? 100 : 0));
-    const smoothed = smoothTokenSeries(raw);
-    const peak = smoothed[30];
-
-    expect(smoothed[29] / peak).toBeGreaterThan(0.85);
-    expect(smoothed[31] / peak).toBeGreaterThan(0.85);
-    const halfHeightWidth = smoothed.filter((value) => value >= peak / 2).length;
-    expect(halfHeightWidth).toBeGreaterThanOrEqual(5);
-    expect(halfHeightWidth).toBeLessThanOrEqual(7);
-    expect(smoothed.reduce((sum, value) => sum + value, 0)).toBeCloseTo(100);
-    expect(raw[30]).toBe(100);
-  });
-
-  it('keeps two short bursts distinct and leaves the long inactive tail at zero', () => {
-    const raw = Array<number>(120).fill(0);
-    raw[1] = 180_000;
-    raw[2] = 190_000;
-    raw[10] = 240_000;
-    const smoothed = smoothTokenSeries(raw);
-    const peaks = smoothed.filter(
-      (value, index) =>
-        index > 0 &&
-        index < smoothed.length - 1 &&
-        value > smoothed[index - 1] &&
-        value > smoothed[index + 1]
-    );
-
-    expect(peaks).toHaveLength(2);
-    expect(Math.min(...smoothed.slice(5, 9))).toBeLessThan(Math.min(...peaks) * 0.6);
-    expect(smoothed.slice(17).every((value) => value === 0)).toBe(true);
-    expect(smoothed.every((value) => Number.isFinite(value) && value >= 0)).toBe(true);
-  });
-
-  it('keeps constant activity flat at both window edges', () => {
-    expect(smoothTokenSeries([])).toEqual([]);
-    expect(smoothTokenSeries([3])).toEqual([3]);
-    expect(smoothTokenSeries([0, 0, 0])).toEqual([0, 0, 0]);
-    for (const value of smoothTokenSeries(Array<number>(120).fill(500))) {
-      expect(value).toBeCloseTo(500);
+  it.each(['1h', '1d'] as const)(
+    'preserves the exact 30-second usage and idle buckets in %s',
+    (range) => {
+      const now = new Date('2026-08-23T12:42:45.000Z');
+      const entries = [
+        entry('2026-08-23T12:40:00.000Z', 300),
+        entry('2026-08-23T12:41:30.000Z', 900),
+      ];
+      const { values, startTime } = buildRealtimeTokenSeries(entries, range, now);
+      expect(values).toHaveLength(range === '1h' ? 120 : 2880);
+      expect(values.filter((value) => value > 0)).toEqual([300, 900]);
+      expect(values.reduce((sum, value) => sum + value, 0)).toBe(1200);
+      expect(values.at(-6)).toBe(300);
+      expect(values.at(-3)).toBe(900);
+      expect(startTime + (values.length - 1) * 30_000).toBe(Date.parse('2026-08-23T12:42:30.000Z'));
     }
+  );
+
+  it('does not change preceding buckets when a later burst arrives', () => {
+    const now = new Date('2026-08-23T12:42:45.000Z');
+    const entries = [entry('2026-08-23T12:30:00.000Z', 300)];
+    const before = buildRealtimeTokenSeries(entries, '1d', now);
+    const after = buildRealtimeTokenSeries(
+      [...entries, entry('2026-08-23T12:42:30.000Z', 900)],
+      '1d',
+      now
+    );
+    expect(after.values.slice(0, -1)).toEqual(before.values.slice(0, -1));
+    expect(after.values.at(-1)).toBe(900);
   });
 
   it('uses four non-zero intensity bands', () => {

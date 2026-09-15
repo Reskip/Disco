@@ -532,7 +532,13 @@ function hydrationKeysetFor(
     query.message_id === undefined &&
     (typeof query.task_id === 'string' || typeof query.session_id === 'string')
   ) {
-    return { idField: 'message_id', pageLimit: MESSAGE_PAGINATION.MAX_LIMIT };
+    return {
+      idField: 'message_id',
+      // Conversation projections omit tool payloads and can use the normal
+      // list page size. Full transcripts keep their smaller transport pages.
+      pageLimit:
+        query.view === 'conversation' ? PAGINATION.MAX_LIMIT : MESSAGE_PAGINATION.MAX_LIMIT,
+    };
   }
   if (path === 'tasks' && query.task_id === undefined && typeof query.session_id === 'string') {
     return { idField: 'task_id', pageLimit: PAGINATION.MAX_LIMIT };

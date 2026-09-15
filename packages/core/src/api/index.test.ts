@@ -691,6 +691,26 @@ describe('createClient', () => {
       }
     });
 
+    it.each([10_000, 1_000])(
+      'loads lightweight conversation pages completely with a server ceiling of %i',
+      async (ceiling) => {
+        const service = createClient().service('messages');
+        const find = service.find as unknown as MockedFunction<any>;
+        const rows = Array.from({ length: 1200 }, (_, index) => ({
+          message_id: `m${String(index).padStart(4, '0')}`,
+          task_id: 't1',
+          index,
+        }));
+        mockExactMessagePages(find, rows, ceiling);
+        expect(
+          await service.findAll({ query: { session_id: 'session', view: 'conversation' } })
+        ).toEqual(rows);
+        expect(find.mock.calls[0][0].query.$limit).toBe(10_000);
+        if (ceiling === 10_000) expect(find).toHaveBeenCalledTimes(1);
+        else expect(find.mock.calls.length).toBeGreaterThan(1);
+      }
+    );
+
     it('accepts an exact result that fits in one server page without a verification scan', async () => {
       const client = createClient();
       const messagesService = client.service('messages');

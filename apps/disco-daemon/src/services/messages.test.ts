@@ -83,9 +83,10 @@ describe('MessagesService.find pagination', () => {
       });
       const service = createMessagesService(db);
       const projected = await service.find({
-        query: { session_id: sessionId, view: 'conversation' },
+        query: { session_id: sessionId, view: 'conversation', $limit: 10_000 },
       });
       expect(JSON.stringify(projected).length).toBeLessThan(2500);
+      expect(projected).toMatchObject({ limit: 10_000 });
       expect((projected as { data: Message[] }).data[0].content).toMatchObject([
         { type: 'text', text: '正文不变' },
         { type: 'tool_use', deferred: { message_id: original.message_id, block_index: 1 } },

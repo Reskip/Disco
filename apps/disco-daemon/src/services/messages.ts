@@ -290,7 +290,12 @@ export class MessagesService extends DrizzleService<
   async find(params?: MessageParams): Promise<Message[] | Paginated<Message>> {
     const query = normalizeQuery((params?.query ?? {}) as Record<string, unknown>);
     const limit = query.$limit ?? this.paginate?.default ?? 100;
-    const actualLimit = Math.min(limit, this.paginate?.max ?? 1000);
+    const lightweightView =
+      query.view === 'conversation' &&
+      (!query.$select ||
+        query.$select.every((field) => !['content', 'tool_uses', 'metadata'].includes(field)));
+    const pageMaximum = lightweightView ? PAGINATION.MAX_LIMIT : (this.paginate?.max ?? 1000);
+    const actualLimit = Math.min(limit, pageMaximum);
     const skip = query.$skip ?? 0;
     const sessionId = query.session_id;
     const exactTranscript = typeof query.task_id === 'string' || typeof sessionId === 'string';

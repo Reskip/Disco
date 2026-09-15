@@ -3,6 +3,7 @@ import {
   DownloadOutlined,
   FileOutlined,
   FilePdfOutlined,
+  PlayCircleOutlined,
   VideoCameraOutlined,
 } from '@ant-design/icons';
 import {
@@ -16,11 +17,12 @@ import {
 } from '@disco/core/types';
 import type { ParsedUploadPromptAttachment } from '@disco-live/client';
 import { parseUploadAttachmentPrompt } from '@disco-live/client';
-import { Flex, Image, Spin, Typography, theme } from 'antd';
+import { Button, Flex, Spin, Typography, theme } from 'antd';
 import type React from 'react';
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { useAuthenticatedUpload } from '../../hooks/useAuthenticatedUpload';
-import { useIsolatedImagePreview } from '../../hooks/useIsolatedImagePreview';
+import { useThemedMessage } from '../../utils/message';
+import { AuthenticatedImage } from '../AuthenticatedImage';
 import { VisualizationCitation } from './VisualizationCitation';
 
 export interface MessageAttachment extends Omit<ParsedUploadPromptAttachment, 'ref'> {
@@ -50,117 +52,123 @@ export function parseMessageAttachments(content: string): ParsedMessageAttachmen
 export const MessageAttachmentItem: React.FC<{ attachment: MessageAttachment }> = ({
   attachment,
 }) => {
-  const { objectUrl, loading, unavailable } = useAuthenticatedUpload(attachment.uploadRef);
-  const imagePreview = useIsolatedImagePreview();
+  const { objectUrl, loading, load } = useAuthenticatedUpload(attachment.uploadRef);
+  const { showError } = useThemedMessage();
+  const [playing, setPlaying] = useState(false);
   const mimeType = attachment.mimeType.toLowerCase();
   const isImage = mimeType.startsWith('image/');
   const isPdf = mimeType === 'application/pdf';
   const isAudio = mimeType.startsWith('audio/');
   const isVideo = mimeType.startsWith('video/');
 
-  const download = () => {
-    if (!objectUrl) return;
-    const anchor = document.createElement('a');
-    anchor.href = objectUrl;
-    anchor.download = attachment.filename;
-    anchor.click();
+  const download = async () => {
+    try {
+      const upload = await load();
+      const anchor = document.createElement('a');
+      anchor.href = upload.objectUrl;
+      anchor.download = attachment.filename;
+      anchor.click();
+    } catch {
+      showError('文件加载失败，请重试');
+    }
   };
+
+  const openPdf = async () => {
+    // Open in the click handler so an asynchronous download is not popup-blocked.
+    const tab = window.open('about:blank', '_blank');
+    if (tab) tab.opener = null;
+    try {
+      const upload = await load();
+      if (tab) tab.location.replace(upload.objectUrl);
+      else {
+        const anchor = document.createElement('a');
+        anchor.href = upload.objectUrl;
+        anchor.download = attachment.filename;
+        anchor.click();
+      }
+    } catch {
+      tab?.close();
+      showError('文件加载失败，请重试');
+    }
+  };
+
+  const play = async () => {
+    try {
+      await load();
+      setPlaying(true);
+    } catch {
+      showError('文件加载失败，请重试');
+    }
+  };
+
+  const downloadButton = (
+    <button
+      type="button"
+      aria-label={`下载 ${attachment.filename}`}
+      title={`下载 ${attachment.filename}`}
+      disabled={loading}
+      onClick={() => void download()}
+      className={isImage ? 'disco-message-image-download' : undefined}
+    >
+      {loading ? <Spin size="small" /> : <DownloadOutlined aria-hidden />}
+    </button>
+  );
 
   if (isImage) {
     return (
       <div className="disco-message-image-attachment">
-        {loading ? (
-          <div className="disco-message-attachment-loading">
-            <Spin size="small" />
-          </div>
-        ) : objectUrl ? (
-          <>
-            <Image
-              src={objectUrl}
-              alt={attachment.filename}
-              preview={imagePreview}
-              className="disco-message-attachment-image"
-            />
-            <button
-              type="button"
-              className="disco-message-image-download"
-              aria-label={`下载 ${attachment.filename}`}
-              title={`下载 ${attachment.filename}`}
-              onClick={download}
-            >
-              <DownloadOutlined aria-hidden />
-            </button>
-          </>
-        ) : (
-          <div className="disco-message-attachment-unavailable">图片已不可用</div>
-        )}
-      </div>
-    );
-  }
-
-  if (loading) {
-    return (
-      <div
-        className="disco-message-media-attachment is-loading"
-        aria-label={`正在加载 ${attachment.filename}`}
-      >
-        <Spin size="small" />
-        <span>{attachment.filename}</span>
-      </div>
-    );
-  }
-
-  if (!objectUrl || unavailable) {
-    return (
-      <div
-        className="disco-message-media-attachment is-unavailable"
-        aria-label={`${attachment.filename} 已不可用`}
-      >
-        <FileOutlined aria-hidden />
-        <span>{attachment.filename}</span>
-        <small>文件已不可用</small>
-      </div>
-    );
-  }
-
-  if (isVideo) {
-    return (
-      <figure className="disco-message-video-attachment">
-        <video
-          src={objectUrl}
-          controls
-          preload="metadata"
-          aria-label={`播放 ${attachment.filename}`}
+        <AuthenticatedImage
+          uploadRef={attachment.uploadRef}
+          filename={attachment.filename}
+          className="disco-message-attachment-image"
         />
-        <figcaption>
-          <VideoCameraOutlined aria-hidden />
-          <span title={attachment.filename}>{attachment.filename}</span>
-          {attachment.sizeLabel && <small>{attachment.sizeLabel}</small>}
-          <button type="button" aria-label={`下载 ${attachment.filename}`} onClick={download}>
-            <DownloadOutlined aria-hidden />
-          </button>
-        </figcaption>
-      </figure>
+        {downloadButton}
+      </div>
     );
   }
 
-  if (isAudio) {
+  if (isAudio || isVideo) {
     return (
-      <div className="disco-message-audio-attachment">
+      <div
+        className={isVideo ? 'disco-message-video-attachment' : 'disco-message-audio-attachment'}
+      >
         <div className="disco-message-media-heading">
-          <AudioOutlined aria-hidden />
+          {isVideo ? <VideoCameraOutlined aria-hidden /> : <AudioOutlined aria-hidden />}
           <span title={attachment.filename}>{attachment.filename}</span>
           {attachment.sizeLabel && <small>{attachment.sizeLabel}</small>}
-          <button type="button" aria-label={`下载 ${attachment.filename}`} onClick={download}>
-            <DownloadOutlined aria-hidden />
-          </button>
+          {downloadButton}
         </div>
-        <audio
-          src={objectUrl}
-          controls
-          preload="metadata"
-          aria-label={`播放 ${attachment.filename}`}
-        />
+        {playing && objectUrl ? (
+          isVideo ? (
+            // biome-ignore lint/a11y/useMediaCaption: User-provided media has no caption track metadata.
+            <video
+              src={objectUrl}
+              controls
+              autoPlay
+              preload="none"
+              aria-label={`播放 ${attachment.filename}`}
+            />
+          ) : (
+            // biome-ignore lint/a11y/useMediaCaption: User-provided media has no caption track metadata.
+            <audio
+              src={objectUrl}
+              controls
+              autoPlay
+              preload="none"
+              aria-label={`播放 ${attachment.filename}`}
+            />
+          )
+        ) : (
+          <Button
+            type="text"
+            icon={<PlayCircleOutlined />}
+            loading={loading}
+            aria-label={`播放 ${attachment.filename}`}
+            onClick={() => void play()}
+          >
+            点击播放
+          </Button>
+        )}
       </div>
     );
   }
@@ -173,14 +181,13 @@ export const MessageAttachmentItem: React.FC<{ attachment: MessageAttachment }> 
           type="button"
           className="disco-message-document-open"
           aria-label={`打开 ${attachment.filename}`}
-          onClick={() => window.open(objectUrl, '_blank', 'noopener,noreferrer')}
+          disabled={loading}
+          onClick={() => void openPdf()}
         >
           <span title={attachment.filename}>{attachment.filename}</span>
           <small>{attachment.sizeLabel ? `PDF · ${attachment.sizeLabel}` : 'PDF'}</small>
         </button>
-        <button type="button" aria-label={`下载 ${attachment.filename}`} onClick={download}>
-          <DownloadOutlined aria-hidden />
-        </button>
+        {downloadButton}
       </div>
     );
   }
@@ -189,14 +196,14 @@ export const MessageAttachmentItem: React.FC<{ attachment: MessageAttachment }> 
     <button
       type="button"
       className="disco-message-file-attachment"
-      aria-label={unavailable ? `${attachment.filename} 已不可用` : `下载 ${attachment.filename}`}
-      disabled={!objectUrl}
-      onClick={download}
+      aria-label={`下载 ${attachment.filename}`}
+      disabled={loading}
+      onClick={() => void download()}
     >
       <FileOutlined aria-hidden />
       <Typography.Text ellipsis>{attachment.filename}</Typography.Text>
       {attachment.sizeLabel && <small>{attachment.sizeLabel}</small>}
-      <DownloadOutlined aria-hidden />
+      {loading ? <Spin size="small" /> : <DownloadOutlined aria-hidden />}
     </button>
   );
 };
@@ -301,14 +308,14 @@ function FileCitationItem({ citation }: { citation: FileCitationContentBlock }) 
   if (!citation.available || !citation.upload_ref) {
     return (
       <Flex className="disco-message-file-citation" vertical gap={token.marginXXS}>
-        <div
+        <section
           className="disco-message-media-attachment is-unavailable"
           aria-label={`${citation.filename} 已不可用`}
         >
           {citation.mime_type === 'application/pdf' ? <FilePdfOutlined /> : <FileOutlined />}
           <span title={citation.filename}>{citation.filename}</span>
           <small>{citation.unavailable_reason || '文件已不可用'}</small>
-        </div>
+        </section>
         {metadata}
       </Flex>
     );
@@ -341,6 +348,7 @@ export const MessageFileCitations: React.FC<{ citations: FileCitationContentBloc
     <Flex vertical gap={token.marginSM} style={{ marginBlock: token.marginXS }}>
       {citations.map((citation, index) => (
         <FileCitationItem
+          // biome-ignore lint/suspicious/noArrayIndexKey: Repeated citations retain their existing occurrence keys.
           key={`${citation.upload_ref ?? citation.filename}:${citation.purpose}:${index}`}
           citation={citation}
         />

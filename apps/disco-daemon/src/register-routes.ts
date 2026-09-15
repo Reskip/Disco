@@ -174,6 +174,7 @@ import {
   type StagedMulterFile,
 } from './utils/upload.js';
 import { getUploadStagingStore } from './utils/upload-staging.js';
+import { UploadThumbnailCache } from './utils/upload-thumbnail.js';
 import { WidgetResolutionStore } from './widgets/resolution-store.js';
 import { resolveWidget } from './widgets/submissions.js';
 
@@ -2347,6 +2348,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     feathers?: AuthenticatedParams;
     params: { uploadRef: string };
   };
+  const uploadThumbnails = new UploadThumbnailCache();
   const loadAuthorizedUpload = async (req: UploadHttpRequest) => {
     const params = req.feathers as AuthenticatedParams;
     const tenantId = params.tenant?.tenant_id;
@@ -2363,6 +2365,55 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     if (upload.createdBy !== userId) throw new NotFound('Upload unavailable');
     return upload;
   };
+
+  // Authorize every derivative request before consulting the cache, including
+  // after deletion or expiry. Thumbnail failures never fall back to original bytes.
+  // biome-ignore lint/suspicious/noExplicitAny: Express route method not on Feathers Application
+  (app as any).get(
+    '/uploads/:uploadRef/thumbnail',
+    uploadAuthMiddleware,
+    async (req: UploadHttpRequest, res: Response, next: NextFunction) => {
+      try {
+        const upload = await loadAuthorizedUpload(req);
+        if (!upload.mimeType.startsWith('image/')) {
+          return res.status(415).json({ message: 'Image preview unavailable' });
+        }
+        const key = JSON.stringify([
+          upload.tenantId,
+          upload.createdBy,
+          upload.sessionId,
+          upload.agentId,
+          upload.ref,
+          upload.checksum,
+          upload.size,
+        ]);
+        let thumbnail: Buffer;
+        try {
+          thumbnail = await uploadThumbnails.get(key, () =>
+            getUploadStagingStore().read({
+              tenantId: upload.tenantId,
+              createdBy: upload.createdBy,
+              sessionId: upload.sessionId,
+              agentId: upload.agentId,
+              ref: upload.ref,
+            })
+          );
+        } catch {
+          return res.status(415).json({ message: 'Image preview unavailable' });
+        }
+        if (res.destroyed) return;
+        res.setHeader('Content-Type', 'image/webp');
+        res.setHeader('Content-Length', String(thumbnail.length));
+        res.setHeader('Cache-Control', 'private, max-age=604800, immutable');
+        res.setHeader('Vary', 'Authorization, Cookie');
+        res.setHeader('ETag', `"${upload.ref}-${upload.size}-thumb-v1"`);
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.send(thumbnail);
+      } catch (error) {
+        next(error);
+      }
+    }
+  );
 
   // User Settings: owner-scoped logical upload inventory.
   // biome-ignore lint/suspicious/noExplicitAny: Express route method not on Feathers Application

@@ -5,10 +5,9 @@ import {
   isUploadRef,
   type ToolImageContentBlock,
 } from '@disco/core/types';
-import { Image, Spin } from 'antd';
+import { Spin } from 'antd';
 import type React from 'react';
-import { useAuthenticatedUpload } from '../../../hooks/useAuthenticatedUpload';
-import { useIsolatedImagePreview } from '../../../hooks/useIsolatedImagePreview';
+import { AuthenticatedImage } from '../../AuthenticatedImage';
 import type { ToolRendererProps } from './index';
 
 function legacyPreviewFromInput(input: Record<string, unknown>): ToolImageContentBlock | undefined {
@@ -28,28 +27,13 @@ function legacyPreviewFromInput(input: Record<string, unknown>): ToolImageConten
 }
 
 function PublishedImagePreview({ image }: { image: ToolImageContentBlock }) {
-  const { objectUrl, loading, unavailable } = useAuthenticatedUpload(image.upload_ref!);
-  const preview = useIsolatedImagePreview('查看大图');
-
   return (
     <div className="disco-tool-image-preview-item">
-      {loading ? (
-        <div className="disco-tool-image-preview-state" aria-label={`正在加载 ${image.filename}`}>
-          <Spin size="small" />
-        </div>
-      ) : objectUrl && !unavailable ? (
-        <Image
-          src={objectUrl}
-          alt={image.filename}
-          preview={preview}
-          className="disco-tool-image-preview-image"
-        />
-      ) : (
-        <div className="disco-tool-image-preview-state is-unavailable">
-          <FileImageOutlined aria-hidden />
-          <span>图片预览不可用</span>
-        </div>
-      )}
+      <AuthenticatedImage
+        uploadRef={image.upload_ref!}
+        filename={image.filename}
+        className="disco-tool-image-preview-image"
+      />
     </div>
   );
 }
@@ -61,7 +45,11 @@ export const ViewImageRenderer: React.FC<ToolRendererProps> = ({ input, result }
 
   if (!result && !image) {
     return (
-      <div className="disco-tool-image-preview-state is-inline" aria-label="正在准备图片预览">
+      <div
+        className="disco-tool-image-preview-state is-inline"
+        role="status"
+        aria-label="正在准备图片预览"
+      >
         <Spin size="small" />
         <span>正在准备图片预览…</span>
       </div>

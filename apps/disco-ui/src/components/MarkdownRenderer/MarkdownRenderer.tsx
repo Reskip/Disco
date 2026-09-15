@@ -13,17 +13,16 @@
 
 import { DownloadOutlined, PaperClipOutlined } from '@ant-design/icons';
 import { UPLOAD_VIRTUAL_URL_PREFIX } from '@disco/core/types';
-import { Button, Image, Spin, Tooltip, Typography, theme } from 'antd';
+import { Button, Tooltip, Typography, theme } from 'antd';
 import React, { useMemo } from 'react';
 import { defaultRehypePlugins, type LinkSafetyConfig, Streamdown } from 'streamdown';
 import { getDaemonUrl } from '../../config/daemon';
-import { useAuthenticatedUpload } from '../../hooks/useAuthenticatedUpload';
-import { useIsolatedImagePreview } from '../../hooks/useIsolatedImagePreview';
 import { authenticatedFetch } from '../../utils/authenticatedFetch';
 import { rehypeHeadingAnchors } from '../../utils/headingAnchors';
 import { highlightMentionsInMarkdown } from '../../utils/highlightMentions';
 import { useThemedMessage } from '../../utils/message';
 import { isDarkTheme } from '../../utils/theme';
+import { AuthenticatedImage } from '../AuthenticatedImage';
 import { normalizeCommonLatexDelimiters } from './normalizeMathDelimiters';
 import {
   streamdownRemarkPlugins,
@@ -106,7 +105,7 @@ const MarkdownRendererInner: React.FC<MarkdownRendererProps> = ({
   const { token } = theme.useToken();
 
   // Handle array of strings: filter empty, join with double newlines
-  const rawText = Array.isArray(content) ? content.filter(t => t.trim()).join('\n\n') : content;
+  const rawText = Array.isArray(content) ? content.filter((t) => t.trim()).join('\n\n') : content;
   let text = normalizeCommonLatexDelimiters(rawText);
 
   // A model may echo a host-local path as a Markdown link before the executor
@@ -276,7 +275,7 @@ function MarkdownBlockquote({
 
 function reactText(value: React.ReactNode): string {
   return React.Children.toArray(value)
-    .map(child => {
+    .map((child) => {
       if (typeof child === 'string' || typeof child === 'number') return String(child);
       if (React.isValidElement(child)) {
         return reactText((child.props as { children?: React.ReactNode }).children);
@@ -374,21 +373,9 @@ function UploadAttachmentTag(props: Record<string, unknown>) {
 }
 
 function InlineUploadImage({ uploadRef, filename }: { uploadRef: string; filename: string }) {
-  const { objectUrl, loading, unavailable } = useAuthenticatedUpload(uploadRef);
-  const imagePreview = useIsolatedImagePreview();
   return (
     <span className="disco-inline-upload-image">
-      {loading ? (
-        <span className="disco-inline-upload-image-status">
-          <Spin size="small" />
-        </span>
-      ) : objectUrl ? (
-        <Image src={objectUrl} alt={filename} preview={imagePreview} />
-      ) : (
-        <span className="disco-inline-upload-image-status">
-          {unavailable ? '图片已不可用' : filename}
-        </span>
-      )}
+      <AuthenticatedImage uploadRef={uploadRef} filename={filename} />
     </span>
   );
 }

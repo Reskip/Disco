@@ -164,11 +164,11 @@ describe('MessageBlock layout', () => {
       'blob:assistant-publication-1'
     );
     expect(screen.getByRole('button', { name: '打开 报告.pdf' })).toBeVisible();
-    expect(screen.getByLabelText('播放 说明.mp3')).toHaveAttribute('controls');
-    expect(screen.getByLabelText('播放 演示.mp4')).toHaveAttribute('controls');
+    expect(screen.getByRole('button', { name: '播放 说明.mp3' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '播放 演示.mp4' })).toBeEnabled();
     expect(screen.getByRole('button', { name: '下载 数据.csv' })).toBeEnabled();
     expect(screen.queryByText('Attached files:')).not.toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('renders structured output citations as native document cards without protocol text', async () => {
@@ -219,7 +219,7 @@ describe('MessageBlock layout', () => {
     expect(card.compareDocumentPosition(after) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(screen.getByText('输出文件')).toBeVisible();
     expect(screen.queryByText(/codex-file-citation/)).not.toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('renders a published visualization inline at its cited position', async () => {
@@ -270,6 +270,9 @@ describe('MessageBlock layout', () => {
     const { container } = render(<MessageBlock message={message} />);
 
     const before = screen.getByText('路线如下。');
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(container.querySelector('iframe')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '加载交互图' }));
     await waitFor(() => expect(container.querySelector('iframe')).not.toBeNull());
     const frame = container.querySelector('iframe')!;
     const after = screen.getByText('可以缩放查看。');

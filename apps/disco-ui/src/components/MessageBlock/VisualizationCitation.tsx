@@ -1,11 +1,12 @@
 import { DownloadOutlined, ExpandOutlined } from '@ant-design/icons';
 import type { FileCitationContentBlock } from '@disco/core/types';
-import { Modal, Spin, theme } from 'antd';
+import { Button, Modal, Spin, theme } from 'antd';
 import type React from 'react';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { getDaemonUrl } from '../../config/daemon';
 import { useOptionalTheme } from '../../contexts/ThemeContext';
 import { useAuthenticatedUpload } from '../../hooks/useAuthenticatedUpload';
+import { useThemedMessage } from '../../utils/message';
 import { isDarkTheme } from '../../utils/theme';
 import visualizeCss from './visualization-runtime/visualize.css?raw';
 import visualizeKit from './visualization-runtime/visualize.html?raw';
@@ -107,12 +108,12 @@ export const VisualizationCitation: React.FC<VisualizationCitationProps> = ({ ci
   const [fragment, setFragment] = useState<string | null>(null);
   const [loadError, setLoadError] = useState(false);
   const [expanded, setExpanded] = useState(false);
+  const [requested, setRequested] = useState(false);
+  const { showError } = useThemedMessage();
   const [frameHeight, setFrameHeight] = useState(
     citation.presentation?.mode === 'wide' ? 500 : 420
   );
-  const { blob, objectUrl, loading, unavailable } = useAuthenticatedUpload(
-    citation.upload_ref ?? ''
-  );
+  const { blob, loading, unavailable, load } = useAuthenticatedUpload(citation.upload_ref ?? '');
   const title = citation.presentation?.title || citation.locator?.label || citation.filename;
   const channelVersion = `${citation.upload_ref ?? citation.filename}:${dark ? 'dark' : 'light'}`;
   const inlineChannelId = `${channelId}:inline:${channelVersion}`;
@@ -123,7 +124,7 @@ export const VisualizationCitation: React.FC<VisualizationCitationProps> = ({ ci
     let active = true;
     setFragment(null);
     setLoadError(false);
-    if (!blob) return () => undefined;
+    if (!blob || !requested) return () => undefined;
     void readBlobText(blob)
       .then((value) => {
         if (active) setFragment(value);
@@ -134,7 +135,7 @@ export const VisualizationCitation: React.FC<VisualizationCitationProps> = ({ ci
     return () => {
       active = false;
     };
-  }, [blob]);
+  }, [blob, requested]);
 
   const document = useMemo(
     () =>
@@ -185,12 +186,21 @@ export const VisualizationCitation: React.FC<VisualizationCitationProps> = ({ ci
     return () => window.removeEventListener('message', receiveSize);
   }, [document, expandedChannelId, expandedDocument, inlineChannelId]);
 
-  const download = () => {
-    if (!objectUrl) return;
-    const anchor = window.document.createElement('a');
-    anchor.href = objectUrl;
-    anchor.download = citation.filename;
-    anchor.click();
+  const download = async () => {
+    try {
+      const upload = await load();
+      const anchor = window.document.createElement('a');
+      anchor.href = upload.objectUrl;
+      anchor.download = citation.filename;
+      anchor.click();
+    } catch {
+      showError('文件加载失败，请重试');
+    }
+  };
+
+  const openVisualization = () => {
+    setRequested(true);
+    void load().catch(() => {});
   };
 
   const failed = unavailable || loadError || !citation.available;
@@ -217,15 +227,28 @@ export const VisualizationCitation: React.FC<VisualizationCitationProps> = ({ ci
             type="button"
             aria-label={`下载 ${citation.filename}`}
             title="下载"
-            disabled={!objectUrl}
-            onClick={download}
+            disabled={loading || !citation.available}
+            onClick={() => void download()}
           >
             <DownloadOutlined aria-hidden />
           </button>
         </div>
       </header>
-      <div className="disco-message-visualization-body" style={{ height: frameHeight }}>
-        {loading || (!failed && !document) ? (
+      <div
+        className="disco-message-visualization-body"
+        style={{ height: requested ? frameHeight : 100 }}
+      >
+        {!citation.available ? (
+          <div className="disco-message-visualization-state is-unavailable">
+            {citation.unavailable_reason || '交互图已不可用'}
+          </div>
+        ) : !requested ? (
+          <div className="disco-message-visualization-state">
+            <Button onClick={openVisualization} disabled={!citation.available}>
+              加载交互图
+            </Button>
+          </div>
+        ) : loading || (!failed && !document) ? (
           <div className="disco-message-visualization-state">
             <Spin size="small" />
             <span>正在加载交互图</span>
@@ -233,6 +256,7 @@ export const VisualizationCitation: React.FC<VisualizationCitationProps> = ({ ci
         ) : failed ? (
           <div className="disco-message-visualization-state is-unavailable">
             {citation.unavailable_reason || '交互图已不可用'}
+            {citation.available && <Button onClick={openVisualization}>重试</Button>}
           </div>
         ) : (
           <iframe

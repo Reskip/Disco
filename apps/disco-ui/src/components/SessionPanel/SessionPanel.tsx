@@ -310,7 +310,7 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
     }
   }, [session, titleDraft, onUpdateSession]);
   React.useEffect(() => {
-    if (editingTitle) titleInputRef.current?.focus();
+    if (editingTitle) titleInputRef.current?.focus({ cursor: 'all' });
   }, [editingTitle]);
 
   // "Switch tool" — same underlying chooseAgenticTool action the quick-start

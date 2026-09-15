@@ -186,6 +186,7 @@ function SessionRow({
             value={renameDraft}
             disabled={renameSaving}
             aria-label="编辑对话标题"
+            onFocus={(event) => event.currentTarget.select()}
             onChange={(event) => onRenameDraftChange(event.target.value)}
             onBlur={() => {
               if (!cancelOnBlurRef.current) onRenameSubmit();

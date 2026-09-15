@@ -1,8 +1,11 @@
 import { createClient } from '@disco-live/client';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { findConversationPage } from '../utils/conversationHttp';
 import { TOKENS_REFRESHED_EVENT } from '../utils/singleFlightRefresh';
 import { useDiscoClient } from './useDiscoClient';
+
+vi.mock('../utils/conversationHttp', () => ({ findConversationPage: vi.fn() }));
 
 // Keep every real export; only stub the client factory so the hook wires a
 // controllable mock instead of opening a real socket.
@@ -98,6 +101,28 @@ function registeredAroundHook(client: ReturnType<typeof makeSeamClient>['client'
 }
 
 describe('useDiscoClient session-streams announce seam', () => {
+  it('uses HTTP only for opted-in conversation reads and leaves realtime operations on the socket', async () => {
+    const { client } = makeSeamClient();
+    vi.mocked(createClient).mockReturnValue(client as never);
+    renderHook(() => useDiscoClient({ url: 'http://daemon.test', accessToken: 'access-token' }));
+    await waitFor(() => expect(client.hooks).toHaveBeenCalled());
+    const page = { data: [], total: 0, skip: 0, limit: 1000 };
+    vi.mocked(findConversationPage).mockResolvedValue(page);
+    const query = { session_id: 'session', view: 'conversation', $limit: 1000 };
+    const context = { path: 'messages', method: 'find', params: { query }, result: undefined };
+    const next = vi.fn().mockResolvedValue(undefined);
+    const hook = registeredAroundHook(client);
+    await hook(context, next);
+    expect(context.result).toBe(page);
+    expect(findConversationPage).toHaveBeenCalledWith('http://daemon.test', query);
+    expect(next).not.toHaveBeenCalled();
+    await hook({ path: 'messages', method: 'create', params: {} }, next);
+    await hook(
+      { path: 'messages', method: 'find', params: { query: { session_id: 'session' } } },
+      next
+    );
+    expect(next).toHaveBeenCalledTimes(2);
+  });
   afterEach(() => {
     vi.clearAllMocks();
     refreshMock.mockReset();

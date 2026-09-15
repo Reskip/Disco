@@ -3,6 +3,27 @@ import { describe, expect, it } from 'vitest';
 import { conversationMessage } from './conversation-message';
 
 describe('conversation message projection', () => {
+  it('preserves the actual inner tool name and action title in collapsed labels', () => {
+    const message = {
+      message_id: 'm',
+      content: [
+        {
+          type: 'tool_use',
+          id: 'call',
+          name: 'disco.disco_execute_tool',
+          input: {
+            tool_name: 'disco_files_publish',
+            title: '发布附件',
+            arguments: { data: 'x'.repeat(100_000) },
+          },
+        },
+      ],
+    } as unknown as Message;
+    expect(conversationMessage(message).content).toMatchObject([
+      { input: { tool_name: 'disco_files_publish', title: '发布附件' } },
+    ]);
+    expect(JSON.stringify(conversationMessage(message))).not.toContain('arguments');
+  });
   it('defers bulky tools while preserving text, attachments, plans and error status', () => {
     const input = { code: 'x'.repeat(1_000_000), description: '检查数据' };
     const content = [

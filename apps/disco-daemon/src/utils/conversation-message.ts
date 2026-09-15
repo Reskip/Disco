@@ -2,7 +2,22 @@ import type { ContentBlock, Message } from '@disco/core/types';
 
 // These values label a collapsed action. Its complete input/output remains in
 // the stored Message and is fetched through the ordinary authorized get API.
-const LABEL_FIELDS = ['description', 'file_path', 'path', 'pattern', 'query', 'command', 'action'];
+const LABEL_FIELDS = [
+  'title',
+  'description',
+  'file_path',
+  'path',
+  'pattern',
+  'query',
+  'command',
+  'action',
+  'tool_name',
+  'domain',
+  'url',
+  'skill',
+  'name',
+  'prompt',
+];
 
 function labelInput(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object') return {};

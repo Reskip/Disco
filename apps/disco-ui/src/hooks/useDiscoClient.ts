@@ -10,6 +10,7 @@ import { createClient } from '@disco-live/client';
 import { useEffect, useRef, useState } from 'react';
 import { getDaemonUrl } from '../config/daemon';
 import { isDefiniteAuthFailure, isTransientConnectionError } from '../utils/authErrors';
+import { findConversationPage } from '../utils/conversationHttp';
 import {
   RefreshUnrecoverableError,
   refreshAndReauthenticate,
@@ -163,6 +164,14 @@ export function useDiscoClient(options: UseDiscoClientOptions = {}): UseDiscoCli
               }
 
               try {
+                if (
+                  path === 'messages' &&
+                  context.method === 'find' &&
+                  context.params?.query?.view === 'conversation'
+                ) {
+                  context.result = await findConversationPage(url, context.params.query);
+                  return;
+                }
                 await next();
               } catch (err) {
                 if (!isDefiniteAuthFailure(err)) throw err;

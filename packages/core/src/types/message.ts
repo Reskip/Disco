@@ -65,6 +65,8 @@ export interface ContentBlock {
     | 'rate_limit'
     | 'api_wait'
     | 'sdk_event';
+  /** Read-only conversation projection; fetch the original Message on expansion. */
+  deferred?: { message_id: MessageID; block_index: number };
   [key: string]: unknown; // Additional type-specific fields
 }
 

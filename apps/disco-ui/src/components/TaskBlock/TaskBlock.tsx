@@ -936,6 +936,7 @@ export const TaskBlock = React.memo<TaskBlockProps>(
                           blockIndex,
                           <div key={blockKey} data-conversation-block={getBlockMarker(block)}>
                             <AgentChain
+                              client={client}
                               messages={block.messages}
                               isTaskRunning={runtimeLive && !compactionInProgress}
                               isLatest={isLatestTask && blockIndex === activeAgentChainIndex}

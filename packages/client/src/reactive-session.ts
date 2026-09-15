@@ -18,6 +18,8 @@ export interface ReactiveSessionOptions {
    * - eager: load all session messages during bootstrap
    */
   taskHydration?: TaskHydrationMode;
+  /** UI display projection; full/lossless transcript hydration remains the default. */
+  messageView?: 'full' | 'conversation';
 }
 
 export interface StreamingMessageState {
@@ -198,6 +200,7 @@ export class ReactiveSessionHandle {
     this.client = client;
     this.options = {
       taskHydration: options?.taskHydration ?? 'lazy',
+      messageView: options?.messageView ?? 'full',
     };
     this.stateSnapshot = {
       sessionId,
@@ -417,7 +420,11 @@ export class ReactiveSessionHandle {
     // Completeness no longer depends on seeing the matching realtime event;
     // the journal is retained until the stable membership view is committed.
     return this.client.service('messages').findAll({
-      query: { ...query, $limit: MESSAGE_PAGINATION.MAX_LIMIT },
+      query: {
+        ...query,
+        ...(this.options.messageView === 'conversation' ? { view: 'conversation' } : {}),
+        $limit: MESSAGE_PAGINATION.MAX_LIMIT,
+      },
     });
   }
 
@@ -578,7 +585,7 @@ export class ReactiveSessionHandle {
               (message) => this.matchesSession(message.session_id)
             );
       messagesByTask = groupMessagesByTask(messages);
-      loadedTaskIds = new Set(messagesByTask.keys());
+      loadedTaskIds = new Set(tasks.map((task) => task.task_id));
     } else if (args.lazyMessageSnapshot) {
       const { taskId, messages: snapshot } = args.lazyMessageSnapshot;
       const messages =
@@ -1315,7 +1322,7 @@ export class ReactiveSessionHandle {
                   this.matchesSession(message.session_id)
                 );
           messagesByTask = groupMessagesByTask(messages);
-          loadedTaskIds = new Set(messagesByTask.keys());
+          loadedTaskIds = new Set(tasks.map((task) => task.task_id));
         } else if (lazyMessageSnapshots) {
           // Start from commit-time cache membership. Buckets loaded while the
           // resync was in flight stay present, and buckets unloaded during the
@@ -1700,7 +1707,10 @@ interface SharedReactiveSessionEntry {
   lastReleasedAt: number;
 }
 
-const SHARED_REACTIVE_SESSIONS = new WeakMap<DiscoClient, Map<string, SharedReactiveSessionEntry>>();
+const SHARED_REACTIVE_SESSIONS = new WeakMap<
+  DiscoClient,
+  Map<string, SharedReactiveSessionEntry>
+>();
 export const SHARED_REACTIVE_SESSION_IDLE_TTL_MS = 15 * 60 * 1000;
 const SHARED_REACTIVE_SESSION_MAX_IDLE_ENTRIES = 12;
 
@@ -1736,11 +1746,12 @@ function normalizeReactiveSessionOptions(
 ): Required<ReactiveSessionOptions> {
   return {
     taskHydration: options?.taskHydration ?? 'lazy',
+    messageView: options?.messageView ?? 'full',
   };
 }
 
 function getSharedSessionKey(sessionId: string, options: Required<ReactiveSessionOptions>): string {
-  return `${sessionId}:${options.taskHydration}`;
+  return `${sessionId}:${options.taskHydration}:${options.messageView}`;
 }
 
 /**

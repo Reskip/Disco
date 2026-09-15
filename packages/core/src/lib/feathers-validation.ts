@@ -229,6 +229,7 @@ const messageSelectableFieldSchema = Type.Union(
  */
 export const messageQuerySchema = Type.Object(
   {
+    view: Type.Optional(Type.Literal('conversation')),
     message_id: Type.Optional(
       Type.Union([
         CommonSchemas.uuid,

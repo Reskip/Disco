@@ -69,6 +69,41 @@ async function createMessages(
 
 describe('MessagesService.find pagination', () => {
   dbTest(
+    'serves a lightweight conversation view while get and default find remain lossless',
+    async ({ db }) => {
+      const sessionId = await createTestSession(db);
+      const repository = new MessagesRepository(db);
+      const original = await repository.create({
+        ...message(sessionId, 0),
+        content: [
+          { type: 'text', text: '正文不变' },
+          { type: 'tool_use', id: 'call', name: 'Bash', input: { command: 'x'.repeat(100_000) } },
+          { type: 'tool_result', tool_use_id: 'call', content: 'result'.repeat(100_000) },
+        ],
+      });
+      const service = createMessagesService(db);
+      const projected = await service.find({
+        query: { session_id: sessionId, view: 'conversation' },
+      });
+      expect(JSON.stringify(projected).length).toBeLessThan(2500);
+      expect((projected as { data: Message[] }).data[0].content).toMatchObject([
+        { type: 'text', text: '正文不变' },
+        { type: 'tool_use', deferred: { message_id: original.message_id, block_index: 1 } },
+        { type: 'tool_result', deferred: { message_id: original.message_id, block_index: 2 } },
+      ]);
+      expect((await service.get(original.message_id)).content).toEqual(original.content);
+      const full = await service.find({ query: { session_id: sessionId } });
+      expect((full as { data: Message[] }).data[0].content).toEqual(original.content);
+      const ids = await service.find({
+        query: { session_id: sessionId, view: 'conversation', $select: ['message_id'] },
+      });
+      expect((ids as { data: Message[] }).data).toEqual([{ message_id: original.message_id }]);
+      await expect(service.find({ query: { view: 'invalid' } } as never)).rejects.toThrow(
+        'Unsupported messages view'
+      );
+    }
+  );
+  dbTest(
     'pushes the public page limit into SQL instead of hydrating every match',
     async ({ db }) => {
       const sessionId = await createTestSession(db);

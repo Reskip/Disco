@@ -26,6 +26,7 @@ export function useSharedReactiveSession(
 ): UseSharedReactiveSessionResult {
   const { enabled = true, reactiveOptions } = options;
   const taskHydration = reactiveOptions?.taskHydration ?? 'lazy';
+  const messageView = reactiveOptions?.messageView ?? 'full';
   const [handle, setHandle] = useState<ReactiveSessionHandle | null>(null);
   const [state, setState] = useState<ReactiveSessionState | null>(null);
 
@@ -36,7 +37,7 @@ export function useSharedReactiveSession(
       return;
     }
 
-    const sharedHandle = retainReactiveSession(client, sessionId, { taskHydration });
+    const sharedHandle = retainReactiveSession(client, sessionId, { taskHydration, messageView });
     setHandle(sharedHandle);
     let disposed = false;
 
@@ -53,9 +54,9 @@ export function useSharedReactiveSession(
     return () => {
       disposed = true;
       unsubscribe();
-      releaseReactiveSession(client, sessionId, { taskHydration });
+      releaseReactiveSession(client, sessionId, { taskHydration, messageView });
     };
-  }, [client, sessionId, enabled, taskHydration]);
+  }, [client, sessionId, enabled, taskHydration, messageView]);
 
   // Re-trigger resync() when an external signal suggests our error state may
   // be stale. The reactive session itself only resyncs on socket `connect`

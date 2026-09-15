@@ -29,6 +29,7 @@ import {
 } from '@disco/core/types';
 import { DrizzleService, type Query } from '../adapters/drizzle';
 import { assertMessageCreatePayload } from '../hooks/validate-message-create.js';
+import { conversationMessage } from '../utils/conversation-message.js';
 
 /**
  * Public Message transport surface. Full replacement is daemon-internal.
@@ -45,6 +46,7 @@ export const MESSAGES_SERVICE_TRANSPORT_METHODS = [
  * Message service params
  */
 export type MessageParams = QueryParams<{
+  view?: 'conversation';
   message_id?:
     | MessageID
     | {
@@ -104,6 +106,9 @@ function normalizeQuery(rawQuery: Record<string, unknown>): Query {
     }
   }
   const query = { ...rawQuery } as Query;
+  if (rawQuery.view !== undefined && rawQuery.view !== 'conversation') {
+    throw new BadRequest('Unsupported messages view');
+  }
   if ('$limit' in rawQuery && rawQuery.$limit !== undefined) {
     query.$limit = parseNonNegativeInteger(rawQuery.$limit, '$limit');
   }
@@ -167,6 +172,7 @@ function normalizeQuery(rawQuery: Record<string, unknown>): Query {
 }
 
 const MESSAGE_QUERY_FIELDS = new Set([
+  'view',
   'message_id',
   'session_id',
   'task_id',
@@ -340,7 +346,10 @@ export class MessagesService extends DrizzleService<
       total: page.total,
       limit: actualLimit,
       skip,
-      data: page.data as Message[],
+      data:
+        query.view === 'conversation' && !query.$select
+          ? (page.data as Message[]).map(conversationMessage)
+          : (page.data as Message[]),
     };
   }
 

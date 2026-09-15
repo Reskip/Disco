@@ -4,8 +4,8 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   __streamSubscriptionCountForTest,
   attachReactiveSessionApi,
-  releaseReactiveSession,
   ReactiveSessionHandle,
+  releaseReactiveSession,
   retainReactiveSession,
   SHARED_REACTIVE_SESSION_IDLE_TTL_MS,
   type TaskHydrationMode,
@@ -181,6 +181,44 @@ async function bootstrapHandle(opts: MockClientOptions, taskHydration: TaskHydra
 }
 
 describe('ReactiveSessionHandle bootstrap hydration', () => {
+  it('loads the conversation projection coherently and keeps it separate from full transcripts', async () => {
+    vi.useFakeTimers();
+    const { client, messageFindAll } = createMockClient({
+      tasks: [makeTask('old', TaskStatus.COMPLETED), makeTask('empty', TaskStatus.COMPLETED)],
+      messagesByTask: { old: [makeMessage('old', 0)] },
+    });
+    const projected = retainReactiveSession(client, SESSION_ID, {
+      taskHydration: 'eager',
+      messageView: 'conversation',
+    });
+    const full = retainReactiveSession(client, SESSION_ID, { taskHydration: 'eager' });
+    expect(projected).not.toBe(full);
+    await Promise.all([projected.ready(), full.ready()]);
+    expect(projected.isTaskLoaded('empty')).toBe(true);
+    expect(projected.state.loading).toBe(false);
+    expect(messageFindAll.mock.calls.map(([params]) => params.query.view)).toEqual([
+      'conversation',
+      undefined,
+    ]);
+    releaseReactiveSession(client, SESSION_ID, {
+      taskHydration: 'eager',
+      messageView: 'conversation',
+    });
+    expect(
+      retainReactiveSession(client, SESSION_ID, {
+        taskHydration: 'eager',
+        messageView: 'conversation',
+      })
+    ).toBe(projected);
+    expect(messageFindAll).toHaveBeenCalledTimes(2);
+    releaseReactiveSession(client, SESSION_ID, {
+      taskHydration: 'eager',
+      messageView: 'conversation',
+    });
+    releaseReactiveSession(client, SESSION_ID, { taskHydration: 'eager' });
+    await vi.advanceTimersByTimeAsync(SHARED_REACTIVE_SESSION_IDLE_TTL_MS);
+    vi.useRealTimers();
+  });
   const tasks = [
     makeTask('task-1', TaskStatus.COMPLETED),
     makeTask('task-2', TaskStatus.COMPLETED),

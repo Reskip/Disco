@@ -13,9 +13,14 @@
  * (like AgentChain) are responsible for wrapping this in ThoughtChain items.
  */
 
-import type { ContentBlock as CoreContentBlock, DiffEnrichment } from '@disco-live/client';
-import { theme } from 'antd';
-import type React from 'react';
+import type {
+  ContentBlock as CoreContentBlock,
+  DiffEnrichment,
+  DiscoClient,
+  Message,
+} from '@disco-live/client';
+import { Alert, Button, Spin, theme } from 'antd';
+import { type FC, useEffect, useState } from 'react';
 import { shouldUseAnsiRendering } from '../../utils/ansi';
 import { toolResultToDisplayText } from '../../utils/toolResultToDisplayText';
 import { CollapsibleText } from '../CollapsibleText';
@@ -28,6 +33,7 @@ interface ToolUseBlock {
   id: string;
   name: string;
   input: Record<string, unknown>;
+  deferred?: CoreContentBlock['deferred'];
 }
 
 interface ToolResultBlock {
@@ -37,9 +43,11 @@ interface ToolResultBlock {
   is_error?: boolean;
   /** Executor-enriched diff data (best-effort, may not be present) */
   diff?: DiffEnrichment;
+  deferred?: CoreContentBlock['deferred'];
 }
 
 interface ToolUseRendererProps {
+  client?: DiscoClient | null;
   /**
    * Tool use block with invocation details
    */
@@ -69,7 +77,88 @@ function compactInputText(name: string, input: Record<string, unknown>): string 
   return JSON.stringify(input, null, 2);
 }
 
-export const ToolUseRenderer: React.FC<ToolUseRendererProps> = ({
+export const ToolUseRenderer: FC<ToolUseRendererProps> = (props) => {
+  if (props.toolUse.deferred || props.toolResult?.deferred) {
+    const key = JSON.stringify([props.toolUse.deferred, props.toolResult?.deferred]);
+    return <DeferredToolDetails key={key} {...props} />;
+  }
+  return <LoadedToolUseRenderer {...props} />;
+};
+
+// This component is mounted by the existing collapsed-body boundary only after
+// the user opens the action. Never fetch full tool payloads to draw its header.
+function DeferredToolDetails({ client, toolUse, toolResult, compact }: ToolUseRendererProps) {
+  const [attempt, setAttempt] = useState(0);
+  const [result, setResult] = useState<{
+    client: DiscoClient;
+    toolUse: ToolUseBlock;
+    toolResult?: ToolResultBlock;
+  } | null>(null);
+  const [error, setError] = useState(false);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: attempt explicitly retries the same failed request.
+  useEffect(() => {
+    let cancelled = false;
+    setResult(null);
+    setError(false);
+    const messages = new Map<string, Promise<Message>>();
+    const resolveBlock = async <T extends ToolUseBlock | ToolResultBlock>(block: T): Promise<T> => {
+      if (!block.deferred) return block;
+      if (!client) throw new Error('Message client unavailable');
+      const { message_id, block_index } = block.deferred;
+      let request = messages.get(message_id);
+      if (!request) {
+        request = client.service('messages').get(message_id);
+        messages.set(message_id, request);
+      }
+      const message = await request;
+      const original = Array.isArray(message.content) ? message.content[block_index] : undefined;
+      const identity = block.type === 'tool_use' ? 'id' : 'tool_use_id';
+      if (
+        !original ||
+        original.type !== block.type ||
+        original.deferred ||
+        original[identity] !== (block as unknown as Record<string, unknown>)[identity]
+      ) {
+        throw new Error('Tool detail no longer matches this action');
+      }
+      return original as unknown as T;
+    };
+    Promise.all([resolveBlock(toolUse), toolResult ? resolveBlock(toolResult) : undefined])
+      .then(([fullUse, fullResult]) => {
+        if (!cancelled && client) setResult({ client, toolUse: fullUse, toolResult: fullResult });
+      })
+      .catch(() => {
+        if (!cancelled) setError(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [client, toolUse, toolResult, attempt]);
+
+  if (error)
+    return (
+      <Alert
+        type="error"
+        title="工具详情加载失败"
+        action={
+          <Button size="small" onClick={() => setAttempt((value) => value + 1)}>
+            重试
+          </Button>
+        }
+      />
+    );
+  if (!result || result.client !== client)
+    return <Spin size="small" aria-label="正在加载工具详情" />;
+  return (
+    <LoadedToolUseRenderer
+      toolUse={result.toolUse}
+      toolResult={result.toolResult}
+      compact={compact}
+    />
+  );
+}
+
+const LoadedToolUseRenderer: FC<ToolUseRendererProps> = ({
   toolUse,
   toolResult,
   compact = false,

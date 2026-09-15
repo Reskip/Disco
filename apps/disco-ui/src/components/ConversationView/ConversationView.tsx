@@ -207,7 +207,9 @@ export const ConversationView = React.memo<ConversationViewProps>(
       sessionId,
       {
         enabled: isActive,
-        reactiveOptions: { taskHydration: 'lazy' },
+        // Commit the lightweight transcript together, so historical turns do
+        // not arrive as independent spinners that push the reading position.
+        reactiveOptions: { taskHydration: 'eager', messageView: 'conversation' },
       }
     );
     const currentReactiveState = reactiveState?.sessionId === sessionId ? reactiveState : null;

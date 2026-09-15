@@ -14,7 +14,12 @@
  */
 
 import { BulbOutlined, CheckCircleOutlined, DownOutlined, RightOutlined } from '@ant-design/icons';
-import type { ContentBlock as CoreContentBlock, DiffEnrichment, Message } from '@disco-live/client';
+import type {
+  ContentBlock as CoreContentBlock,
+  DiffEnrichment,
+  DiscoClient,
+  Message,
+} from '@disco-live/client';
 import { Spin, Typography, theme } from 'antd';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useCollapsibleContent } from '../../hooks/useCollapsibleContent';
@@ -33,6 +38,7 @@ interface ToolUseBlock {
   id: string;
   name: string;
   input: Record<string, unknown>;
+  deferred?: CoreContentBlock['deferred'];
 }
 
 interface ToolResultBlock {
@@ -41,6 +47,7 @@ interface ToolResultBlock {
   content: string | CoreContentBlock[];
   is_error?: boolean;
   diff?: DiffEnrichment;
+  deferred?: CoreContentBlock['deferred'];
 }
 
 interface TextBlock {
@@ -49,6 +56,7 @@ interface TextBlock {
 }
 
 interface AgentChainProps {
+  client?: DiscoClient | null;
   /**
    * Messages containing thoughts and/or tool uses
    */
@@ -458,7 +466,7 @@ function thinkingAfterToolLabel(toolUse: ToolUseBlock): string {
 }
 
 export const AgentChain = React.memo<AgentChainProps>(
-  ({ messages, isTaskRunning = false, isLatest }) => {
+  ({ messages, isTaskRunning = false, isLatest, client }) => {
     const { token } = theme.useToken();
     const [expanded, setExpanded] = useState(false);
     const renderDetails = useCollapsibleContent(expanded);
@@ -772,7 +780,7 @@ export const AgentChain = React.memo<AgentChainProps>(
       if (chainItems.length === 1 && toolUse.name.toLowerCase() === 'viewimage') {
         return (
           <div key={toolUse.id} className="disco-agent-chain-image-preview">
-            <ToolUseRenderer toolUse={toolUse} toolResult={toolResult} compact />
+            <ToolUseRenderer client={client} toolUse={toolUse} toolResult={toolResult} compact />
           </div>
         );
       }
@@ -855,7 +863,7 @@ export const AgentChain = React.memo<AgentChainProps>(
                 ))}
               </ol>
             </div>
-          ) : searchSummary ? (
+          ) : searchSummary && !toolUse.deferred && !toolResult?.deferred ? (
             <div className="disco-tool-io">
               <div className="disco-tool-io-section">
                 <Typography.Text type="secondary">输入</Typography.Text>
@@ -873,7 +881,7 @@ export const AgentChain = React.memo<AgentChainProps>(
               </div>
             </div>
           ) : (
-            <ToolUseRenderer toolUse={toolUse} toolResult={toolResult} compact />
+            <ToolUseRenderer client={client} toolUse={toolUse} toolResult={toolResult} compact />
           )}
         </ToolBlock>
       );

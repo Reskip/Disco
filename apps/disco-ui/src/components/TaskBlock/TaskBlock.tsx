@@ -26,10 +26,16 @@ import {
 import { Alert, Button, Collapse, Flex, Spin, Typography, theme } from 'antd';
 import React, { useMemo, useRef, useState } from 'react';
 import { getContextWindowGradient } from '../../utils/contextWindow';
+import {
+  formatQuestionReply,
+  getQuestionReply,
+  isInitialQuestionReplyMessage,
+} from '../../utils/questionReply';
 import { AgentChain } from '../AgentChain';
 import { CompactionBlock } from '../CompactionBlock';
 import { CopyableContent } from '../CopyableContent';
 import { MessageBlock } from '../MessageBlock';
+import { QuestionReplyMessage } from '../MessageBlock/QuestionReplyMessage';
 import { CreatedByTag } from '../metadata/CreatedByTag';
 import { ContextWindowPill, ModelPill, ScheduledRunPill, TimerPill, TokenCountPill } from '../Pill';
 import { RateLimitBlock } from '../RateLimitBlock';
@@ -564,6 +570,13 @@ export const TaskBlock = React.memo<TaskBlockProps>(
   }) => {
     const { token } = theme.useToken();
     const runtimeLive = shouldRenderLiveTaskProgress(task);
+    const questionReply = useMemo(
+      () => getQuestionReply({ full_prompt: task.full_prompt, metadata: task.metadata }),
+      [task.full_prompt, task.metadata]
+    );
+    const promptDisplayText = questionReply
+      ? formatQuestionReply(questionReply)
+      : task.full_prompt || '';
 
     const [reactiveMessagesLoading, setReactiveMessagesLoading] = React.useState(false);
 
@@ -706,7 +719,7 @@ export const TaskBlock = React.memo<TaskBlockProps>(
               copy-overlay (matches MessageBlock's pattern) — no tooltip,
               which got in the way of normal hover behavior. */}
           <CopyableContent
-            textContent={task.full_prompt || ''}
+            textContent={promptDisplayText}
             // Default offsets place the icon outside the wrapper, but the
             // task header has rounded corners with overflow:hidden which
             // clips it. Pull the icon inside the prompt row instead.
@@ -720,7 +733,7 @@ export const TaskBlock = React.memo<TaskBlockProps>(
                 paddingRight: token.sizeUnit * 3,
               }}
             >
-              {task.full_prompt || '用户消息'}
+              {promptDisplayText || '用户消息'}
             </Typography.Text>
           </CopyableContent>
 
@@ -739,9 +752,7 @@ export const TaskBlock = React.memo<TaskBlockProps>(
               lastExecutorHeartbeatAt={task.last_executor_heartbeat_at}
               latestExecutorPulse={task.latest_executor_pulse}
             />
-            {isScheduled && scheduledRunAt && (
-              <ScheduledRunPill scheduledRunAt={scheduledRunAt} />
-            )}
+            {isScheduled && scheduledRunAt && <ScheduledRunPill scheduledRunAt={scheduledRunAt} />}
             {task.created_by && (
               <CreatedByTag
                 createdBy={task.created_by}
@@ -889,21 +900,25 @@ export const TaskBlock = React.memo<TaskBlockProps>(
                             key={block.message.message_id}
                             data-conversation-block={getBlockMarker(block)}
                           >
-                            <MessageBlock
-                              message={block.message}
-                              agentic_tool={agentic_tool}
-                              userById={userById}
-                              currentUserId={task.created_by}
-                              isTaskRunning={runtimeLive && !compactionInProgress}
-                              sessionId={sessionId}
-                              onPermissionDecision={onPermissionDecision}
-                              isFirstPendingPermission={isFirstPending}
-                              isLatestMessage={isLatestMessage}
-                              taskId={task.task_id}
-                              teammateEmoji={teammateEmoji}
-                              client={client}
-                              onOpenAgenticToolSettings={onOpenAgenticToolSettings}
-                            />
+                            {questionReply && isInitialQuestionReplyMessage(task, block.message) ? (
+                              <QuestionReplyMessage reply={questionReply} />
+                            ) : (
+                              <MessageBlock
+                                message={block.message}
+                                agentic_tool={agentic_tool}
+                                userById={userById}
+                                currentUserId={task.created_by}
+                                isTaskRunning={runtimeLive && !compactionInProgress}
+                                sessionId={sessionId}
+                                onPermissionDecision={onPermissionDecision}
+                                isFirstPendingPermission={isFirstPending}
+                                isLatestMessage={isLatestMessage}
+                                taskId={task.task_id}
+                                teammateEmoji={teammateEmoji}
+                                client={client}
+                                onOpenAgenticToolSettings={onOpenAgenticToolSettings}
+                              />
+                            )}
                           </div>
                         );
                       }
@@ -936,20 +951,18 @@ export const TaskBlock = React.memo<TaskBlockProps>(
                       return null;
                     })}
 
-                  {!messagesLoading &&
-                    simpleMode &&
-                    turnStatusInsertIndex === blocks.length && (
-                      <>
-                        <TaskTurnStatus task={task} />
-                        {isVerifiedRuntimeInterruption(task, isLatestTask) && (
-                          <RuntimeInterruptionNotice
-                            task={task}
-                            sessionId={sessionId}
-                            client={client}
-                          />
-                        )}
-                      </>
-                    )}
+                  {!messagesLoading && simpleMode && turnStatusInsertIndex === blocks.length && (
+                    <>
+                      <TaskTurnStatus task={task} />
+                      {isVerifiedRuntimeInterruption(task, isLatestTask) && (
+                        <RuntimeInterruptionNotice
+                          task={task}
+                          sessionId={sessionId}
+                          client={client}
+                        />
+                      )}
+                    </>
+                  )}
 
                   {/* Show typing indicator whenever the executor may still be live.
                       Marked as a conversation block so its unmount at stream

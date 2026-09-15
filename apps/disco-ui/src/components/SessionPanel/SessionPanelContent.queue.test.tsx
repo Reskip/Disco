@@ -24,7 +24,7 @@ const SESSION = {
   status: 'running',
 } as Session;
 
-function renderQueue({ onEdit = vi.fn(async () => {}) } = {}) {
+function renderQueue({ onEdit = vi.fn(async () => {}), task = QUEUED_TASK } = {}) {
   const steer = vi.fn(async () => ({ result: { steered: true } }));
   const remove = vi.fn(async () => QUEUED_TASK);
   const client = {
@@ -36,7 +36,7 @@ function renderQueue({ onEdit = vi.fn(async () => {}) } = {}) {
   } as unknown as DiscoClient;
 
   function Harness() {
-    const [queuedTasks, setQueuedTasks] = React.useState<Task[]>([QUEUED_TASK]);
+    const [queuedTasks, setQueuedTasks] = React.useState<Task[]>([task]);
     return (
       <AntApp>
         <AppActionsProvider value={{}}>
@@ -70,6 +70,21 @@ function renderQueue({ onEdit = vi.fn(async () => {}) } = {}) {
 afterEach(() => vi.restoreAllMocks());
 
 describe('SessionPanelContent queued prompt controls', () => {
+  it('shows a readable question reply while its continuation waits in the queue', () => {
+    const task = {
+      ...QUEUED_TASK,
+      metadata: { system_authored: true, widget_id: 'question-1' as never },
+      full_prompt:
+        '[Disco] 用户已回答本次问题，请依据以下回答继续原任务。回答只针对对应问题，不是对其他操作的授权。\n' +
+        JSON.stringify([{ question: '怎样处理？', selected: ['保留原文件'], answer: '' }]),
+    };
+    renderQueue({ task });
+    const queue = screen.getByRole('region', { name: '排队消息' });
+    expect(queue).toHaveTextContent('问题：怎样处理？');
+    expect(queue).toHaveTextContent('回答：保留原文件');
+    expect(queue).not.toHaveTextContent('[Disco]');
+    expect(task.full_prompt).toContain('不是对其他操作的授权');
+  });
   it('标题不重复消息预览，并始终提供追加、编辑和删除', async () => {
     const onEdit = vi.fn(async () => {});
     renderQueue({ onEdit });

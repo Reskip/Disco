@@ -14,6 +14,7 @@ import { MOBILE_COMPOSER_QUERY, useMediaQuery } from '../../hooks/useMediaQuery'
 import { useDiscoStore } from '../../store/discoStore';
 import { selectUserById } from '../../store/selectors';
 import { useThemedMessage } from '../../utils/message';
+import { taskPromptDisplayText } from '../../utils/questionReply';
 import { ConversationView } from '../ConversationView';
 import { TaskPlanProgress, type TaskPlanViewModel } from '../StickyTodoRenderer';
 import type { ComposerAttachment } from './composerAttachments';
@@ -106,6 +107,7 @@ export const SessionPanelContent = React.memo<SessionPanelContentProps>(
     }, [queuedTasks.length]);
     const isQueueHeldByFailure = queuedTasks.length > 0 && session.status === 'failed';
 
+    // biome-ignore lint/correctness/useExhaustiveDependencies: Rebind the observer when the session or footer replaces the composer DOM.
     React.useLayoutEffect(() => {
       const composer = composerAnchorRef.current;
       const sessionBody = composer?.closest<HTMLElement>('.disco-session-body');
@@ -245,8 +247,8 @@ export const SessionPanelContent = React.memo<SessionPanelContentProps>(
                             <Typography.Text type="secondary">
                               {index === 0 ? '下一条' : `随后第 ${index + 1} 条`}
                             </Typography.Text>
-                            <Typography.Text ellipsis title={task.full_prompt}>
-                              {task.full_prompt}
+                            <Typography.Text ellipsis title={taskPromptDisplayText(task)}>
+                              {taskPromptDisplayText(task)}
                             </Typography.Text>
                           </div>
                           <div className="disco-queue-item-actions">

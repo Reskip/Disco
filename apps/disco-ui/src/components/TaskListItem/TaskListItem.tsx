@@ -1,4 +1,3 @@
-import type { Task } from '@disco-live/client';
 import {
   EditOutlined,
   FileTextOutlined,
@@ -6,8 +5,10 @@ import {
   MessageOutlined,
   ToolOutlined,
 } from '@ant-design/icons';
+import type { Task } from '@disco-live/client';
 import { Space, Tooltip, Typography, theme } from 'antd';
 import { parseGitStateSha } from '../../utils/gitState';
+import { taskPromptDisplayText } from '../../utils/questionReply';
 import { Tag } from '../Tag';
 import { TaskStatusIcon } from '../TaskStatusIcon';
 
@@ -37,7 +38,7 @@ const TaskListItem = ({ task, onClick, compact = false }: TaskListItemProps) => 
   const { cleanSha, isDirty } = parseGitStateSha(displaySha);
 
   // Truncate prompt if too long
-  const description = task.full_prompt || 'Untitled task';
+  const description = taskPromptDisplayText(task) || 'Untitled task';
   const isTruncated = description.length > TRUNCATION_LENGTH;
   const displayDescription = isTruncated
     ? `${description.substring(0, TRUNCATION_LENGTH)}...`
@@ -55,7 +56,7 @@ const TaskListItem = ({ task, onClick, compact = false }: TaskListItemProps) => 
       <div style={{ width: '100%' }}>
         <div style={{ marginBottom: 4 }}>
           <Space size={8}>
-            <Tooltip title={<div style={{ whiteSpace: 'pre-wrap' }}>{task.full_prompt}</div>}>
+            <Tooltip title={<div style={{ whiteSpace: 'pre-wrap' }}>{description}</div>}>
               <span>
                 <TaskStatusIcon status={task.status} size={16} />
               </span>

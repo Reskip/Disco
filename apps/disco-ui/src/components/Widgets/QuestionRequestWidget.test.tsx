@@ -44,12 +44,14 @@ const widget: WidgetMessageMetadata = {
 };
 const message = { session_id: 'session-a', metadata: { widget } } as Message;
 function setup(value = widget, create = vi.fn(async () => ({}))) {
-  const service = vi.fn(() => ({ create }));
+  const get = vi.fn(async () => ({ status: 'idle', agentic_tool: 'codex' }));
+  const service = vi.fn(() => ({ create, get }));
   const client = { service } as unknown as DiscoClient;
   return {
     client,
     create,
     service,
+    get,
     value,
     ui: <QuestionRequestWidget widget={value} message={message} client={client} />,
   };
@@ -68,6 +70,24 @@ describe('question card', () => {
     storeTokens(jwt);
     expect(getQuestionDraft('s-a', 'q-a').getState().answers).toEqual({});
     clearTokens();
+  });
+  it('does not resend a saved answer if the optional handoff fails', async () => {
+    const fixture = setup();
+    fixture.get.mockRejectedValue(new Error('connection lost after saving'));
+    render(fixture.ui);
+    fireEvent.click(screen.getByRole('button', { name: '跳过' }));
+    await screen.findByText('已跳过');
+    await waitFor(() => expect(fixture.get).toHaveBeenCalledExactlyOnceWith('session-a'));
+    expect(fixture.create).toHaveBeenCalledExactlyOnceWith({});
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '跳过' })).not.toBeInTheDocument();
+  });
+  it('respects questions with automatic continuation disabled', async () => {
+    const fixture = setup({ ...widget, auto_resume: false });
+    render(fixture.ui);
+    fireEvent.click(screen.getByRole('button', { name: '跳过' }));
+    await screen.findByText('已跳过');
+    expect(fixture.get).not.toHaveBeenCalled();
   });
   it('does not preselect, keeps the draft across navigation, and submits once', async () => {
     const fixture = setup();

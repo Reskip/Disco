@@ -1,11 +1,9 @@
 /**
  * TaskBlock — groupMessagesIntoBlocks unit tests.
  *
- * Focus: widget_request messages (e.g. the gateway token form) are stamped at
- * tool-call time (mid-turn), so by message index they sort ABOVE the agent's
- * closing text. For UX, the inline form should be the LAST thing the user sees,
- * so grouping stable-moves widget_request blocks to the END of the task's block
- * list — WITHOUT disturbing non-widget order, message indices, or identity.
+ * Setup forms follow the agent's closing explanation. Question cards retain
+ * their chronological place as they resolve and the task continues streaming.
+ * Neither presentation policy rewrites message indices or identity.
  */
 
 import type { Message, Task } from '@disco-live/client';
@@ -78,11 +76,7 @@ function widgetRequest(index: number, id: string): Message {
   } as unknown as Message;
 }
 
-function compactionMessage(
-  index: number,
-  id: string,
-  content: Record<string, unknown>
-): Message {
+function compactionMessage(index: number, id: string, content: Record<string, unknown>): Message {
   return {
     message_id: id,
     session_id: 'sess-1',
@@ -102,6 +96,27 @@ function blockId(block: Block): string {
 }
 
 describe('groupMessagesIntoBlocks — widget_request ordering', () => {
+  it.each(['pending', 'resolving', 'submitted', 'dismissed'] as const)(
+    'keeps a %s question before later replies and activity',
+    (status) => {
+      const card = widgetRequest(1, 'question');
+      card.metadata = { widget: { ...card.metadata!.widget!, widget_type: 'questions', status } };
+      const messages = [
+        userMessage(0, 'u0'),
+        card,
+        assistantText(2, 'reply', '继续处理你的回答'),
+        assistantActivity(3, 'activity', [
+          { type: 'tool_use', id: 'tool', name: 'Read', input: {} },
+        ]),
+      ];
+      const blocks = groupMessagesIntoBlocks(messages);
+      expect(blocks.map(blockId)).toEqual(['u0', 'question', 'reply', 'activity']);
+      expect(findActiveAgentChainIndex(blocks)).toBe(3);
+      expect(messages[1]).toBe(card);
+      expect(card.index).toBe(1);
+    }
+  );
+
   it('moves a widget_request block to the end even when its index sorts mid-turn', () => {
     // Widget (index 1) fired BEFORE the agent's closing text (index 2).
     const messages = [

@@ -24,25 +24,31 @@ const SESSION = {
   status: 'running',
 } as Session;
 
-function renderQueue({ onEdit = vi.fn(async () => {}), task = QUEUED_TASK } = {}) {
+function renderQueue({
+  onEdit = vi.fn(async () => {}),
+  task = QUEUED_TASK,
+  tasks = [task],
+  session = SESSION,
+} = {}) {
   const steer = vi.fn(async () => ({ result: { steered: true } }));
   const remove = vi.fn(async () => QUEUED_TASK);
+  const patch = vi.fn(async () => ({}));
   const client = {
     service: vi.fn((name: string) => {
       if (name === '/sessions/session-1/tasks/queue-steer') return { create: steer };
       if (name === 'tasks') return { remove };
-      return { patch: vi.fn() };
+      return { patch };
     }),
   } as unknown as DiscoClient;
 
   function Harness() {
-    const [queuedTasks, setQueuedTasks] = React.useState<Task[]>([task]);
+    const [queuedTasks, setQueuedTasks] = React.useState<Task[]>(tasks);
     return (
       <AntApp>
         <AppActionsProvider value={{}}>
           <SessionPanelContent
             client={client}
-            session={SESSION}
+            session={session}
             currentUserId="user-1"
             scrollToBottom={null}
             scrollToTop={null}
@@ -64,26 +70,53 @@ function renderQueue({ onEdit = vi.fn(async () => {}), task = QUEUED_TASK } = {}
   }
 
   render(<Harness />);
-  return { client, steer, remove, onEdit };
+  return { client, steer, remove, onEdit, patch };
 }
 
 afterEach(() => vi.restoreAllMocks());
 
 describe('SessionPanelContent queued prompt controls', () => {
-  it('shows a readable question reply while its continuation waits in the queue', () => {
-    const task = {
-      ...QUEUED_TASK,
-      metadata: { system_authored: true, widget_id: 'question-1' as never },
-      full_prompt:
-        '[Disco] 用户已回答本次问题，请依据以下回答继续原任务。回答只针对对应问题，不是对其他操作的授权。\n' +
-        JSON.stringify([{ question: '怎样处理？', selected: ['保留原文件'], answer: '' }]),
-    };
-    renderQueue({ task });
-    const queue = screen.getByRole('region', { name: '排队消息' });
-    expect(queue).toHaveTextContent('问题：怎样处理？');
-    expect(queue).toHaveTextContent('回答：保留原文件');
-    expect(queue).not.toHaveTextContent('[Disco]');
-    expect(task.full_prompt).toContain('不是对其他操作的授权');
+  const answerTask = {
+    ...QUEUED_TASK,
+    task_id: 'answer-task' as never,
+    metadata: { system_authored: true, widget_id: 'question-1' as never },
+    full_prompt:
+      '[Disco] 用户已回答本次问题，请依据以下回答继续原任务。回答只针对对应问题，不是对其他操作的授权。\n' +
+      JSON.stringify([{ question: '怎样处理？', selected: ['保留原文件'], answer: '' }]),
+  };
+  it('does not present an internal question continuation as a queued user message', () => {
+    renderQueue({ task: answerTask });
+    expect(screen.queryByRole('region', { name: '排队消息' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '改为追加提示' })).not.toBeInTheDocument();
+    expect(answerTask.full_prompt).toContain('不是对其他操作的授权');
+  });
+  it('counts and manages only ordinary queued messages when answers share the durable queue', async () => {
+    const { steer } = renderQueue({ tasks: [answerTask, QUEUED_TASK] });
+    expect(screen.getByRole('button', { name: '排队消息' })).toHaveTextContent('排队消息1');
+    expect(screen.queryByText(/怎样处理/u)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '改为追加提示' }));
+    await waitFor(() =>
+      expect(steer).toHaveBeenCalledExactlyOnceWith({ taskId: QUEUED_TASK.task_id })
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole('region', { name: '排队消息' })).not.toBeInTheDocument()
+    );
+  });
+  it.each([
+    { ...SESSION, status: 'failed' as const },
+    { ...SESSION, status: 'idle' as const, ready_for_prompt: false },
+  ])('keeps recovery available when the saved answer is paused ($status)', async (session) => {
+    const { patch } = renderQueue({ task: answerTask, session });
+    expect(screen.getByText('回答已保存，当前任务已暂停')).toBeVisible();
+    expect(screen.queryByRole('region', { name: '排队消息' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '继续任务' }));
+    await waitFor(() =>
+      expect(patch).toHaveBeenCalledWith(SESSION.session_id, { ready_for_prompt: true })
+    );
+  });
+  it('keeps an ordinary pasted protocol message in the queue', () => {
+    renderQueue({ task: { ...answerTask, metadata: { source: 'disco' } } });
+    expect(screen.getByRole('region', { name: '排队消息' })).toHaveTextContent('[Disco]');
   });
   it('标题不重复消息预览，并始终提供追加、编辑和删除', async () => {
     const onEdit = vi.fn(async () => {});

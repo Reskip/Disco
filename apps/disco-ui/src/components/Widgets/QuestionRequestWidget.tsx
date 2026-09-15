@@ -2,6 +2,7 @@ import type { QuestionAnswer, QuestionsParams, QuestionsResult } from '@disco-li
 import { Alert, Button, Card, Checkbox, Flex, Input, Radio, Space, Typography, theme } from 'antd';
 import { useStore } from 'zustand';
 import { registerWidgetComponent, type WidgetComponentProps } from '../MessageBlock/WidgetBlock';
+import { continueQuestionReply } from './continueQuestionReply';
 import { getQuestionDraft } from './questionDrafts';
 
 const emptyAnswer: QuestionAnswer = { selected: [], text: '' };
@@ -38,6 +39,11 @@ export function QuestionRequestWidget({ widget, message, client }: WidgetCompone
         .service(`widgets/${encodeURIComponent(widget.widget_id)}/${action}`)
         .create(action === 'submit' ? { answers: draft.getState().answers } : {});
       draft.setState({ resolved: action === 'submit' ? 'submitted' : 'dismissed' });
+      if (widget.auto_resume !== false) {
+        // A handoff failure must not turn a saved answer into a failed submission
+        // or submit it twice. Its durable continuation remains the fallback.
+        await continueQuestionReply(client, message.session_id, widget.widget_id).catch(() => {});
+      }
     } catch {
       draft.setState({ error: '提交未成功，请重试。你的回答已保留。' });
     } finally {

@@ -14,7 +14,7 @@ import { MOBILE_COMPOSER_QUERY, useMediaQuery } from '../../hooks/useMediaQuery'
 import { useDiscoStore } from '../../store/discoStore';
 import { selectUserById } from '../../store/selectors';
 import { useThemedMessage } from '../../utils/message';
-import { taskPromptDisplayText } from '../../utils/questionReply';
+import { getQuestionReply, taskPromptDisplayText } from '../../utils/questionReply';
 import { ConversationView } from '../ConversationView';
 import { TaskPlanProgress, type TaskPlanViewModel } from '../StickyTodoRenderer';
 import type { ComposerAttachment } from './composerAttachments';
@@ -57,7 +57,7 @@ export const SessionPanelContent = React.memo<SessionPanelContentProps>(
     currentUserId,
     setScrollToBottom,
     setScrollToTop,
-    queuedTasks,
+    queuedTasks: allQueuedTasks,
     setQueuedTasks,
     onEditQueuedTask,
     isOpen,
@@ -66,6 +66,16 @@ export const SessionPanelContent = React.memo<SessionPanelContentProps>(
     footerSlot = null,
   }) => {
     const mobileComposer = useMediaQuery(MOBILE_COMPOSER_QUERY);
+    // Answer continuations belong to their question cards, not the user's queue.
+    const queuedTasks = React.useMemo(
+      () => allQueuedTasks.filter((task) => !getQuestionReply(task)),
+      [allQueuedTasks]
+    );
+    const questionReplyPaused =
+      allQueuedTasks.length > queuedTasks.length &&
+      queuedTasks.length === 0 &&
+      (session.status === 'failed' ||
+        (session.status === 'idle' && session.ready_for_prompt === false));
     const { showError } = useThemedMessage();
     const userById = useDiscoStore(selectUserById);
     const { onPermissionDecision, onOpenAgenticToolSettings } = useAppActions();
@@ -193,8 +203,25 @@ export const SessionPanelContent = React.memo<SessionPanelContentProps>(
           onTaskPlanChange={handleTaskPlanChange}
         />
 
-        {(taskPlan || queuedTasks.length > 0) && (
+        {(taskPlan || queuedTasks.length > 0 || questionReplyPaused) && (
           <div className="disco-session-floating-dock">
+            {questionReplyPaused && (
+              <Alert
+                type="info"
+                showIcon
+                title="回答已保存，当前任务已暂停"
+                action={
+                  <Button
+                    size="small"
+                    onClick={() => void resumeQueue()}
+                    loading={resumeQueueInFlight}
+                    disabled={!client}
+                  >
+                    继续任务
+                  </Button>
+                }
+              />
+            )}
             {taskPlan && (
               <div className="disco-task-plan-anchor">
                 <TaskPlanProgress plan={taskPlan} />

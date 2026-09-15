@@ -9,6 +9,7 @@ const TaskStatus = {
 const MessageRole = {
   ASSISTANT: 'assistant',
 } as const;
+const { observeQuestionWidgets } = vi.hoisted(() => ({ observeQuestionWidgets: vi.fn() }));
 
 vi.mock('@disco-live/client', () => ({
   TaskStatus: {
@@ -70,15 +71,18 @@ vi.mock('../../hooks/useSharedReactiveSession', () => ({
 }));
 
 vi.mock('../TaskBlock', () => ({
-  TaskBlock: ({ task, isExpanded, onExpandChange, taskMessagesLoaded }: any) => (
-    <section data-testid={`task-${task.task_id}`} data-expanded={String(isExpanded)}>
-      <h2>{task.full_prompt}</h2>
-      <button type="button" onClick={() => onExpandChange(task.task_id, !isExpanded)}>
-        toggle {task.task_id}
-      </button>
-      {taskMessagesLoaded ? <div>messages loaded for {task.task_id}</div> : null}
-    </section>
-  ),
+  TaskBlock: ({ task, isExpanded, onExpandChange, taskMessagesLoaded, questionWidgets }: any) => {
+    observeQuestionWidgets(task.task_id, questionWidgets);
+    return (
+      <section data-testid={`task-${task.task_id}`} data-expanded={String(isExpanded)}>
+        <h2>{task.full_prompt}</h2>
+        <button type="button" onClick={() => onExpandChange(task.task_id, !isExpanded)}>
+          toggle {task.task_id}
+        </button>
+        {taskMessagesLoaded ? <div>messages loaded for {task.task_id}</div> : null}
+      </section>
+    );
+  },
 }));
 
 const mockUseSharedReactiveSession = vi.mocked(useSharedReactiveSession);
@@ -132,6 +136,7 @@ function makeState(overrides: Record<string, unknown>): any {
 
 describe('ConversationView auto-scroll integration', () => {
   beforeEach(() => {
+    observeQuestionWidgets.mockClear();
     transcriptHeight = 1600;
     viewportHeight = 600;
     mockState = {
@@ -468,5 +473,45 @@ describe('ConversationView auto-scroll integration', () => {
     );
 
     expect(screen.getByTestId('task-task-1')).toBeInTheDocument();
+  });
+
+  it('shares earlier question cards without changing their array on ordinary message patches', () => {
+    const card = {
+      ...makeMessage('task-1'),
+      type: 'widget_request',
+      metadata: { widget: { widget_type: 'questions', status: 'pending' } },
+    };
+    let state = makeState({
+      tasks: [makeTask('task-1', 'question'), makeTask('task-2', 'answer')],
+      messagesByTask: new Map([['task-1', [card]]]),
+    });
+    mockUseSharedReactiveSession.mockImplementation(() => ({ handle: null, state }));
+    const { rerender } = render(
+      <ConversationView client={null} sessionId={'session-1' as any} sessionModel="initial" />
+    );
+    const shared = observeQuestionWidgets.mock.calls.at(-1)![1];
+    expect(observeQuestionWidgets).toHaveBeenLastCalledWith('task-2', [card]);
+    state = {
+      ...state,
+      messagesByTask: new Map([
+        ['task-1', [card]],
+        ['task-2', [makeMessage('task-2')]],
+      ]),
+    };
+    rerender(
+      <ConversationView client={null} sessionId={'session-1' as any} sessionModel="patched" />
+    );
+    expect(observeQuestionWidgets.mock.calls.at(-1)![1]).toBe(shared);
+
+    const submitted = {
+      ...card,
+      metadata: { widget: { widget_type: 'questions', status: 'submitted' } },
+    };
+    state = { ...state, messagesByTask: new Map([['task-1', [submitted]]]) };
+    rerender(
+      <ConversationView client={null} sessionId={'session-1' as any} sessionModel="submitted" />
+    );
+    expect(observeQuestionWidgets).toHaveBeenLastCalledWith('task-2', [submitted]);
+    expect(observeQuestionWidgets.mock.calls.at(-1)![1]).not.toBe(shared);
   });
 });

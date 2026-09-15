@@ -4,6 +4,7 @@ import {
   formatQuestionReply,
   getQuestionReply,
   isInitialQuestionReplyMessage,
+  isQuestionReplyRepresentedByWidget,
   taskPromptDisplayText,
 } from './questionReply';
 
@@ -102,5 +103,106 @@ describe('question reply presentation', () => {
     const legacy = { ...task, metadata: { ...task.metadata, initial_message_id: undefined } };
     expect(isInitialQuestionReplyMessage(legacy, message)).toBe(true);
     expect(isInitialQuestionReplyMessage(legacy, { ...message, index: 11 })).toBe(false);
+  });
+});
+
+describe('saved question cards and legacy queue-to-steer messages', () => {
+  const full_prompt =
+    prefix +
+    JSON.stringify([{ question: '怎样处理？', selected: ['保留'], answer: '原样保留 &#x20;\n🙂' }]);
+  const card = {
+    message_id: 'card-1',
+    session_id: 'session-1',
+    task_id: 'original-task',
+    type: 'widget_request',
+    metadata: {
+      widget: {
+        widget_type: 'questions',
+        status: 'submitted',
+        params: { questions: [{ id: 'q', question: '怎样处理？' }] },
+        result_meta: { answers: { q: { selected: ['保留'], text: '原样保留 &#x20;\n🙂' } } },
+      },
+    },
+  } as Message;
+  const hint = {
+    session_id: card.session_id,
+    task_id: card.task_id,
+    role: 'user',
+    content: full_prompt,
+    metadata: { source: 'disco', is_steering_hint: true },
+  } as Message;
+
+  it('recognizes the exact persisted answer when queue-to-steer lost widget metadata', () => {
+    expect(isQuestionReplyRepresentedByWidget(hint, [card])).toBe(true);
+    expect(hint.content).toBe(full_prompt);
+  });
+
+  it('recognizes the new-task fallback when the original task finishes during handoff', () => {
+    const racedTask = {
+      ...task,
+      task_id: 'next-task' as never,
+      session_id: card.session_id,
+      full_prompt,
+      metadata: { source: 'disco' },
+    };
+    const initial = { ...hint, task_id: racedTask.task_id, metadata: { source: 'disco' } };
+    expect(getQuestionReply(racedTask, [card])?.status).toBe('submitted');
+    expect(isQuestionReplyRepresentedByWidget(initial, [card])).toBe(true);
+    expect(getQuestionReply(racedTask)).toBeNull();
+  });
+
+  it('keeps failures, ordinary messages, different answers and other sessions visible', () => {
+    const unchanged = JSON.stringify(card);
+    for (const candidate of [
+      { ...hint, role: 'assistant' as const },
+      { ...hint, metadata: {} },
+      { ...hint, metadata: { ...hint.metadata, steering_failed: true } },
+      { ...hint, content: '手动补充要求' },
+      { ...hint, content: full_prompt.replace('怎样处理', '何时处理') },
+      { ...hint, content: full_prompt.replace('保留', '删除') },
+      { ...hint, session_id: 'other-session' as never },
+    ])
+      expect(isQuestionReplyRepresentedByWidget(candidate, [card])).toBe(false);
+    expect(isQuestionReplyRepresentedByWidget(hint, [])).toBe(false);
+    expect(JSON.stringify(card)).toBe(unchanged);
+  });
+
+  it('requires a resolved, structurally valid card with matching saved results', () => {
+    const original = card.metadata!.widget!;
+    for (const widget of [
+      { ...original, status: 'pending' },
+      { ...original, widget_type: 'env_vars' },
+      { ...original, params: { questions: { length: 1 } } },
+      { ...original, params: {} },
+      { ...original, result_meta: undefined },
+    ]) {
+      expect(
+        isQuestionReplyRepresentedByWidget(hint, [{ ...card, metadata: { widget } } as Message])
+      ).toBe(false);
+    }
+  });
+
+  it('does not confuse a skip with an unrelated older dismissed card', () => {
+    const skip = {
+      ...hint,
+      content:
+        '[Disco] 用户跳过了本次提问，没有选择任何选项，也没有提供批准。请继续可独立完成的工作；不要假定答案或立即重复提问。',
+    };
+    const dismissed = {
+      ...card,
+      metadata: {
+        widget: {
+          ...card.metadata!.widget!,
+          status: 'dismissed' as const,
+        },
+      },
+    };
+    expect(isQuestionReplyRepresentedByWidget(skip, [dismissed])).toBe(true);
+    expect(
+      isQuestionReplyRepresentedByWidget({ ...skip, task_id: 'next-task' as never }, [dismissed])
+    ).toBe(false);
+    expect(
+      isQuestionReplyRepresentedByWidget({ ...skip, metadata: { source: 'disco' } }, [dismissed])
+    ).toBe(false);
   });
 });

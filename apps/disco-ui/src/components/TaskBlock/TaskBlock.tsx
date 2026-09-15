@@ -30,12 +30,12 @@ import {
   formatQuestionReply,
   getQuestionReply,
   isInitialQuestionReplyMessage,
+  isQuestionReplyRepresentedByWidget,
 } from '../../utils/questionReply';
 import { AgentChain } from '../AgentChain';
 import { CompactionBlock } from '../CompactionBlock';
 import { CopyableContent } from '../CopyableContent';
 import { MessageBlock } from '../MessageBlock';
-import { QuestionReplyMessage } from '../MessageBlock/QuestionReplyMessage';
 import { CreatedByTag } from '../metadata/CreatedByTag';
 import { ContextWindowPill, ModelPill, ScheduledRunPill, TimerPill, TokenCountPill } from '../Pill';
 import { RateLimitBlock } from '../RateLimitBlock';
@@ -82,6 +82,8 @@ interface TaskBlockProps {
   scheduledRunAt?: number;
   streamingMessages?: Map<string, StreamingMessageState>;
   taskMessages: Message[];
+  /** Hydrated question cards from this conversation, including previous tasks. */
+  questionWidgets?: Message[];
   taskMessagesLoaded: boolean;
   onLoadTaskMessages: (taskId: string) => Promise<void> | void;
   onUnloadTaskMessages: (taskId: string) => void;
@@ -450,18 +452,19 @@ export function groupMessagesIntoBlocks(messages: Message[]): Block[] {
     blocks.splice(insertPosition, 0, block);
   }
 
-  // Display-order only: stable-move widget_request blocks to the END of the
-  // task's block list so an inline widget (e.g. the gateway token form) renders
-  // BELOW the agent's closing text for the same turn — making it the last thing
-  // the user sees. Widgets are stamped at tool-call time (mid-turn), so by
-  // message index they'd otherwise sort above the agent's closing explanation.
-  // Non-widget blocks keep their original order; widget blocks keep their
-  // relative order at the end. This touches render order ONLY — message.index /
-  // identity (genealogy markers, streaming, React keys) are untouched.
-  const isWidgetBlock = (b: Block): boolean =>
-    b.type === 'message' && b.message.type === 'widget_request';
-  if (blocks.some(isWidgetBlock)) {
-    return [...blocks.filter((b) => !isWidgetBlock(b)), ...blocks.filter(isWidgetBlock)];
+  // Setup forms retain their placement below the agent's closing explanation.
+  // Question cards stay at their chronological position through pending,
+  // submitted and dismissed states, so continued replies/activity appear below
+  // the card and resolving it does not reshuffle the conversation.
+  const isTrailingSetupWidget = (b: Block): boolean =>
+    b.type === 'message' &&
+    b.message.type === 'widget_request' &&
+    b.message.metadata?.widget?.widget_type !== 'questions';
+  if (blocks.some(isTrailingSetupWidget)) {
+    return [
+      ...blocks.filter((b) => !isTrailingSetupWidget(b)),
+      ...blocks.filter(isTrailingSetupWidget),
+    ];
   }
 
   return blocks;
@@ -559,6 +562,7 @@ export const TaskBlock = React.memo<TaskBlockProps>(
     scheduledRunAt,
     streamingMessages,
     taskMessages,
+    questionWidgets = taskMessages,
     taskMessagesLoaded,
     onLoadTaskMessages,
     onUnloadTaskMessages,
@@ -571,8 +575,8 @@ export const TaskBlock = React.memo<TaskBlockProps>(
     const { token } = theme.useToken();
     const runtimeLive = shouldRenderLiveTaskProgress(task);
     const questionReply = useMemo(
-      () => getQuestionReply({ full_prompt: task.full_prompt, metadata: task.metadata }),
-      [task.full_prompt, task.metadata]
+      () => getQuestionReply(task, questionWidgets),
+      [task, questionWidgets]
     );
     const promptDisplayText = questionReply
       ? formatQuestionReply(questionReply)
@@ -632,7 +636,13 @@ export const TaskBlock = React.memo<TaskBlockProps>(
     // untouched (often large) tool-chain subtrees bail out of re-rendering.
     const prevBlocksRef = useRef<Block[]>([]);
     const blocks = useMemo(() => {
-      const next = groupMessagesIntoBlocks(messages);
+      const next = groupMessagesIntoBlocks(
+        messages.filter(
+          (message) =>
+            !(questionReply && isInitialQuestionReplyMessage(task, message)) &&
+            !isQuestionReplyRepresentedByWidget(message, questionWidgets)
+        )
+      );
       const prevByKey = new Map(prevBlocksRef.current.map((b) => [getBlockKey(b), b]));
       const reconciled = next.map((block) => {
         const prev = prevByKey.get(getBlockKey(block));
@@ -640,7 +650,7 @@ export const TaskBlock = React.memo<TaskBlockProps>(
       });
       prevBlocksRef.current = reconciled;
       return reconciled;
-    }, [messages]);
+    }, [messages, questionReply, questionWidgets, task]);
 
     // Only a chain that is literally the latest chronological block is live.
     // Once the assistant emits user-facing text, the preceding activity group
@@ -900,25 +910,21 @@ export const TaskBlock = React.memo<TaskBlockProps>(
                             key={block.message.message_id}
                             data-conversation-block={getBlockMarker(block)}
                           >
-                            {questionReply && isInitialQuestionReplyMessage(task, block.message) ? (
-                              <QuestionReplyMessage reply={questionReply} />
-                            ) : (
-                              <MessageBlock
-                                message={block.message}
-                                agentic_tool={agentic_tool}
-                                userById={userById}
-                                currentUserId={task.created_by}
-                                isTaskRunning={runtimeLive && !compactionInProgress}
-                                sessionId={sessionId}
-                                onPermissionDecision={onPermissionDecision}
-                                isFirstPendingPermission={isFirstPending}
-                                isLatestMessage={isLatestMessage}
-                                taskId={task.task_id}
-                                teammateEmoji={teammateEmoji}
-                                client={client}
-                                onOpenAgenticToolSettings={onOpenAgenticToolSettings}
-                              />
-                            )}
+                            <MessageBlock
+                              message={block.message}
+                              agentic_tool={agentic_tool}
+                              userById={userById}
+                              currentUserId={task.created_by}
+                              isTaskRunning={runtimeLive && !compactionInProgress}
+                              sessionId={sessionId}
+                              onPermissionDecision={onPermissionDecision}
+                              isFirstPendingPermission={isFirstPending}
+                              isLatestMessage={isLatestMessage}
+                              taskId={task.task_id}
+                              teammateEmoji={teammateEmoji}
+                              client={client}
+                              onOpenAgenticToolSettings={onOpenAgenticToolSettings}
+                            />
                           </div>
                         );
                       }

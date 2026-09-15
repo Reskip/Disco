@@ -21,7 +21,7 @@ import type {
 } from '@disco-live/client';
 import { TaskStatus } from '@disco-live/client';
 import { Alert, Button, Progress, Spin, Typography } from 'antd';
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useStickToBottom } from 'use-stick-to-bottom';
 import { useSharedReactiveSession } from '../../hooks/useSharedReactiveSession';
 import { useStreamingMessagesByTask } from '../../hooks/useStreamingMessagesByTask';
@@ -225,6 +225,27 @@ export const ConversationView = React.memo<ConversationViewProps>(
       () => (currentReactiveState?.tasks || []).filter((t) => t.status !== TaskStatus.QUEUED),
       [currentReactiveState?.tasks]
     );
+    const questionWidgetsRef = useRef<Message[]>(EMPTY_MESSAGES);
+    const questionWidgets = useMemo(() => {
+      const next = Array.from(currentReactiveState?.messagesByTask.values() || []).flatMap(
+        (messages) =>
+          messages.filter(
+            (message) =>
+              message.type === 'widget_request' &&
+              message.metadata?.widget?.widget_type === 'questions'
+          )
+      );
+      const previous = questionWidgetsRef.current;
+      // An ordinary message patch must not invalidate every TaskBlock's props.
+      if (
+        next.length === previous.length &&
+        next.every((widget, index) => widget === previous[index])
+      ) {
+        return previous;
+      }
+      questionWidgetsRef.current = next;
+      return next;
+    }, [currentReactiveState?.messagesByTask]);
 
     // Land at the bottom on panel open / session switch once real content is
     // available. The scroll container itself remains mounted during loading,
@@ -460,6 +481,7 @@ export const ConversationView = React.memo<ConversationViewProps>(
                 currentReactiveState?.messagesByTask.get(task.task_id) || EMPTY_MESSAGES
               }
               taskMessagesLoaded={!!currentReactiveState?.loadedTaskIds.has(task.task_id)}
+              questionWidgets={questionWidgets}
               onLoadTaskMessages={handleLoadTaskMessages}
               onUnloadTaskMessages={handleUnloadTaskMessages}
               teammateEmoji={teammateEmoji}

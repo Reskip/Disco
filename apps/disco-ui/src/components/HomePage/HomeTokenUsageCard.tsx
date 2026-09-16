@@ -7,6 +7,7 @@ import { useLocale } from '../../contexts/LocaleContext';
 import { useDiscoStore } from '../../store/discoStore';
 import { formatTokenCount } from '../../utils/formatTokenCount';
 import { estimateEntriesCostCny, formatEstimatedCny } from '../../utils/tokenPricing';
+import { HomeQuotaBar } from './HomeQuotaBar';
 
 const { Text } = Typography;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -1516,6 +1517,7 @@ export const HomeTokenUsageCard: React.FC<{
     (data.self?.totalTokens ?? 0) > 0 || data.daily.length > 0 || data.activity.length > 0;
   return (
     <Card
+      aria-label={t('tokenUsage')}
       style={{
         marginBottom: 18,
         overflow: 'hidden',
@@ -1617,6 +1619,8 @@ export const HomeTokenUsageCard: React.FC<{
               />
             </section>
           </div>
+
+          <HomeQuotaBar client={client} connected={connected} currentUserId={currentUserId} />
 
           <div
             style={{

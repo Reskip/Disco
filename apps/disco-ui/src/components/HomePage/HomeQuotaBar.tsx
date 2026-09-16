@@ -72,7 +72,12 @@ export function HomeQuotaBar({
       className="disco-home-quota"
       aria-label="本周额度"
       styles={{ body: { padding: '10px 14px' } }}
-      style={{ marginBottom: token.marginMD, borderRadius: token.borderRadiusLG }}
+      style={{
+        marginBottom: 12,
+        borderRadius: token.borderRadiusLG,
+        borderColor: token.colorBorderSecondary,
+        background: token.colorBgContainer,
+      }}
     >
       <div className="disco-home-quota-row">
         <Typography.Text

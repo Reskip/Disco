@@ -1,7 +1,9 @@
 # Home quota
 
-The compact home strip shows only the primary Codex bucket's weekly remaining
-percentage and reset time. It deliberately omits plan, other buckets, reset
+The compact quota subcard inside the home Token usage dashboard shows only the
+primary Codex bucket's weekly remaining percentage and reset time. It spans a full
+row between the history/model cards and the user-ranking/realtime cards. It omits
+plan, other buckets, reset
 credits, update timestamps, and a details menu.
 
 Authenticated clients read `GET /codex-quota` (Feathers `find`). The service is

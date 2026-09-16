@@ -6,6 +6,7 @@ export * from './agent-capability';
 export * from './agentic-tool';
 export * from './agentic-tool-preset';
 export * from './analytics';
+export * from './codex-quota';
 export * from './codex-skill';
 export * from './context';
 export * from './executor-transcript';

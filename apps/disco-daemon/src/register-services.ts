@@ -103,6 +103,7 @@ import { createClaudeModelsService } from './services/claude-models.js';
 import { createCodexAuthImportService } from './services/codex-auth-import.js';
 import { createCodexAuthLogoutService } from './services/codex-auth-logout.js';
 import { createCodexDeviceAuthService } from './services/codex-device-auth.js';
+import { CodexQuotaService } from './services/codex-quota.js';
 import {
   createCodexSkillsService,
   resolveCodexSkillRuntimeEntries,
@@ -273,6 +274,8 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
     events: [...TASKS_SERVICE_CUSTOM_EVENTS],
   });
   app.use('/leaderboard', createLeaderboardService(db));
+  app.use('/codex-quota', new CodexQuotaService(config), { methods: ['find'] });
+  app.service('/codex-quota').hooks({ before: { all: [ctx.requireAuth] } });
   app.use('/session-search', createSessionSearchService(db), { methods: ['find'] });
   app.use('/runtime-capabilities', createRuntimeCapabilitiesService(getRuntimeCapabilityCatalog), {
     methods: ['find'],

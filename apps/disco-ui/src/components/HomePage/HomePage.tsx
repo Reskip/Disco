@@ -4,6 +4,7 @@ import { memo, useState } from 'react';
 import { useLocale } from '../../contexts/LocaleContext';
 import { FilingNotice } from '../FilingNotice/FilingNotice';
 import { WorkspaceTeammateCreateModal } from '../WorkspaceShell/WorkspaceTeammateCreateModal';
+import { HomeQuotaBar } from './HomeQuotaBar';
 import { HomeTokenUsageCard } from './HomeTokenUsageCard';
 import type { HomePageProps } from './types';
 import { useDailyHomeGreeting } from './useDailyHomeGreeting';
@@ -105,6 +106,12 @@ export const HomePage = memo(function HomePage(props: HomePageProps) {
                 </Button>
               </div>
             </header>
+
+            <HomeQuotaBar
+              client={props.client}
+              connected={props.connected}
+              currentUserId={props.currentUser?.user_id}
+            />
 
             <HomeTokenUsageCard
               client={props.client}

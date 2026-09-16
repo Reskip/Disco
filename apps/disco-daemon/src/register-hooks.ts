@@ -268,6 +268,7 @@ export const TENANT_OWNED_SERVICE_PATHS = [
 export const TENANT_IDENTITY_ONLY_SERVICE_PATHS = [
   'executor-transcripts',
   'check-auth',
+  'codex-quota',
   'files',
   // Global catalog: no tenant column to scope, no writes to stamp.
   'mcp-catalog',

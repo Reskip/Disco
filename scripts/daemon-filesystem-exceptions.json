@@ -1,5 +1,19 @@
 [
   {
+    "id": "DAEMON-FS-CODEX-QUOTA-001",
+    "class": "A",
+    "file": "apps/disco-daemon/src/utils/codex-quota-reader.ts",
+    "import": "node:child_process",
+    "symbol": "spawn",
+    "local": "spawn",
+    "operation": "call:spawn@readHostCodexRateLimits#1",
+    "owner": "shared local Codex account quota",
+    "boundary": "operator-selected host login in simple shared-credential deployments only",
+    "rationale": "A short-lived native App Server reads quota metadata only. Authenticated users receive a three-field projection. No request-controlled executable, path, thread, login, or reset action is accepted; isolated tenant deployments do not invoke the reader.",
+    "reviewTarget": null,
+    "reviewDate": null
+  },
+  {
     "id": "DAEMON-FS-CAP-001",
     "class": "A",
     "file": "apps/disco-daemon/src/index.ts",

@@ -6,6 +6,39 @@
 
 /* Global styles for Disco UI */
 
+/* The approved quota strip reflows into two compact rows on narrow screens. */
+.disco-home-quota-row {
+  display: grid;
+  grid-template-columns: auto auto minmax(40px, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 22px;
+}
+
+@media (max-width: 600px) {
+  .disco-home-quota-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 4px 12px;
+  }
+  .disco-home-quota-title {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .disco-home-quota-value {
+    grid-column: 2;
+    grid-row: 1;
+    justify-self: end;
+  }
+  .disco-home-quota-track {
+    grid-column: 1;
+    grid-row: 2;
+  }
+  .disco-home-quota-reset {
+    grid-column: 2;
+    grid-row: 2;
+  }
+}
+
 .disco-filing-notice {
   color: var(--ant-color-text-quaternary);
   font-size: 11px;

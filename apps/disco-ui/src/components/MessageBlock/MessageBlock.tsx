@@ -568,11 +568,17 @@ function MessageTextSurface({
                     maxLines={12}
                     defaultExpanded={isLatestMessage}
                     isStreaming={renderAsStreaming}
+                    preserveLineBreaks={isUser}
                   >
                     {segment.text}
                   </CollapsibleMarkdown>
                 ) : (
-                  <MarkdownRenderer content={segment.text} inline isStreaming={renderAsStreaming} />
+                  <MarkdownRenderer
+                    content={segment.text}
+                    inline
+                    isStreaming={renderAsStreaming}
+                    preserveLineBreaks={isUser}
+                  />
                 )}
               </div>
             </CopyableContent>

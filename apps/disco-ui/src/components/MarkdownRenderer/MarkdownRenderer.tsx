@@ -28,6 +28,7 @@ import {
   streamdownRemarkPlugins,
   streamdownRichContentPlugins,
   streamdownRichContentPluginsWithVegaLite,
+  streamdownUserMessageRemarkPlugins,
 } from './richContentPlugins';
 import {
   createVegaLiteActivationBudget,
@@ -48,6 +49,8 @@ interface MarkdownRendererProps {
    * If true, renders inline (without <p> wrapper)
    */
   inline?: boolean;
+  /** Preserve the line breaks entered in a user chat message. */
+  preserveLineBreaks?: boolean;
   /**
    * Optional style to apply to the wrapper
    */
@@ -95,6 +98,7 @@ const LINK_SAFETY: LinkSafetyConfig = { enabled: false };
 const MarkdownRendererInner: React.FC<MarkdownRendererProps> = ({
   content,
   inline = false,
+  preserveLineBreaks = false,
   style,
   isStreaming = false,
   compact = false,
@@ -179,7 +183,11 @@ const MarkdownRendererInner: React.FC<MarkdownRendererProps> = ({
     <Typography style={mergedStyles} className={compact ? 'markdown-compact' : undefined}>
       <VegaLiteActivationBudgetContext.Provider value={vegaLiteActivationBudget}>
         <Streamdown
-          key={isStreaming ? undefined : markdownContentKey(rawText, { headingAnchors })}
+          key={
+            isStreaming
+              ? undefined
+              : markdownContentKey(rawText, { headingAnchors, preserveLineBreaks })
+          }
           mode={isStreaming ? 'streaming' : 'static'}
           parseIncompleteMarkdown={isStreaming} // Parse incomplete syntax only while streaming
           className={inline ? 'inline-markdown' : 'markdown-content'}
@@ -191,7 +199,9 @@ const MarkdownRendererInner: React.FC<MarkdownRendererProps> = ({
           allowedTags={{ 'disco-upload': ['upload_ref', 'filename'] }}
           linkSafety={LINK_SAFETY}
           rehypePlugins={rehypePlugins}
-          remarkPlugins={streamdownRemarkPlugins}
+          remarkPlugins={
+            preserveLineBreaks ? streamdownUserMessageRemarkPlugins : streamdownRemarkPlugins
+          }
           // Keep anchored documents in one Streamdown block so the heading slugger
           // sees the whole document and duplicate headings are deduped globally.
           parseMarkdownIntoBlocksFn={headingAnchors ? parseMarkdownAsSingleBlock : undefined}
@@ -207,7 +217,10 @@ const MarkdownRendererInner: React.FC<MarkdownRendererProps> = ({
 export const MarkdownRenderer = React.memo(MarkdownRendererInner);
 MarkdownRenderer.displayName = 'MarkdownRenderer';
 
-function markdownContentKey(text: string, options: { headingAnchors?: boolean } = {}): string {
+function markdownContentKey(
+  text: string,
+  options: { headingAnchors?: boolean; preserveLineBreaks?: boolean } = {}
+): string {
   // Streamdown memoizes several rendered markdown node components by AST
   // position. Container positions (for example a `<ul>` spanning multiple
   // bullets) do not change when text changes inside an earlier child line, so
@@ -219,9 +232,9 @@ function markdownContentKey(text: string, options: { headingAnchors?: boolean } 
     hash ^= text.charCodeAt(i);
     hash = Math.imul(hash, 0x01000193);
   }
-  return `${options.headingAnchors ? 'anchors' : 'plain'}:${text.length}:${(hash >>> 0).toString(
-    36
-  )}`;
+  return `${options.headingAnchors ? 'anchors' : 'plain'}:${options.preserveLineBreaks ? 'breaks' : 'soft'}:${text.length}:${(
+    hash >>> 0
+  ).toString(36)}`;
 }
 
 const parseMarkdownAsSingleBlock = (markdown: string) => [markdown];

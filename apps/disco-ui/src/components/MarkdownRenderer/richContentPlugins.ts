@@ -7,6 +7,10 @@ import remarkAlert from 'remark-github-blockquote-alert';
 import { defaultRemarkPlugins, type PluginConfig, type StreamdownProps } from 'streamdown';
 import { VegaLiteRendererGate } from './VegaLiteRendererGate';
 
+// Bundle KaTeX styles and fonts with the app. The plugin's runtime CSS path
+// alone is not resolved by Vite in production, leaving duplicate, unstyled math.
+import 'katex/dist/katex.min.css';
+
 const math = createMathPlugin({ singleDollarTextMath: true });
 
 export const streamdownRichContentPlugins: PluginConfig = {

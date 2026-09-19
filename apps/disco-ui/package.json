@@ -42,6 +42,7 @@
     "emojibase": "^17.0.0",
     "emojibase-data": "^17.0.0",
     "immer": "^11.1.16",
+    "katex": "0.16.47",
     "lz-string": "1.5.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",

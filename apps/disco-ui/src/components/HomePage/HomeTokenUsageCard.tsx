@@ -4,10 +4,12 @@ import { Avatar, Button, Card, Empty, Segmented, Tooltip, Typography, theme } fr
 import type React from 'react';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useLocale } from '../../contexts/LocaleContext';
+import { useOptionalTheme } from '../../contexts/ThemeContext';
 import { useDiscoStore } from '../../store/discoStore';
 import { formatTokenCount } from '../../utils/formatTokenCount';
 import { estimateEntriesCostCny, formatEstimatedCny } from '../../utils/tokenPricing';
 import { HomeQuotaBar } from './HomeQuotaBar';
+import { TOKEN_HEATMAP_PALETTE } from './tokenHeatmapPalette';
 
 const { Text } = Typography;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -477,19 +479,14 @@ const TokenHeatmap: React.FC<{
   locale: string;
 }> = ({ entries, locale }) => {
   const { token } = theme.useToken();
+  const isDark = useOptionalTheme()?.isDark ?? false;
   const { t } = useLocale();
   const containerRef = useRef<HTMLDivElement>(null);
   const [containerWidth, setContainerWidth] = useState(300);
   const weeks = weeksForHeatmapWidth(containerWidth);
   const cells = useMemo(() => buildDailyTokenCells(entries, weeks), [entries, weeks]);
   const gridWidth = weeks * HEATMAP_CELL_SIZE + Math.max(0, weeks - 1) * HEATMAP_CELL_GAP;
-  const colors = [
-    token.colorFillQuaternary,
-    token.colorPrimaryBg,
-    token.colorPrimaryBorder,
-    token.colorPrimary,
-    token.colorPrimaryActive,
-  ];
+  const colors = TOKEN_HEATMAP_PALETTE[isDark ? 'dark' : 'light'];
   const monthFormatter = useMemo(
     () => new Intl.DateTimeFormat(locale, { month: 'short', timeZone: 'UTC' }),
     [locale]

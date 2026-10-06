@@ -5,15 +5,15 @@ import path from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import {
-  resolveManagedAgenticToolPackageDirectory,
-  resolveManagedAgenticToolVersion,
-} from '@disco/core/agentic-integrations';
-import {
   buildRuntimeCapabilityCatalog,
   CODEX_NATIVE_RUNTIME_CAPABILITIES,
   type RuntimeCapabilityCatalog,
   type RuntimeCapabilityDefinition,
 } from '@disco/core';
+import {
+  resolveManagedAgenticToolPackageDirectory,
+  resolveManagedAgenticToolVersion,
+} from '@disco/core/agentic-integrations';
 import {
   buildHeadlessCodexCliConfigArgs,
   discoverHeadlessDisabledCodexSkillFiles,
@@ -145,7 +145,7 @@ function dynamicToolMatches(
   }
   return (
     registration.spec.name === call.namespace &&
-    registration.spec.tools.some(tool => tool.name === call.tool)
+    registration.spec.tools.some((tool) => tool.name === call.tool)
   );
 }
 
@@ -193,7 +193,7 @@ export async function executeCodexDynamicToolCall(
       success: false,
     };
   }
-  const registration = registrations.find(candidate => dynamicToolMatches(candidate, call));
+  const registration = registrations.find((candidate) => dynamicToolMatches(candidate, call));
   if (!registration) return undefined;
   try {
     const result = await registration.execute(call);
@@ -256,11 +256,11 @@ export function codexDynamicToolRuntimeCapabilities(
   registrations: readonly CodexDynamicToolRegistration[]
 ): RuntimeCapabilityDefinition[] {
   assertValidCodexDynamicTools(registrations);
-  return registrations.flatMap(registration => {
+  return registrations.flatMap((registration) => {
     const spec = registration.spec;
     const namespace = spec.type === 'namespace' ? spec.name : null;
     const tools = spec.type === 'namespace' ? spec.tools : [spec];
-    return tools.map(tool => ({
+    return tools.map((tool) => ({
       id: `client-dynamic:${namespace ? `${namespace}/` : ''}${tool.name}`,
       name: namespace ? `${namespace}.${tool.name}` : tool.name,
       provider: 'client-dynamic' as const,
@@ -366,7 +366,7 @@ function requestedPermissionProfileIsSafe(
     if (!Array.isArray(paths)) return false;
     if (
       paths.some(
-        candidate =>
+        (candidate) =>
           typeof candidate !== 'string' || !permissionPathIsSafe(candidate, boundary, cwd)
       )
     ) {
@@ -375,7 +375,7 @@ function requestedPermissionProfileIsSafe(
   }
   if (fileSystem.entries != null) {
     if (!Array.isArray(fileSystem.entries)) return false;
-    if (fileSystem.entries.some(entry => !permissionEntryIsSafe(entry, boundary, cwd))) {
+    if (fileSystem.entries.some((entry) => !permissionEntryIsSafe(entry, boundary, cwd))) {
       return false;
     }
   }
@@ -564,6 +564,26 @@ export class CodexAppServerClient {
     return forkedThreadId;
   }
 
+  /** Read every page, including hidden IDs that existing sessions may still use. */
+  async listModels(): Promise<unknown[]> {
+    await this.initialize();
+    const models: unknown[] = [];
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const page = await this.request<{ data: unknown[]; nextCursor?: string | null }>(
+        'model/list',
+        { limit: 100, includeHidden: true, ...(cursor ? { cursor } : {}) }
+      );
+      if (!Array.isArray(page.data)) throw new Error('Invalid Codex model/list response');
+      models.push(...page.data);
+      cursor = page.nextCursor || undefined;
+      if (cursor && cursors.has(cursor)) throw new Error('Repeated Codex model/list cursor');
+      if (cursor) cursors.add(cursor);
+    } while (cursor);
+    return models;
+  }
+
   async initialize(): Promise<void> {
     if (this.initializePromise) return this.initializePromise;
     this.initializePromise = (async () => {
@@ -650,9 +670,9 @@ export class CodexAppServerClient {
     this.pending.clear();
     this.closeNotifications();
 
-    const exited = new Promise<void>(resolve => child.once('exit', () => resolve()));
+    const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
-    const timedOut = new Promise<void>(resolve => {
+    const timedOut = new Promise<void>((resolve) => {
       setTimeout(() => {
         if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
         resolve();
@@ -692,7 +712,7 @@ export class CodexAppServerClient {
           reject(error);
         };
 
-        child.once('error', error => {
+        child.once('error', (error) => {
           rejectStartup(new Error(`Failed to start Codex app-server: ${error.message}`));
         });
 
@@ -716,7 +736,7 @@ export class CodexAppServerClient {
         });
 
         const rl = createInterface({ input: child.stdout });
-        rl.on('line', line => this.handleLine(line));
+        rl.on('line', (line) => this.handleLine(line));
       });
     })();
 
@@ -746,7 +766,7 @@ export class CodexAppServerClient {
       timer.unref();
 
       this.pending.set(id, {
-        resolve: value => resolve(value as T),
+        resolve: (value) => resolve(value as T),
         reject,
         timer,
       });
@@ -793,7 +813,7 @@ export class CodexAppServerClient {
         }
         const automaticResponse = this.options.autoApproveWorkspaceRequests
           ? automaticWorkspaceApprovalResponse(
-            method,
+              method,
               requestParams,
               this.options.filesystemApprovalBoundary
             )
@@ -802,7 +822,7 @@ export class CodexAppServerClient {
           this.respondToServerRequest(message.id, automaticResponse);
         } else if (method === 'item/tool/call') {
           void executeCodexDynamicToolCall(this.options.dynamicTools ?? [], requestParams).then(
-            result => {
+            (result) => {
               if (result) this.respondToServerRequest(message.id as number | string, result);
               else this.rejectUnsupportedServerRequest(message.id as number | string, method);
             }
@@ -846,7 +866,7 @@ export class CodexAppServerClient {
     const queued = this.notificationQueue.shift();
     if (queued) return Promise.resolve(queued);
     if (this.notificationsClosed) return Promise.resolve(undefined);
-    return new Promise(resolve => this.notificationWaiters.push(resolve));
+    return new Promise((resolve) => this.notificationWaiters.push(resolve));
   }
 
   private pushNotification(notification: CodexAppServerNotification): void {

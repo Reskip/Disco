@@ -29,7 +29,7 @@ import type {
 } from '@disco-live/client';
 import {
   DEFAULT_CNY_PER_USD,
-  DEFAULT_CODEX_MODEL,
+  getCodexCatalogSelectionError,
   OFFICIAL_TOKEN_PRICING,
   OPENAI_PRICING_SOURCE_URL,
 } from '@disco-live/client';
@@ -56,6 +56,7 @@ import {
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocale } from '../../contexts/LocaleContext';
 import { useOptionalTheme } from '../../contexts/ThemeContext';
+import { useCodexModels } from '../../hooks/useCodexModels';
 import { cropAvatarImage } from '../../utils/avatarImage';
 import {
   DISPLAY_SCALE_OPTIONS,
@@ -208,6 +209,7 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
     : resolvedProfileUsername || profileUsername;
   const effortLevels = AGENTIC_TOOL_CAPABILITIES.codex.reasoningEffortLevels ?? [];
   const preferredEffort = getPreferredReasoningEffort(effortLevels) ?? 'xhigh';
+  const codex = useCodexModels(client, open);
   const watchedModel = Form.useWatch('modelConfig', modelForm);
   const watchedEffort = Form.useWatch('effort', modelForm);
   const watchedAvatarUrl = Form.useWatch('avatar_url', profileForm);
@@ -225,7 +227,7 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
     modelForm.setFieldsValue({
       modelConfig: {
         mode: savedModel?.mode ?? 'alias',
-        model: savedModel?.model ?? DEFAULT_CODEX_MODEL,
+        model: savedModel?.model ?? '',
         provider: savedModel?.provider,
       },
       effort: savedModel?.effort ?? preferredEffort,
@@ -382,6 +384,12 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
   const saveModelDefaults = async () => {
     if (!currentUser || !onUpdateUser) return;
     const values = await modelForm.validateFields();
+    if (!values.modelConfig.model) values.modelConfig.model = codex.catalog.default;
+    const catalogError = getCodexCatalogSelectionError(codex.catalog, {
+      ...values.modelConfig,
+      effort: values.effort,
+    });
+    if (catalogError) return;
     const currentDefaults = currentUser.default_agentic_config ?? {};
     const currentCodex = currentDefaults.codex ?? {};
     setSavingModels(true);
@@ -654,11 +662,16 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
         <Form.Item label="默认模型">
           <div style={{ width: 'min(100%, 360px)' }}>
             <ModelSelector
-              value={watchedModel}
-              onChange={(modelConfig) => modelForm.setFieldValue('modelConfig', modelConfig)}
+              value={{ ...watchedModel, effort: watchedEffort }}
+              onChange={(modelConfig) =>
+                modelForm.setFieldsValue({
+                  modelConfig,
+                  ...(modelConfig.effort ? { effort: modelConfig.effort } : {}),
+                })
+              }
               agentic_tool="codex"
               client={client}
-              catalogEnabled={false}
+              catalogEnabled={open}
               compact
               showAdvisor={false}
             />
@@ -667,6 +680,9 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
         <Form.Item label="默认思考深度" required>
           <div style={{ width: 'min(100%, 240px)' }}>
             <EffortSelector
+              client={client}
+              catalogEnabled={open}
+              codexModel={watchedModel?.model || codex.catalog.default}
               value={watchedEffort ?? preferredEffort}
               onChange={(effort) => effort && modelForm.setFieldValue('effort', effort)}
               levels={effortLevels}
@@ -692,6 +708,9 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
           type="primary"
           className="disco-settings-save-button"
           loading={savingModels}
+          disabled={Boolean(
+            getCodexCatalogSelectionError(codex.catalog, { ...watchedModel, effort: watchedEffort })
+          )}
           onClick={() => void saveModelDefaults()}
         >
           保存默认值

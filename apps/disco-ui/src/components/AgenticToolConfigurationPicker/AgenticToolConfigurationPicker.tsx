@@ -1,8 +1,10 @@
 import { InfoCircleOutlined } from '@ant-design/icons';
 import type { AgenticToolName, DiscoClient, MCPServer, User } from '@disco-live/client';
+import { getCodexCatalogSelectionError, getCodexReplacementModel } from '@disco-live/client';
 import { Alert, Button, Checkbox, Form, Select, Space, Spin, Tooltip, Typography } from 'antd';
 import { useEffect } from 'react';
 import { useLocale } from '../../contexts/LocaleContext';
+import { useCodexModels } from '../../hooks/useCodexModels';
 import type { AgenticFormValues, AgenticToolConfigFormProps } from '../AgenticToolConfigForm';
 import { AgenticToolConfigForm, buildConfigFromFormValues } from '../AgenticToolConfigForm';
 import { SessionMcpServersField } from '../MCPServerSelect';
@@ -105,6 +107,7 @@ export const AgenticToolConfigurationPicker: React.FC<Props> = ({
     preferredSource,
     sourceOptions,
     getSourceError,
+    resolveConfiguration,
   } = useAgenticConfigurationSources({
     tool,
     client,
@@ -112,6 +115,15 @@ export const AgenticToolConfigurationPicker: React.FC<Props> = ({
     allowInlineSelection: !catalogUnavailable,
     preserveInlineSelection: catalogUnavailable && selected === INLINE_AGENTIC_CONFIGURATION,
   });
+  const codex = useCodexModels(
+    resolvedModelCatalogClient,
+    tool === 'codex' && configurationOwnerResolved
+  );
+  const resolved = resolveConfiguration(selected, { modelConfig, permissionMode });
+  const catalogError =
+    tool === 'codex'
+      ? getCodexCatalogSelectionError(codex.catalog, resolved.modelConfig)
+      : undefined;
   const storedInlineSummary = summarizeAgenticConfiguration(
     tool,
     {
@@ -157,7 +169,7 @@ export const AgenticToolConfigurationPicker: React.FC<Props> = ({
         rules={[
           {
             validator: () => {
-              const error = getSourceError(selected);
+              const error = getSourceError(selected) ?? catalogError;
               return error ? Promise.reject(new Error(error)) : Promise.resolve();
             },
           },
@@ -188,6 +200,37 @@ export const AgenticToolConfigurationPicker: React.FC<Props> = ({
         />
       </Form.Item>
 
+      {catalogError && selected !== INLINE_AGENTIC_CONFIGURATION && (
+        <Alert
+          type="warning"
+          title={catalogError}
+          action={
+            inlineAllowed ? (
+              <Button
+                size="small"
+                onClick={() => {
+                  const replacement = getCodexReplacementModel(
+                    codex.catalog,
+                    resolved.modelConfig?.model
+                  );
+                  if (!replacement) return;
+                  form.setFieldsValue({
+                    [fieldName]: INLINE_AGENTIC_CONFIGURATION,
+                    modelConfig: { mode: 'alias', model: replacement.id },
+                    effort: replacement.defaultReasoningEffort,
+                    permissionMode: resolved.permissionMode,
+                    codexSandboxMode: resolved.codexSandboxMode,
+                    codexApprovalPolicy: resolved.codexApprovalPolicy,
+                    codexNetworkAccess: resolved.codexNetworkAccess,
+                  });
+                }}
+              >
+                更换模型
+              </Button>
+            ) : undefined
+          }
+        />
+      )}
       {loadError && (
         <Alert
           type="error"

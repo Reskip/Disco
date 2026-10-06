@@ -14,6 +14,7 @@ import type {
   User,
 } from '@disco-live/client';
 import {
+  getCodexCatalogSelectionError,
   getDefaultPermissionMode,
   isAgenticToolName,
   mapToCodexPermissionConfig,
@@ -27,6 +28,7 @@ import { getDiscoPortalContainer } from '@/utils/portalContainer';
 import { getDaemonUrl } from '../../config/daemon';
 import { useAppActions } from '../../contexts/AppActionsContext';
 import { useConnectionDisabled } from '../../contexts/ConnectionContext';
+import { useCodexModels } from '../../hooks/useCodexModels';
 import { useSharedReactiveSession } from '../../hooks/useSharedReactiveSession';
 import { useDiscoStore } from '../../store/discoStore';
 import { selectUserById } from '../../store/selectors';
@@ -340,6 +342,10 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
   const activeAgenticTool =
     session && isAgenticToolName(session.agentic_tool) ? session.agentic_tool : undefined;
   const hasActiveAgenticTool = Boolean(activeAgenticTool);
+  const codex = useCodexModels(
+    client,
+    activeAgenticTool === 'codex' && session?.created_by === currentUserId
+  );
   const toolCaps = activeAgenticTool ? AGENTIC_TOOL_CAPABILITIES[activeAgenticTool] : undefined;
   const preferredEffort = getPreferredReasoningEffort(
     toolCaps?.reasoningEffortLevels,
@@ -654,6 +660,7 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
   React.useEffect(() => {
     if (
       !session?.model_config ||
+      session.agentic_tool === 'codex' ||
       session.model_config.effort ||
       !preferredEffort ||
       !onUpdateSession ||
@@ -725,6 +732,7 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
             model: session.model_config.model,
             provider: session.model_config.provider,
             advisorModel: session.model_config.advisorModel,
+            effort: session.model_config.effort,
           }
         : undefined,
     [
@@ -732,6 +740,7 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
       session?.model_config?.model,
       session?.model_config?.provider,
       session?.model_config?.advisorModel,
+      session?.model_config?.effort,
     ]
   );
 
@@ -845,6 +854,14 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
       return;
     }
 
+    const modelError =
+      session.agentic_tool === 'codex' && requestedFollowUpBehavior !== 'steer'
+        ? getCodexCatalogSelectionError(codex.catalog, session.model_config)
+        : undefined;
+    if (modelError) {
+      showError(modelError);
+      return;
+    }
     composerSendInFlightRef.current = true;
     const sendStartSessionId = session.session_id;
     const sendStartComposerIdentity = composerSessionIdentityRef.current;
@@ -1216,6 +1233,7 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
         ...session.model_config,
         mode: newConfig.mode,
         model: newConfig.model,
+        ...(newConfig.effort ? { effort: newConfig.effort } : {}),
         ...(newConfig.provider ? { provider: newConfig.provider } : {}),
         updated_at: new Date().toISOString(),
       };

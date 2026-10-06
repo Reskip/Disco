@@ -103,6 +103,7 @@ import { createClaudeModelsService } from './services/claude-models.js';
 import { createCodexAuthImportService } from './services/codex-auth-import.js';
 import { createCodexAuthLogoutService } from './services/codex-auth-logout.js';
 import { createCodexDeviceAuthService } from './services/codex-device-auth.js';
+import { createCodexModelsService } from './services/codex-models.js';
 import { CodexQuotaService } from './services/codex-quota.js';
 import {
   createCodexSkillsService,
@@ -473,6 +474,8 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   // Resolves ANTHROPIC_API_KEY per-user (with config.yaml + env fallback)
   // and falls back to AVAILABLE_CLAUDE_MODEL_ALIASES if no key or API failure.
   app.use('/claude-models', createClaudeModelsService(db));
+  app.use('/codex-models', createCodexModelsService(app, db), { methods: ['find'] });
+  app.service('/codex-models').hooks({ before: { find: [ctx.requireAuth] } });
   app.service('/claude-models').hooks({ before: { find: [ctx.requireAuth] } });
 
   // Copilot dynamic model discovery via @github/copilot-sdk's listModels().

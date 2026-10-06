@@ -1,10 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   assertValidCodexDynamicTools,
   automaticWorkspaceApprovalResponse,
   buildCodexAppServerCapabilityCatalog,
-  codexDynamicToolRuntimeCapabilities,
   CodexAppServerClient,
+  codexDynamicToolRuntimeCapabilities,
   executeCodexDynamicToolCall,
   resolveCodexAppServerChildEnvironment,
 } from './app-server-client.js';
@@ -272,9 +272,12 @@ describe('assertValidCodexDynamicTools', () => {
       description: 'Echo',
       inputSchema: { type: 'object' },
     };
-    expect(() => assertValidCodexDynamicTools([{ spec, execute }, { spec, execute }])).toThrow(
-      'Duplicate Codex dynamic tool'
-    );
+    expect(() =>
+      assertValidCodexDynamicTools([
+        { spec, execute },
+        { spec, execute },
+      ])
+    ).toThrow('Duplicate Codex dynamic tool');
     expect(() =>
       assertValidCodexDynamicTools([
         {
@@ -343,5 +346,37 @@ describe('Codex runtime capability catalog', () => {
     expect(client.runtimeCapabilityCatalog.entries).toEqual(
       expect.arrayContaining([expect.objectContaining({ id: 'codex-native:thread-resume' })])
     );
+  });
+});
+
+describe('Codex model/list pagination', () => {
+  it('reads every page and includes hidden entries without starting a thread', async () => {
+    const client = new CodexAppServerClient();
+    vi.spyOn(client, 'initialize').mockResolvedValue();
+    const request = vi
+      .spyOn(
+        client as unknown as { request(method: string, params: unknown): Promise<unknown> },
+        'request'
+      )
+      .mockResolvedValueOnce({ data: [{ model: 'first' }], nextCursor: 'page-two' })
+      .mockResolvedValueOnce({ data: [{ model: 'hidden', hidden: true }], nextCursor: null });
+    expect(await client.listModels()).toEqual([
+      { model: 'first' },
+      { model: 'hidden', hidden: true },
+    ]);
+    expect(request).toHaveBeenLastCalledWith('model/list', {
+      limit: 100,
+      includeHidden: true,
+      cursor: 'page-two',
+    });
+  });
+  it('fails an incomplete catalog if pagination repeats or a later page fails', async () => {
+    const client = new CodexAppServerClient();
+    vi.spyOn(client, 'initialize').mockResolvedValue();
+    vi.spyOn(
+      client as unknown as { request(method: string, params: unknown): Promise<unknown> },
+      'request'
+    ).mockResolvedValue({ data: [{ model: 'first' }], nextCursor: 'same' });
+    await expect(client.listModels()).rejects.toThrow('Repeated');
   });
 });

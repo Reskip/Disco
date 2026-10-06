@@ -42,7 +42,7 @@ const _CODEX_MODEL_REGISTRY = {
   },
   // GPT-5.6 models
   'gpt-5.6-sol': {
-    name: 'GPT-5.6 Sol (Recommended)',
+    name: 'GPT-5.6 Sol',
     description: 'Flagship GPT-5.6 model for complex, open-ended work',
     status: 'current',
     selectable: true,
@@ -313,48 +313,12 @@ export type CodexModelSelection = {
   model: string;
 };
 
-/**
- * Validate a newly selected Codex model.
- *
- * `alias` is Disco's known-model selection mode, so only entries exposed by
- * CODEX_MODEL_METADATA are accepted. Some older entries are provider-dependent
- * and can still be rejected for a particular account. `exact` is an explicit provider model
- * ID escape hatch: unknown IDs are allowed because availability is
- * account-specific and can change independently of an Disco release. Known
- * aliases marked unsupported are rejected in either mode.
- *
- * This is selection-time validation. Persisted sessions are not scanned or
- * invalidated when the registry changes; the provider remains authoritative
- * at dispatch time.
- */
+/** Model IDs are provider-owned. Availability is checked against the live catalog. */
 export function getCodexModelSelectionError(
   selection: CodexModelSelection | null | undefined
 ): string | undefined {
-  if (!selection?.model) return undefined;
-
-  const lifecycle = getCodexModelLifecycle(selection.model);
-  if (lifecycle?.availability === 'unsupported') {
-    return formatUnsupportedDiscoCodexModelMessage(selection.model);
-  }
-  if (selection.mode === 'exact') return undefined;
-  const normalized = selection.model.toLowerCase();
-  if (Object.hasOwn(CODEX_MODEL_METADATA, normalized)) {
-    if (selection.model === normalized) return undefined;
-    return (
-      `Codex model alias "${selection.model}" must use its canonical registry casing: ` +
-      `"${normalized}". Use that value, or pass mode "exact" for an intentional ` +
-      'provider-specific model ID.'
-    );
-  }
-
-  const replacement = lifecycle?.replacement ?? DEFAULT_CODEX_MODEL;
-  return (
-    `Codex model "${selection.model}" is not a selectable Disco Codex alias. ` +
-    `Call disco_models_list for current selectable aliases, omit modelConfig to use the default ` +
-    `(${DEFAULT_CODEX_MODEL}), or use "${replacement}". ` +
-    'If this is an intentional provider-specific model ID, pass modelConfig with mode "exact"; ' +
-    'provider/account availability will then be checked when Codex starts.'
-  );
+  if (selection?.model && !selection.model.trim()) return '请选择 Codex 模型。';
+  return undefined;
 }
 
 export function formatUnsupportedDiscoCodexModelMessage(model: string): string {

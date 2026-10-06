@@ -76,46 +76,15 @@ describe('Codex model registry', () => {
     expect(message).toContain('omit modelConfig');
   });
 
-  it('accepts curated aliases and rejects unknown alias selections actionably', () => {
-    expect(getCodexModelSelectionError({ mode: 'alias', model: 'gpt-5.6-sol' })).toBeUndefined();
-    expect(getCodexModelSelectionError({ mode: 'alias', model: 'gpt-6-astra' })).toBeUndefined();
-    expect(getCodexModelSelectionError({ mode: 'alias', model: 'gpt-5.4' })).toBeUndefined();
-
-    const error = getCodexModelSelectionError({
-      mode: 'alias',
-      model: 'gpt-5.6-codex',
-    });
-    expect(error).toContain('gpt-5.6-codex');
-    expect(error).toContain('disco_models_list');
-    expect(error).toContain('mode "exact"');
-  });
-
-  it('requires dated provider snapshots to use exact mode', () => {
-    const snapshot = 'gpt-5.6-sol-2026-07-09';
-
-    expect(getCodexModelSelectionError({ mode: 'alias', model: snapshot })).toContain(
-      'mode "exact"'
-    );
-    expect(getCodexModelSelectionError({ mode: 'exact', model: snapshot })).toBeUndefined();
-  });
-
-  it('rejects non-canonical alias casing instead of persisting it unchanged', () => {
-    const error = getCodexModelSelectionError({
-      mode: 'alias',
-      model: 'GPT-5.6-SOL',
-    });
-
-    expect(error).toContain('canonical registry casing');
-    expect(error).toContain('"gpt-5.6-sol"');
-    expect(getCodexModelSelectionError({ mode: 'exact', model: 'GPT-5.6-SOL' })).toBeUndefined();
-  });
-
-  it('allows unknown exact provider IDs but still rejects known unsupported aliases', () => {
-    expect(
-      getCodexModelSelectionError({ mode: 'exact', model: 'account-preview-model' })
-    ).toBeUndefined();
-    expect(getCodexModelSelectionError({ mode: 'exact', model: 'gpt-5-codex' })).toContain(
-      'legacy alias'
-    );
+  it('does not reject provider-owned IDs using a stale built-in registry', () => {
+    for (const model of [
+      'brand-new-model',
+      'gpt-5-codex',
+      'GPT-5.6-SOL',
+      'gpt-5.6-sol-2026-07-09',
+    ]) {
+      expect(getCodexModelSelectionError({ mode: 'alias', model })).toBeUndefined();
+      expect(getCodexModelSelectionError({ mode: 'exact', model })).toBeUndefined();
+    }
   });
 });

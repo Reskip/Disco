@@ -6,15 +6,20 @@ import {
   CODEX_MODEL_METADATA,
   COPILOT_MODEL_METADATA,
   CURSOR_MODEL_METADATA,
+  codexModelDisplayName,
   DEFAULT_CODEX_MODEL,
   DEFAULT_COPILOT_MODEL,
   type DiscoClient,
+  type EffortLevel,
   GEMINI_MODELS,
   type GeminiModel,
+  getCodexCatalogSelectionError,
+  getCodexReplacementModel,
 } from '@disco-live/client';
 import { AutoComplete, Button, Flex, Select, Space, Tag, Tooltip, Typography, theme } from 'antd';
 import { useEffect, useState } from 'react';
 import { useLocale } from '../../contexts/LocaleContext';
+import { useCodexModels } from '../../hooks/useCodexModels';
 import { AdvisorModelSelect } from './AdvisorModelSelect';
 import {
   curateModelOptions,
@@ -30,6 +35,7 @@ export interface ModelConfig {
   model: string;
   // Claude Code-specific: server-side advisor tool model.
   advisorModel?: string;
+  effort?: EffortLevel;
   // OpenCode-specific: provider + model
   provider?: string;
 }
@@ -178,6 +184,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
   // Determine which model list to use based on agentic_tool (with backwards compat for agent prop)
   const effectiveTool = agentic_tool || agent || 'claude-code';
   const isClaude = effectiveTool === 'claude-code';
+  const codex = useCodexModels(client, catalogEnabled && effectiveTool === 'codex');
   const ToolModelSelector = getAgenticToolUIIntegration(effectiveTool)?.ModelSelector;
 
   // Dynamic model lists — fetched once when the picker opens for a given tool
@@ -294,7 +301,9 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
   const rawModelList = ToolModelSelector
     ? []
     : effectiveTool === 'codex'
-      ? CODEX_MODEL_OPTIONS
+      ? codex.catalog.source === 'static'
+        ? CODEX_MODEL_OPTIONS
+        : codex.catalog.models.filter((model) => !model.hidden)
       : effectiveTool === 'gemini'
         ? GEMINI_MODEL_OPTIONS
         : effectiveTool === 'copilot'
@@ -337,16 +346,22 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
     );
   }
 
-  const fallbackModel = getModelSelectorFallbackModel(effectiveTool, rawModelList, {
-    copilotDefaultModel,
-    cursorDefaultModel,
-  });
+  const fallbackModel =
+    effectiveTool === 'codex'
+      ? codex.catalog.default
+      : getModelSelectorFallbackModel(effectiveTool, rawModelList, {
+          copilotDefaultModel,
+          cursorDefaultModel,
+        });
 
   const normalizedList = rawModelList.map(normalizeModelOption).map((model) => ({
     ...model,
-    displayName: localizeModelName(model.displayName, locale),
+    displayName:
+      effectiveTool === 'codex'
+        ? codexModelDisplayName(model.displayName)
+        : localizeModelName(model.displayName, locale),
     description:
-      locale === 'zh-CN' && effectiveTool === 'codex'
+      locale === 'zh-CN' && effectiveTool === 'codex' && codex.catalog.source === 'static'
         ? (CODEX_DESCRIPTION_ZH[model.id] ?? model.description)
         : model.description,
   }));
@@ -354,8 +369,44 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
   const currentModel = value?.model || fallbackModel;
 
   const selectAlias = (model: string) => {
-    onChange?.({ ...value, mode: 'alias', model });
+    const option = codex.catalog.models.find((item) => item.id === model);
+    const effort =
+      value?.effort && option?.supportedReasoningEfforts?.includes(value.effort)
+        ? value.effort
+        : option?.defaultReasoningEffort;
+    onChange?.({
+      ...value,
+      mode: 'alias',
+      model,
+      ...(effectiveTool === 'codex' && effort ? { effort } : {}),
+    });
   };
+  const codexError =
+    effectiveTool === 'codex'
+      ? getCodexCatalogSelectionError(
+          codex.catalog,
+          value ? { ...value, effort: undefined } : value
+        )
+      : undefined;
+  const replacement = getCodexReplacementModel(codex.catalog, value?.model);
+  const catalogNotice =
+    effectiveTool === 'codex' &&
+    (codexError ||
+      (!codex.loading && codex.catalog.source !== 'dynamic' && client && catalogEnabled)) ? (
+      <div role="status" style={{ whiteSpace: 'normal', fontSize: token.fontSizeSM }}>
+        <Typography.Text type={codexError ? 'warning' : 'secondary'}>
+          {codexError ?? '暂时无法更新模型列表，已保留原选择。'}
+        </Typography.Text>
+        {codexError && replacement && (
+          <Button size="small" type="link" onClick={() => selectAlias(replacement.id)}>
+            更换为 {replacement.displayName}
+          </Button>
+        )}
+        <Button size="small" type="link" loading={codex.loading} onClick={codex.refresh}>
+          刷新列表
+        </Button>
+      </div>
+    ) : null;
   const selectPinned = (model: string) => {
     onChange?.({ ...value, mode: 'exact', model });
   };
@@ -414,12 +465,12 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
           )}
         </div>
         <Space size={4}>
-          {data?.availability === 'provider-dependent' && (
+          {effectiveTool !== 'codex' && data?.availability === 'provider-dependent' && (
             <Tag bordered={false} color="gold" style={{ marginInlineEnd: 0, fontSize: 10 }}>
               {locale === 'zh-CN' ? '账号相关' : 'account-dependent'}
             </Tag>
           )}
-          {data?.isDefault && (
+          {effectiveTool !== 'codex' && data?.isDefault && (
             <Tag bordered={false} color="blue" style={{ marginInlineEnd: 0, fontSize: 10 }}>
               {locale === 'zh-CN' ? '默认' : 'default'}
             </Tag>
@@ -434,7 +485,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
     const compactOptions = aliasOptions.map((o) => ({
       value: o.value,
       label:
-        o.availability === 'provider-dependent'
+        effectiveTool !== 'codex' && o.availability === 'provider-dependent'
           ? `${o.label} ${locale === 'zh-CN' ? '（账号相关）' : '(account-dependent)'}`
           : o.label,
       searchText: o.searchText,
@@ -452,6 +503,10 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
     const modelSelect = (
       <Select
         value={currentModel}
+        loading={effectiveTool === 'codex' && codex.loading}
+        onOpenChange={(open) => {
+          if (open && effectiveTool === 'codex') codex.refresh();
+        }}
         onChange={selectAlias}
         size="middle"
         showSearch
@@ -464,7 +519,13 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
       />
     );
 
-    if (!isClaude || !showAdvisor) return modelSelect;
+    if (!isClaude || !showAdvisor)
+      return (
+        <div style={{ width: '100%' }}>
+          {modelSelect}
+          {catalogNotice}
+        </div>
+      );
 
     return (
       <Space orientation="vertical" size={6} style={{ width: '100%' }}>
@@ -489,6 +550,10 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
         <Select
           showSearch
           value={currentModel}
+          loading={effectiveTool === 'codex' && codex.loading}
+          onOpenChange={(open) => {
+            if (open && effectiveTool === 'codex') codex.refresh();
+          }}
           onChange={selectAlias}
           optionLabelProp="label"
           filterOption={(input, option) => (option?.searchText ?? '').includes(input.toLowerCase())}
@@ -515,6 +580,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
         />
       )}
 
+      {catalogNotice}
       {!pinned ? (
         <Button
           type="link"
@@ -531,7 +597,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
           onClick={disablePin}
           style={{ height: 'auto', padding: 0, fontSize: token.fontSizeSM }}
         >
-          使用推荐模型
+          {effectiveTool === 'codex' ? '从模型列表选择' : '使用推荐模型'}
         </Button>
       )}
 

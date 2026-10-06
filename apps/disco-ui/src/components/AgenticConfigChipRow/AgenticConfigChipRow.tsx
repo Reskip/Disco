@@ -1,27 +1,33 @@
 import {
+  ApiOutlined,
+  ExperimentOutlined,
+  InfoCircleOutlined,
+  RobotOutlined,
+} from '@ant-design/icons';
+import {
   AGENTIC_TOOL_CAPABILITIES,
   agenticToolRequiresModelSelection,
   getAgenticToolModelSelectionError,
 } from '@disco/agentic-tools';
 import type {
   AgenticToolName,
-  DiscoClient,
   DefaultAgenticToolConfig,
+  DiscoClient,
   EffortLevel,
   MCPServer,
   PermissionMode,
   User,
 } from '@disco-live/client';
-import { getDefaultModelForTool, getDefaultPermissionMode } from '@disco-live/client';
 import {
-  ApiOutlined,
-  ExperimentOutlined,
-  InfoCircleOutlined,
-  RobotOutlined,
-} from '@ant-design/icons';
+  getCodexCatalogSelectionError,
+  getCodexReplacementModel,
+  getDefaultModelForTool,
+  getDefaultPermissionMode,
+} from '@disco-live/client';
 import { Alert, Button, Checkbox, Flex, Form, Popover, Select, Typography, theme } from 'antd';
 import { useEffect, useState } from 'react';
 import { mapToArray } from '@/utils/mapHelpers';
+import { useCodexModels } from '../../hooks/useCodexModels';
 import {
   INLINE_AGENTIC_CONFIGURATION,
   SAVE_AS_DEFAULT_FIELD,
@@ -108,6 +114,7 @@ export const AgenticConfigChipRow: React.FC<AgenticConfigChipRowProps> = ({
   const { token } = theme.useToken();
   const form = Form.useFormInstance();
   const isClaude = CLAUDE_TOOLS.has(tool);
+  const codex = useCodexModels(client, tool === 'codex' && catalogEnabled);
   const toolCapabilities = AGENTIC_TOOL_CAPABILITIES[tool];
   const effortLevels = toolCapabilities.reasoningEffortLevels;
   const supportsEffort = showEffort && Boolean(effortLevels?.length);
@@ -148,7 +155,15 @@ export const AgenticConfigChipRow: React.FC<AgenticConfigChipRowProps> = ({
 
   const resolved = configForSource(source);
   const resolvedModelConfig = resolved.modelConfig as ModelConfig | undefined;
+  const codexError =
+    tool === 'codex'
+      ? getCodexCatalogSelectionError(codex.catalog, {
+          ...resolvedModelConfig,
+          effort: isInline ? formEffort : resolved.modelConfig?.effort,
+        })
+      : undefined;
   const configError =
+    codexError ??
     getSourceError(source) ??
     (validateModelSelection
       ? getAgenticToolModelSelectionError(tool, resolvedModelConfig)
@@ -189,6 +204,7 @@ export const AgenticConfigChipRow: React.FC<AgenticConfigChipRowProps> = ({
   const onModelChange = (next: ModelConfig) => {
     ensureCustom();
     form.setFieldValue('modelConfig', next);
+    if (tool === 'codex' && next.effort) form.setFieldValue('effort', next.effort);
   };
   const onPermissionChange = (mode: PermissionMode) => {
     ensureCustom();
@@ -274,6 +290,30 @@ export const AgenticConfigChipRow: React.FC<AgenticConfigChipRowProps> = ({
         />
       )}
 
+      {codexError && (
+        <Alert
+          type="warning"
+          title={codexError}
+          action={
+            inlineAllowed ? (
+              <Button
+                size="small"
+                onClick={() => {
+                  const model = getCodexReplacementModel(codex.catalog, resolvedModelConfig?.model);
+                  if (model)
+                    onModelChange({
+                      mode: 'alias',
+                      model: model.id,
+                      effort: model.defaultReasoningEffort,
+                    });
+                }}
+              >
+                更换模型
+              </Button>
+            ) : undefined
+          }
+        />
+      )}
       <Flex gap={token.marginXS} align="center" wrap="wrap">
         {(resolvedModel || agenticToolRequiresModelSelection(tool)) && (
           <EditableChip
@@ -336,6 +376,9 @@ export const AgenticConfigChipRow: React.FC<AgenticConfigChipRowProps> = ({
             testid="effort-chip"
             renderContent={(close) => (
               <EffortSelector
+                client={client}
+                catalogEnabled={catalogEnabled}
+                codexModel={tool === 'codex' ? resolvedModel : undefined}
                 value={resolvedEffort}
                 levels={effortLevels}
                 fallbackValue={toolCapabilities.defaultReasoningEffort}

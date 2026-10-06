@@ -1,3 +1,4 @@
+import type { DiscoClient } from '@disco-live/client';
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { EffortSelector } from './EffortSelector';
@@ -40,5 +41,36 @@ describe('EffortSelector', () => {
     fireEvent.mouseEnter(select);
     fireEvent.mouseDown(container.querySelector('.ant-select-clear') as Element);
     expect(onChange.mock.calls.at(-1)?.[0]).toBeUndefined();
+  });
+
+  it('keeps an unsupported saved effort until the user explicitly replaces it', async () => {
+    const find = vi.fn().mockResolvedValue({
+      source: 'dynamic',
+      default: 'new-model',
+      models: [
+        {
+          id: 'new-model',
+          displayName: 'New model',
+          hidden: false,
+          isDefault: true,
+          supportedReasoningEfforts: ['medium', 'high'],
+          defaultReasoningEffort: 'medium',
+        },
+      ],
+    });
+    const client = { service: () => ({ find }) } as unknown as DiscoClient;
+    const onChange = vi.fn();
+    const { container } = render(
+      <EffortSelector client={client} codexModel="new-model" value="max" onChange={onChange} />
+    );
+    expect(await screen.findByText(/原设置已保留/)).toBeInTheDocument();
+    expect(screen.getByRole('combobox').parentElement).toHaveTextContent('Max effort');
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.mouseDown(screen.getByRole('combobox'));
+    expect(
+      container.ownerDocument.querySelector('.ant-select-item-option-disabled')
+    ).toHaveTextContent('Max');
+    fireEvent.click(screen.getByRole('button', { name: '更换为 medium' }));
+    expect(onChange).toHaveBeenCalledExactlyOnceWith('medium');
   });
 });

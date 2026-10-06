@@ -2,11 +2,9 @@ import { AGENTIC_TOOL_CAPABILITIES } from '@disco/agentic-tools';
 import { SessionRelationshipRepository } from '@disco/core/db';
 import {
   AVAILABLE_CLAUDE_MODEL_ALIASES,
-  CODEX_MODEL_METADATA,
   COPILOT_MODEL_METADATA,
   CURSOR_MODEL_METADATA,
   DEFAULT_CLAUDE_MODEL,
-  DEFAULT_CODEX_MODEL,
   DEFAULT_COPILOT_MODEL,
   DEFAULT_CURSOR_MODEL,
   DEFAULT_GEMINI_MODEL,
@@ -25,8 +23,7 @@ import type { SessionsServiceImpl } from '../../declarations.js';
 import type { SessionParams } from '../../services/sessions.js';
 import { requireActiveAgenticTool } from '../../utils/agentic-tool-runtime.js';
 import { ensureCanPromptTargetSession } from '../../utils/session-authorization.js';
-import { emitServiceEvent } from '../../utils/emit-service-event.js';
-import { resolveMcpServerId, resolveSessionId } from '../resolve-ids.js';
+import { resolveSessionId } from '../resolve-ids.js';
 import {
   mcpListLimit,
   mcpOffset,
@@ -121,9 +118,7 @@ function coerceModelConfig(
   return input;
 }
 
-function redactSessionForMcp<T extends { mcp_token?: unknown }>(
-  session: T
-): Omit<T, 'mcp_token'> {
+function redactSessionForMcp<T extends { mcp_token?: unknown }>(session: T): Omit<T, 'mcp_token'> {
   const { mcp_token: _mcpToken, ...safeSession } = session;
   return safeSession;
 }
@@ -918,13 +913,10 @@ export function registerSessionTools(server: McpServer, ctx: McpContext): void {
         family: m.family,
       }));
 
-      const codexModels = Object.entries(CODEX_MODEL_METADATA).map(([id, meta]) => ({
-        id,
-        displayName: meta.name,
-        description: meta.description,
-        status: meta.status,
-        availability: meta.availability,
-      }));
+      const codexCatalog =
+        !args.agenticTool || args.agenticTool === 'codex'
+          ? await ctx.app.service('codex-models').find(ctx.baseServiceParams)
+          : undefined;
 
       const copilotModels = Object.entries(COPILOT_MODEL_METADATA).map(([id, meta]) => ({
         id,
@@ -950,9 +942,10 @@ export function registerSessionTools(server: McpServer, ctx: McpContext): void {
           note: 'Claude models are also fetched live via /claude-models (uses the Anthropic Models API). This is the static fallback.',
         },
         codex: {
-          default: DEFAULT_CODEX_MODEL,
-          models: codexModels,
-          note: 'Latest models are listed first; omit modelConfig to use the default. Current models are supported defaults; older entries marked provider-dependent may vary by Codex account and are checked by Codex at startup. This is Disco’s known-model registry, not a dynamic Codex CLI/provider listing. Provider-specific IDs absent from this list must be passed with mode "exact". Known unsupported legacy aliases are omitted.',
+          default: codexCatalog?.default ?? null,
+          models: codexCatalog?.models.filter((model: { hidden: boolean }) => !model.hidden) ?? [],
+          source: codexCatalog?.source,
+          note: 'Models are read from the execution runtime using Codex model/list. Discovery failures use a fallback and do not invalidate saved choices. Exact provider IDs may be absent from this catalog.',
         },
         gemini: {
           default: DEFAULT_GEMINI_MODEL,
@@ -982,7 +975,7 @@ export function registerSessionTools(server: McpServer, ctx: McpContext): void {
         },
       } satisfies Record<
         AgenticToolName,
-        { default: string | null; models: unknown[]; note: string }
+        { default: string | null; models: unknown[]; note: string; source?: string }
       >;
 
       if (args.agenticTool) {

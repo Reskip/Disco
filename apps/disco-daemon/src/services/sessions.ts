@@ -1,3 +1,5 @@
+import { fallbackCodexModelCatalog, getCodexCatalogSelectionError } from '@disco/core/models';
+import type { CodexModelCatalog } from '@disco/core/types';
 /**
  * Sessions Service
  *
@@ -9,6 +11,10 @@ import { mkdir } from 'node:fs/promises';
 
 import { getAgenticToolModelConfiguration } from '@disco/agentic-tools';
 import {
+  isResolvedAgenticToolModelConfiguration,
+  materializeAgenticToolConfiguration,
+} from '@disco/agentic-tools/config';
+import {
   resolveDiscoAgentSessionWorkingDirectory,
   resolveDiscoStandaloneSessionWorkingDirectory,
   resolveDiscoUserWorkspaceDirectory,
@@ -17,21 +23,17 @@ import {
   prepareDiscoAgentRuntimeContext,
   writeDiscoAgentPreloadFailure,
 } from '@disco/core/agent-runtime';
-import {
-  isResolvedAgenticToolModelConfiguration,
-  materializeAgenticToolConfiguration,
-} from '@disco/agentic-tools/config';
-import { isTenantAgenticToolEnabled, PAGINATION, getWorktreesRoot } from '@disco/core/config';
+import { getWorktreesRoot, isTenantAgenticToolEnabled, PAGINATION } from '@disco/core/config';
 import {
   AgentRepository,
   bindRepositoryToTenantUnitOfWork,
+  generateId,
   getCurrentTenantId,
   runWithTenantDatabaseScope,
   SessionEnvSelectionRepository,
   SessionMCPServerRepository,
   SessionRelationshipRepository,
   SessionRepository,
-  generateId,
   type SessionWithLastMessage,
   TaskRepository,
   type TenantScopeAwareDatabase,
@@ -45,7 +47,6 @@ import {
 } from '@disco/core/feathers';
 import {
   formatModelToolMismatchWarning,
-  getCodexModelSelectionError,
   isInvalidModelConfigError,
   isResolvedModelConfig,
   lintModelToolMatch,
@@ -242,13 +243,32 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
     throw new BadRequest(deploymentAgenticToolUnavailableMessage(tool));
   }
 
-  private assertSupportedModelConfig(
+  private async codexCatalog(userId?: string): Promise<CodexModelCatalog> {
+    if (!userId) return fallbackCodexModelCatalog();
+    try {
+      const service = this.app.service('codex-models') as unknown as {
+        find(params: SessionParams): Promise<CodexModelCatalog>;
+      };
+      return await service.find({
+        user: { user_id: userId, username: '', role: 'member' },
+      });
+    } catch {
+      return fallbackCodexModelCatalog();
+    }
+  }
+
+  private async assertSupportedModelConfig(
     agenticTool: Session['agentic_tool'],
-    modelConfig: Session['model_config'] | undefined
-  ): void {
+    modelConfig: Session['model_config'] | undefined,
+    userId?: string,
+    catalog?: CodexModelCatalog
+  ): Promise<void> {
     if (agenticTool !== 'codex' || !modelConfig) return;
-    const modelError = getCodexModelSelectionError(modelConfig);
-    if (modelError) throw new BadRequest(modelError);
+    const error = getCodexCatalogSelectionError(
+      catalog ?? (await this.codexCatalog(userId)),
+      modelConfig
+    );
+    if (error) throw new BadRequest(error);
   }
 
   private async resolveDirectCreateModelFallback(
@@ -363,6 +383,11 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
       model_config: originalModelConfig,
       ...sessionData
     } = data;
+    const codexCatalog =
+      agenticTool === 'codex'
+        ? await this.codexCatalog(data.created_by ?? params?.user?.user_id)
+        : undefined;
+    const codexDefault = codexCatalog?.models.find((model) => model.id === codexCatalog.default);
     let createData: Partial<Session> = { ...sessionData };
     if (params?._agenticConfigResolved) {
       createData = {
@@ -381,6 +406,15 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
         materialized = await materializeAgenticToolConfiguration(this.db, {
           tool: agenticTool,
           source,
+          ...(codexCatalog
+            ? {
+                modelFallback: {
+                  mode: 'alias' as const,
+                  model: codexCatalog.default,
+                  effort: codexDefault?.defaultReasoningEffort,
+                },
+              }
+            : {}),
           executionOwnerId: data.created_by as import('@disco/core/types').UserID | undefined,
         });
       } catch (error) {
@@ -420,7 +454,12 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
     if (createData.model_config != null && !createData.model_config.updated_at) {
       throw new BadRequest('model_config must be resolved before session creation');
     }
-    this.assertSupportedModelConfig(agenticTool, createData.model_config);
+    await this.assertSupportedModelConfig(
+      agenticTool,
+      createData.model_config,
+      undefined,
+      codexCatalog
+    );
     const createdBy = createData.created_by ?? params?.user?.user_id;
     if (!createdBy) throw new NotAuthenticated('Session creation requires an authenticated user');
     const sessionId = createData.session_id ?? (generateId() as SessionID);
@@ -428,7 +467,7 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
     const agent = requestedAgentId
       ? await this.agentRepo.findOwnedById(requestedAgentId, createdBy)
       : null;
-    if (requestedAgentId && (!agent || agent.state !== 'ready' || agent.archived)) {
+    if (requestedAgentId && (agent?.state !== 'ready' || agent.archived)) {
       throw new BadRequest('Agent is unavailable');
     }
     const userRoot = resolveDiscoUserWorkspaceDirectory(
@@ -503,7 +542,11 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
         source: { reference: session.agentic_tool_preset_id },
         executionOwnerId: session.created_by as import('@disco/core/types').UserID,
       });
-      this.assertSupportedModelConfig(agenticTool, materialized.model_config);
+      await this.assertSupportedModelConfig(
+        agenticTool,
+        materialized.model_config,
+        session.created_by
+      );
       return this.sessionRepo.update(
         session.session_id,
         {
@@ -654,7 +697,7 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
         : sessionConfigurationSource(parent),
       executionOwnerId: created_by as import('@disco/core/types').UserID,
     });
-    this.assertSupportedModelConfig(parentTool, inherited.model_config);
+    await this.assertSupportedModelConfig(parentTool, inherited.model_config, created_by);
 
     const forkedSession = await this.create(
       {
@@ -802,7 +845,7 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
       console.warn(`[SessionsService.spawn] ${lintWarning}`);
     }
 
-    this.assertSupportedModelConfig(targetTool, modelConfig);
+    await this.assertSupportedModelConfig(targetTool, modelConfig, created_by);
 
     // callback_session_id is the single source of truth for where to deliver
     // callbacks. Default to parent session when callbacks are enabled (which
@@ -1305,7 +1348,11 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
         ) {
           throw new BadRequest(modelPolicy.missingSelectionError ?? 'model_config is not resolved');
         }
-        this.assertSupportedModelConfig(effectiveTool, effectiveModelConfig);
+        await this.assertSupportedModelConfig(
+          effectiveTool,
+          effectiveModelConfig,
+          current.created_by
+        );
       }
     }
     const result = (

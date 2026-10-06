@@ -6,7 +6,7 @@
 
 import { AGENTIC_TOOL_NAMES } from '@disco/core/types';
 import type { McpServer } from '@modelcontextprotocol/server';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../resolve-ids.js', () => ({
   resolveBoardId: async (_ctx: unknown, id: string) => id,
@@ -485,11 +485,7 @@ describe('disco_sessions_prompt task callback', () => {
       },
     });
     const { ensureCanPromptTargetSession } = await import('../../utils/session-authorization.js');
-    expect(ensureCanPromptTargetSession).toHaveBeenCalledWith(
-      'sess-caller',
-      'user-1',
-      app
-    );
+    expect(ensureCanPromptTargetSession).toHaveBeenCalledWith('sess-caller', 'user-1', app);
   });
 
   it('rejects callback:true when the caller cannot prompt its callback session', async () => {
@@ -620,65 +616,38 @@ describe('modelConfig schema (string shorthand coercion)', () => {
 });
 
 describe('disco_models_list', () => {
-  it('returns model registries grouped by agenticTool', async () => {
+  it('uses the execution-owner catalog and filters hidden entries', async () => {
+    const find = vi.fn().mockResolvedValue({
+      source: 'dynamic',
+      default: 'brand-new-model',
+      models: [
+        { id: 'brand-new-model', displayName: 'New model', hidden: false },
+        { id: 'internal', displayName: 'Internal', hidden: true },
+      ],
+    });
+    const baseServiceParams = { user: { user_id: 'user-1', role: 'member' } };
     const { disco_models_list } = await registerAndCaptureHandlers(
-      { app: {}, userId: 'user-1', sessionId: 'sess-1' },
+      {
+        app: makeFakeApp({ 'codex-models': { find } }),
+        userId: 'user-1',
+        sessionId: 'sess-1',
+        baseServiceParams,
+      },
       ['disco_models_list']
     );
-
-    const result = await disco_models_list({});
-    const parsed = JSON.parse(result.content[0].text);
-
-    expect(Object.keys(parsed)).toEqual(AGENTIC_TOOL_NAMES);
-
-    expect(parsed['claude-code'].default).toBe('claude-sonnet-5');
-    expect(Array.isArray(parsed['claude-code'].models)).toBe(true);
-    expect(parsed['claude-code'].models[0]).toMatchObject({
-      id: expect.any(String),
-      displayName: expect.any(String),
-    });
-
-    // Sanity: the canonical aliases an agent would want to pin should be discoverable
-    const claudeIds = parsed['claude-code'].models.map((m: { id: string }) => m.id);
-    expect(claudeIds).toContain('claude-opus-4-6');
-    expect(claudeIds).toContain('claude-sonnet-5');
-    expect(parsed.opencode).toMatchObject({
-      default: null,
-      models: [],
-      note: expect.stringContaining('provider-specific'),
-    });
-  });
-
-  it('filters to a single agenticTool when requested', async () => {
-    const { disco_models_list } = await registerAndCaptureHandlers(
-      { app: {}, userId: 'user-1', sessionId: 'sess-1' },
-      ['disco_models_list']
-    );
-
     const result = await disco_models_list({ agenticTool: 'codex' });
     const parsed = JSON.parse(result.content[0].text);
-
     expect(Object.keys(parsed)).toEqual(['codex']);
-    expect(parsed.codex.models.length).toBeGreaterThan(0);
-    expect(parsed.codex.models[0]).toMatchObject({
-      id: expect.any(String),
-      displayName: expect.any(String),
-      description: expect.any(String),
+    expect(parsed.codex).toMatchObject({
+      source: 'dynamic',
+      default: 'brand-new-model',
+      models: [{ id: 'brand-new-model', displayName: 'New model' }],
     });
-    expect(parsed.codex.note).toContain('omit modelConfig');
-
-    const codexIds = parsed.codex.models.map((m: { id: string }) => m.id);
-    expect(codexIds.slice(0, 3)).toEqual(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']);
-    expect(codexIds).toContain('gpt-5.5');
-    expect(codexIds).toContain('gpt-5.4-mini');
-    expect(codexIds).toContain('gpt-5.4');
-    expect(codexIds).not.toContain('gpt-5-codex');
-    expect(
-      parsed.codex.models.find((model: { id: string }) => model.id === 'gpt-5.5')
-    ).toMatchObject({
-      status: 'known',
-      availability: 'provider-dependent',
-    });
+    expect(find).toHaveBeenCalledWith(baseServiceParams);
+    const all = JSON.parse((await disco_models_list({})).content[0].text);
+    expect(Object.keys(all)).toEqual(AGENTIC_TOOL_NAMES);
+    await disco_models_list({ agenticTool: 'claude-code' });
+    expect(find).toHaveBeenCalledTimes(2);
   });
 });
 

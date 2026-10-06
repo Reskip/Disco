@@ -1,3 +1,5 @@
+import { getCodexCatalogSelectionError } from '@disco-live/client';
+import { useCodexModels } from '../../hooks/useCodexModels';
 /**
  * Agentic Tool Configuration Form
  *
@@ -74,6 +76,9 @@ export const AgenticToolConfigForm: React.FC<AgenticToolConfigFormProps> = ({
   showAdvisor = true,
 }) => {
   const { locale } = useLocale();
+  const form = Form.useFormInstance();
+  const model = Form.useWatch('modelConfig', form);
+  const { catalog } = useCodexModels(client, agenticTool === 'codex');
   const isChinese = locale === 'zh-CN';
   const modelLabel = isChinese
     ? agenticTool === 'opencode'
@@ -92,7 +97,13 @@ export const AgenticToolConfigForm: React.FC<AgenticToolConfigFormProps> = ({
         rules={[
           {
             validator: (_, value) => {
-              const error = getAgenticToolModelSelectionError(agenticTool, value);
+              const error =
+                agenticTool === 'codex'
+                  ? getCodexCatalogSelectionError(catalog, {
+                      ...value,
+                      effort: form.getFieldValue('effort'),
+                    })
+                  : getAgenticToolModelSelectionError(agenticTool, value);
               return error ? Promise.reject(new Error(error)) : Promise.resolve();
             },
           },
@@ -105,7 +116,15 @@ export const AgenticToolConfigForm: React.FC<AgenticToolConfigFormProps> = ({
             : undefined
         }
       >
-        <ModelSelector agentic_tool={agenticTool} client={client} showAdvisor={showAdvisor} />
+        <ModelSelector
+          agentic_tool={agenticTool}
+          client={client}
+          showAdvisor={showAdvisor}
+          onChange={(config) => {
+            if (agenticTool === 'codex' && config.effort)
+              form.setFieldValue('effort', config.effort);
+          }}
+        />
       </Form.Item>
 
       <Form.Item
@@ -139,6 +158,8 @@ export const AgenticToolConfigForm: React.FC<AgenticToolConfigFormProps> = ({
           }
         >
           <EffortSelector
+            client={client}
+            codexModel={agenticTool === 'codex' ? model?.model : undefined}
             levels={effortLevels}
             fallbackValue={toolCapabilities.defaultReasoningEffort}
             allowInherited={!toolCapabilities.defaultReasoningEffort}

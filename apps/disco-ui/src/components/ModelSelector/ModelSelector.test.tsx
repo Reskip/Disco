@@ -1,4 +1,5 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import type { DiscoClient } from '@disco-live/client';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { LocaleProvider } from '../../contexts/LocaleContext';
 import { ModelSelector } from './ModelSelector';
@@ -112,38 +113,70 @@ describe('ModelSelector (Claude)', () => {
 });
 
 describe('ModelSelector (Codex)', () => {
-  it('marks older aliases whose availability depends on the provider account', () => {
-    render(<ModelSelector agentic_tool="codex" value={{ mode: 'alias', model: 'gpt-5.6-sol' }} />);
-
-    fireEvent.mouseDown(screen.getByRole('combobox'));
-
-    expect(screen.getAllByText('account-dependent').length).toBeGreaterThan(0);
-  });
-
-  it('在中文界面本地化推荐标记、说明和可用性标签', () => {
+  it('shows plain model names without recommendation, account or default badges', () => {
     render(
       <LocaleProvider>
         <ModelSelector agentic_tool="codex" value={{ mode: 'alias', model: 'gpt-5.6-sol' }} />
       </LocaleProvider>
     );
-
-    expect(screen.getByText('GPT-5.6 Sol（推荐）')).toBeInTheDocument();
+    expect(screen.getByText('GPT-5.6 Sol')).toBeInTheDocument();
     fireEvent.mouseDown(screen.getByRole('combobox'));
-    expect(screen.getByText('适合复杂、开放式工作的 GPT-5.6 旗舰模型')).toBeInTheDocument();
-    expect(screen.getAllByText('账号相关').length).toBeGreaterThan(0);
-    expect(screen.getByText('默认')).toBeInTheDocument();
+    expect(screen.queryByText('默认')).not.toBeInTheDocument();
+    expect(screen.queryByText('账号相关')).not.toBeInTheDocument();
+    expect(screen.queryByText(/（推荐）|Recommended|account-dependent/)).not.toBeInTheDocument();
   });
 
-  it('提供 GPT-6 Astra 并标明账号可用性', () => {
+  const catalog = {
+    source: 'dynamic',
+    default: 'new-model',
+    models: [
+      {
+        id: 'new-model',
+        displayName: 'New model',
+        hidden: false,
+        isDefault: true,
+        defaultReasoningEffort: 'medium',
+      },
+      { id: 'old-hidden', displayName: 'Hidden', hidden: true, isDefault: false },
+    ],
+  };
+  it('loads new models, preserves an absent default and replaces it only on an explicit click', async () => {
+    const find = vi.fn().mockResolvedValue(catalog);
+    const onChange = vi.fn();
+    const client = { service: () => ({ find }) } as unknown as DiscoClient;
     render(
-      <LocaleProvider>
-        <ModelSelector agentic_tool="codex" value={{ mode: 'alias', model: 'gpt-6-astra' }} />
-      </LocaleProvider>
+      <ModelSelector
+        agentic_tool="codex"
+        compact
+        client={client}
+        onChange={onChange}
+        value={{ mode: 'alias', model: 'removed-model' }}
+      />
     );
-
-    expect(screen.getByText('GPT-6 Astra')).toBeInTheDocument();
+    expect(await screen.findByText(/原设置已保留/)).toBeInTheDocument();
+    expect(onChange).not.toHaveBeenCalled();
+    expect(screen.getByText('removed-model')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '更换为 New model' }));
+    expect(onChange).toHaveBeenCalledWith({ mode: 'alias', model: 'new-model', effort: 'medium' });
     fireEvent.mouseDown(screen.getByRole('combobox'));
-    expect(screen.getByText('支持 105 万上下文与高级工具调用的 GPT-6 旗舰 Codex 模型')).toBeInTheDocument();
-    expect(screen.getAllByText('账号相关').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('New model').length).toBeGreaterThan(0);
+    expect(screen.queryByText('Hidden')).not.toBeInTheDocument();
+    expect(screen.queryByText('GPT-5.6 Sol')).not.toBeInTheDocument();
+  });
+  it('does not classify discovery failure or an exact ID as an unavailable selection', async () => {
+    const find = vi.fn().mockRejectedValue(new Error('offline'));
+    const onChange = vi.fn();
+    const client = { service: () => ({ find }) } as unknown as DiscoClient;
+    render(
+      <ModelSelector
+        agentic_tool="codex"
+        client={client}
+        onChange={onChange}
+        value={{ mode: 'exact', model: 'my-pinned-model' }}
+      />
+    );
+    await waitFor(() => expect(screen.getByText(/暂时无法更新模型列表/)).toBeInTheDocument());
+    expect(screen.queryByText(/已不再提供/)).not.toBeInTheDocument();
+    expect(onChange).not.toHaveBeenCalled();
   });
 });

@@ -12,8 +12,10 @@ import type {
   EffortLevel,
   Session,
 } from '@disco-live/client';
-import { Button, Segmented, Space, Tooltip } from 'antd';
+import { getCodexCatalogSelectionError, getCodexReplacementModel } from '@disco-live/client';
+import { Button, Segmented, Space, Tooltip, Typography } from 'antd';
 import React from 'react';
+import { useCodexModels } from '../../hooks/useCodexModels';
 import { MOBILE_COMPOSER_QUERY, useMediaQuery } from '../../hooks/useMediaQuery';
 import type { FollowUpBehavior } from '../../utils/followUpBehavior';
 import { getPreferredReasoningEffort } from '../../utils/reasoningEffort';
@@ -77,12 +79,21 @@ export const SimpleSessionFooter = React.memo<SimpleSessionFooterProps>(
     onSendPrompt,
     onStop,
   }) => {
+    const codex = useCodexModels(
+      client,
+      session.agentic_tool === 'codex' && session.created_by === currentUserId
+    );
+    const modelError =
+      session.agentic_tool === 'codex'
+        ? getCodexCatalogSelectionError(codex.catalog, modelConfig)
+        : undefined;
+    const replacement = getCodexReplacementModel(codex.catalog, modelConfig?.model);
     const mobileComposer = useMediaQuery(MOBILE_COMPOSER_QUERY);
     const [optimisticServiceTier, setOptimisticServiceTier] = React.useState(serviceTier);
 
     React.useEffect(() => {
       setOptimisticServiceTier(serviceTier);
-    }, [serviceTier, session.session_id]);
+    }, [serviceTier]);
 
     const managedByPreset = Boolean(session.agentic_tool_preset_id);
     const supportsEffort = Boolean(toolCaps?.reasoningEffortLevels?.length);
@@ -92,7 +103,7 @@ export const SimpleSessionFooter = React.memo<SimpleSessionFooterProps>(
         toolCaps?.reasoningEffortLevels,
         toolCaps?.defaultReasoningEffort
       );
-    const sendDisabled = connectionDisabled || !hasInput;
+    const sendDisabled = connectionDisabled || !hasInput || Boolean(modelError);
     const showRuntimeAction = isRunning || isStopping || stopRequestInFlight;
     const canQueueDraft =
       !mobileComposer &&
@@ -105,6 +116,26 @@ export const SimpleSessionFooter = React.memo<SimpleSessionFooterProps>(
 
     return (
       <div className={`disco-simple-composer${mobileComposer ? ' is-mobile-simplified' : ''}`}>
+        {mobileComposer && modelError && (
+          <div role="status">
+            <Typography.Text type="warning">{modelError}</Typography.Text>
+            {replacement && !managedByPreset && (
+              <Button
+                type="link"
+                size="small"
+                onClick={() =>
+                  onModelConfigChange({
+                    mode: 'alias',
+                    model: replacement.id,
+                    effort: replacement.defaultReasoningEffort,
+                  })
+                }
+              >
+                更换为 {replacement.displayName}
+              </Button>
+            )}
+          </div>
+        )}
         <div className="disco-simple-composer-input">{promptInputSlot}</div>
 
         <div className="disco-simple-composer-toolbar">
@@ -152,6 +183,9 @@ export const SimpleSessionFooter = React.memo<SimpleSessionFooterProps>(
                 }}
               >
                 <EffortSelector
+                  client={client}
+                  codexModel={session.agentic_tool === 'codex' ? modelConfig?.model : undefined}
+                  catalogEnabled={session.created_by === currentUserId}
                   value={resolvedEffort}
                   onChange={onEffortChange}
                   levels={toolCaps.reasoningEffortLevels}

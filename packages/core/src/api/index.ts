@@ -10,6 +10,7 @@ import type {
   AgentCapabilityPatch,
   AgenticToolPreset,
   AuthenticationResult,
+  CodexModelCatalog,
   CodexSkillCatalogEntry,
   CodexSkillSettingsPatch,
   CodexWeeklyQuota,
@@ -460,6 +461,7 @@ export interface DiscoClient extends Omit<Application<ServiceTypes>, 'service'> 
   service(path: 'opencode-auth'): OpenCodeAuthService;
   service(path: 'opencode-models'): OpenCodeModelsService;
   service(path: 'leaderboard'): LeaderboardService;
+  service(path: 'codex-models'): { find(params?: Params): Promise<CodexModelCatalog> };
   service(path: 'codex-quota'): { find(params?: Params): Promise<CodexWeeklyQuota> };
   service(path: 'session-search'): SessionSearchService;
 

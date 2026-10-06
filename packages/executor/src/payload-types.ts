@@ -82,6 +82,12 @@ export const CodexAuthFilePayloadSchema = BasePayloadSchema.extend({
 });
 export type CodexAuthFilePayload = z.infer<typeof CodexAuthFilePayloadSchema>;
 
+export const CodexModelsPayloadSchema = BasePayloadSchema.extend({
+  command: z.literal('codex.models'),
+  params: z.object({ useNativeAuth: z.boolean(), sharedRuntime: z.boolean() }),
+});
+export type CodexModelsPayload = z.infer<typeof CodexModelsPayloadSchema>;
+
 export const CodexGenerateTitlePayloadSchema = BasePayloadSchema.extend({
   command: z.literal('codex.generate-title'),
   params: z.object({ prompt: z.string().min(1).max(4000) }),
@@ -92,15 +98,14 @@ export const CodexLookupTokenPricingPayloadSchema = BasePayloadSchema.extend({
   command: z.literal('codex.lookup-token-pricing'),
   params: z.object({ model: z.string().trim().min(1).max(200) }),
 });
-export type CodexLookupTokenPricingPayload = z.infer<
-  typeof CodexLookupTokenPricingPayloadSchema
->;
+export type CodexLookupTokenPricingPayload = z.infer<typeof CodexLookupTokenPricingPayloadSchema>;
 
 export const ExecutorPayloadSchema = z.discriminatedUnion('command', [
   PromptPayloadSchema,
   AgenticToolInvokePayloadSchema,
   WorkspaceFilesListPayloadSchema,
   CodexAuthFilePayloadSchema,
+  CodexModelsPayloadSchema,
   CodexGenerateTitlePayloadSchema,
   CodexLookupTokenPricingPayloadSchema,
 ]);

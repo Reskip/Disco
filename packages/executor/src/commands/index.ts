@@ -17,6 +17,7 @@ import type {
 import { handleCodexAuthFile } from './codex-auth-file.js';
 import { handleCodexGenerateTitle } from './codex-generate-title.js';
 import { handleCodexLookupTokenPricing } from './codex-lookup-token-pricing.js';
+import { handleCodexModels } from './codex-models.js';
 import { handleWorkspaceFilesList } from './workspace-files.js';
 
 export interface CommandOptions {
@@ -216,5 +217,6 @@ registerCommand('agentic-tool.invoke', handleAgenticToolInvoke);
 registerInteractiveCommand('agentic-tool.invoke', handleInteractiveAgenticToolInvoke);
 registerCommand('workspace.files.list', handleWorkspaceFilesList);
 registerCommand('codex.auth-file', handleCodexAuthFile);
+registerCommand('codex.models', handleCodexModels);
 registerCommand('codex.generate-title', handleCodexGenerateTitle);
 registerCommand('codex.lookup-token-pricing', handleCodexLookupTokenPricing);

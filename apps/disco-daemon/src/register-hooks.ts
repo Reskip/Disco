@@ -278,6 +278,7 @@ export const TENANT_IDENTITY_ONLY_SERVICE_PATHS = [
   'opencode-auth',
   'opencode-models',
   'claude-models',
+  'codex-models',
   'copilot-models',
   'cursor-models',
   'terminals',

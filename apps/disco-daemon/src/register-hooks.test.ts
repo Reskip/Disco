@@ -12,8 +12,8 @@ import {
   PROMPT_FLOW_PATCH_FIELDS,
   protectExternalTaskCreate,
   protectFilesystemHomeWrite,
-  protectSuperadminTargetFromAdmin,
   protectServerManagedTaskWrites,
+  protectSuperadminTargetFromAdmin,
   type RegisterHooksContext,
   registerHooks,
   shouldDrainQueueAfterSessionPostTurnPatch,
@@ -59,9 +59,7 @@ describe('protectFilesystemHomeWrite', () => {
   it('rejects a member changing their own host home path', () => {
     expect(() =>
       protectFilesystemHomeWrite(context('member', path.resolve('test-home', 'member')), config)
-    ).toThrow(
-      'Only admins can modify filesystem_home'
-    );
+    ).toThrow('Only admins can modify filesystem_home');
   });
 
   it('allows an admin to set a validated absolute path', () => {
@@ -393,7 +391,6 @@ describe('tenant-owned service registration', () => {
       'mcpOAuth',
     ]);
   });
-
 });
 
 describe('shouldRunSessionPostTurnHooks', () => {
@@ -699,6 +696,7 @@ describe('TENANT_IDENTITY_ONLY_SERVICE_PATHS', () => {
   });
 
   it.each([
+    'codex-models',
     'mcp-servers/discover',
     'mcp-servers/oauth-complete',
     'mcp-servers/oauth-start',

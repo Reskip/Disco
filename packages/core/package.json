@@ -414,7 +414,7 @@
     "@anthropic-ai/claude-agent-sdk": "^0.3.197",
     "@google/gemini-cli-core": "^0.40.0",
     "@google/genai": "^1.43.0",
-    "@openai/codex-sdk": "^0.153.4",
+    "@openai/codex-sdk": "^0.161.0",
     "@types/bcryptjs": "^2.4.6",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^24.6.0",

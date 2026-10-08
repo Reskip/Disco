@@ -110,33 +110,6 @@ const CURSOR_MODEL_OPTIONS = [
   },
 ];
 
-const CODEX_DESCRIPTION_ZH: Record<string, string> = {
-  'gpt-6-astra': '支持 105 万上下文与高级工具调用的 GPT-6 旗舰 Codex 模型',
-  'gpt-5.6-sol': '适合复杂、开放式工作的 GPT-5.6 旗舰模型',
-  'gpt-5.6-terra': '兼顾日常推理、工具使用与响应速度的均衡模型',
-  'gpt-5.6-luna': '适合清晰、重复和高吞吐任务的快速模型',
-  'gpt-5.6': '自动路由到 GPT-5.6 Sol 的模型别名',
-  'gpt-5.5': '适合复杂编程、电脑操作、知识工作与研究流程的上一代旗舰模型',
-  'gpt-5.5-pro': '面向高难度专业工作的高算力 GPT-5.5 版本',
-  'gpt-5.4': '具备强编程与智能体工作流能力的专业模型',
-  'gpt-5.4-pro': '面向高难推理任务的高算力 GPT-5.4 版本',
-  'gpt-5.4-mini': '适合快速编程任务与子智能体的高效模型',
-  'gpt-5.4-nano': '适合简单、高吞吐任务与子智能体的低成本模型',
-  'gpt-5.3-codex': '上一代 Codex 编程模型',
-  'gpt-5.3-codex-spark': '面向实时编程的高速模型（Pro 用户）',
-  'gpt-5.2-codex': '针对智能体任务优化的上一代编程模型，支持 400k 上下文',
-  'gpt-5.2': '适合复杂任务的上一代旗舰模型，支持 400k 上下文与思考模式',
-  'gpt-5.2-pro': '面向高难问题、支持极高思考深度的高准确度模型',
-  'gpt-5.2-instant': '适合写作与信息检索的快速模型',
-  'gpt-5.1-codex-max': '针对长时间智能体编程优化的上一代模型',
-  'gpt-5.1-codex': '针对智能体编程任务优化的上一代模型',
-  'gpt-5.1-codex-mini': '上一代高性价比 Codex 模型',
-  'gpt-5.1': '通用 GPT-5.1 模型',
-  'gpt-5': '旧版通用模型，是否可用取决于账号',
-  'gpt-4o': '通用模型，是否可用取决于账号',
-  'gpt-4o-mini': '体积更小、响应更快的模型',
-};
-
 function localizeModelName(name: string, locale: string): string {
   if (locale !== 'zh-CN') return name;
   return name.replace(/\s*\(Recommended\)/gi, '（推荐）');
@@ -360,10 +333,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
       effectiveTool === 'codex'
         ? codexModelDisplayName(model.displayName)
         : localizeModelName(model.displayName, locale),
-    description:
-      locale === 'zh-CN' && effectiveTool === 'codex' && codex.catalog.source === 'static'
-        ? (CODEX_DESCRIPTION_ZH[model.id] ?? model.description)
-        : model.description,
+    description: effectiveTool === 'codex' ? undefined : model.description,
   }));
   const curated = curateModelOptions(effectiveTool, normalizedList, fallbackModel);
   const currentModel = value?.model || fallbackModel;

@@ -113,7 +113,7 @@ describe('ModelSelector (Claude)', () => {
 });
 
 describe('ModelSelector (Codex)', () => {
-  it('shows plain model names without recommendation, account or default badges', () => {
+  it('shows plain model names without descriptions or recommendation, account or default badges', () => {
     render(
       <LocaleProvider>
         <ModelSelector agentic_tool="codex" value={{ mode: 'alias', model: 'gpt-5.6-sol' }} />
@@ -124,6 +124,7 @@ describe('ModelSelector (Codex)', () => {
     expect(screen.queryByText('默认')).not.toBeInTheDocument();
     expect(screen.queryByText('账号相关')).not.toBeInTheDocument();
     expect(screen.queryByText(/（推荐）|Recommended|account-dependent/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/旗舰|Frontier|workhorse/)).not.toBeInTheDocument();
   });
 
   const catalog = {
@@ -133,6 +134,7 @@ describe('ModelSelector (Codex)', () => {
       {
         id: 'new-model',
         displayName: 'New model',
+        description: 'A provider supplied English description',
         hidden: false,
         isDefault: true,
         defaultReasoningEffort: 'medium',
@@ -160,6 +162,7 @@ describe('ModelSelector (Codex)', () => {
     expect(onChange).toHaveBeenCalledWith({ mode: 'alias', model: 'new-model', effort: 'medium' });
     fireEvent.mouseDown(screen.getByRole('combobox'));
     expect(screen.getAllByText('New model').length).toBeGreaterThan(0);
+    expect(screen.queryByText('A provider supplied English description')).not.toBeInTheDocument();
     expect(screen.queryByText('Hidden')).not.toBeInTheDocument();
     expect(screen.queryByText('GPT-5.6 Sol')).not.toBeInTheDocument();
   });

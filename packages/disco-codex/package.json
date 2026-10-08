@@ -22,7 +22,7 @@
     "check:pack": "npm pack --dry-run"
   },
   "dependencies": {
-    "@openai/codex-sdk": "0.153.4"
+    "@openai/codex-sdk": "0.161.0"
   },
   "devDependencies": {
     "@types/node": "^24.6.0",

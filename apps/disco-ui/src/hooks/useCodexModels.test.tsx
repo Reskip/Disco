@@ -30,12 +30,18 @@ it('shares discovery between selectors and retains a non-authoritative cache aft
   const first = renderHook(() => useCodexModels(client));
   const second = renderHook(() => useCodexModels(client));
   await waitFor(() => expect(second.result.current.catalog.default).toBe('fresh'));
+  expect(second.result.current.resolved).toBe(true);
   expect(find).toHaveBeenCalledOnce();
-  act(() => first.result.current.refresh());
+  let now = Date.now();
+  vi.spyOn(Date, 'now').mockImplementation(() => now);
+  now += 5 * 60_000 + 1;
+  act(() => window.dispatchEvent(new Event('focus')));
   await waitFor(() => expect(second.result.current.catalog.source).toBe('cached'));
+  expect(second.result.current.resolved).toBe(true);
   expect(second.result.current.catalog.default).toBe('fresh');
   first.unmount();
   second.unmount();
+  vi.restoreAllMocks();
 });
 
 it('clears previous-user data on logout and ignores that user late response', async () => {
@@ -51,12 +57,14 @@ it('clears previous-user data on logout and ignores that user late response', as
     .mockResolvedValue(catalog('user-b'));
   const { client, listeners } = clientWith(find);
   const hook = renderHook(() => useCodexModels(client));
+  expect(hook.result.current.resolved).toBe(false);
   await waitFor(() => expect(find).toHaveBeenCalledOnce());
   act(() => {
     listeners.logout();
     listeners.authenticated();
   });
   await waitFor(() => expect(hook.result.current.catalog.default).toBe('user-b'));
+  expect(hook.result.current.resolved).toBe(true);
   await act(async () => {
     resolveOld(catalog('user-a'));
   });

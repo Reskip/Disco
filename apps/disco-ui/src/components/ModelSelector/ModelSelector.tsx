@@ -335,8 +335,12 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
         : localizeModelName(model.displayName, locale),
     description: effectiveTool === 'codex' ? undefined : model.description,
   }));
+  // A stored value remains visible, but the built-in catalog must not appear
+  // briefly as a long selectable list before the first server read completes.
+  const awaitingCodexCatalog =
+    effectiveTool === 'codex' && Boolean(client) && catalogEnabled && !codex.resolved;
   const curated = curateModelOptions(effectiveTool, normalizedList, fallbackModel);
-  const currentModel = value?.model || fallbackModel;
+  const currentModel = value?.model || (awaitingCodexCatalog ? '' : fallbackModel);
 
   const selectAlias = (model: string) => {
     const option = codex.catalog.models.find((item) => item.id === model);
@@ -361,6 +365,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
   const replacement = getCodexReplacementModel(codex.catalog, value?.model);
   const catalogNotice =
     effectiveTool === 'codex' &&
+    codex.resolved &&
     (codexError ||
       (!codex.loading && codex.catalog.source !== 'dynamic' && client && catalogEnabled)) ? (
       <div role="status" style={{ whiteSpace: 'normal', fontSize: token.fontSizeSM }}>
@@ -372,9 +377,6 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
             更换为 {replacement.displayName}
           </Button>
         )}
-        <Button size="small" type="link" loading={codex.loading} onClick={codex.refresh}>
-          刷新列表
-        </Button>
       </div>
     ) : null;
   const selectPinned = (model: string) => {
@@ -399,7 +401,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
 
   // Preserve the currently-selected alias even if it is absent from the latest
   // discovery result.
-  const aliasOptions = curated.map((m) => ({
+  const aliasOptions = (awaitingCodexCatalog ? [] : curated).map((m) => ({
     value: m.id,
     label: m.displayName,
     description: m.description,
@@ -408,7 +410,12 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
     searchText:
       `${m.displayName} ${m.id} ${m.description ?? ''} ${m.availability ?? ''}`.toLowerCase(),
   }));
-  if (!pinned && currentModel && !aliasOptions.some((o) => o.value === currentModel)) {
+  if (
+    !awaitingCodexCatalog &&
+    !pinned &&
+    currentModel &&
+    !aliasOptions.some((o) => o.value === currentModel)
+  ) {
     const norm = normalizedList.find((m) => m.id === currentModel);
     aliasOptions.unshift({
       value: currentModel,
@@ -462,7 +469,11 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
     }));
     // Compact has no pin toggle, so an exact/pinned current value would be
     // absent from the discovered list — always surface the current selection.
-    if (currentModel && !compactOptions.some((o) => o.value === currentModel)) {
+    if (
+      !awaitingCodexCatalog &&
+      currentModel &&
+      !compactOptions.some((o) => o.value === currentModel)
+    ) {
       const norm = normalizedList.find((m) => m.id === currentModel);
       compactOptions.unshift({
         value: currentModel,
@@ -472,11 +483,9 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
     }
     const modelSelect = (
       <Select
-        value={currentModel}
-        loading={effectiveTool === 'codex' && codex.loading}
-        onOpenChange={(open) => {
-          if (open && effectiveTool === 'codex') codex.refresh();
-        }}
+        value={currentModel || undefined}
+        loading={awaitingCodexCatalog}
+        notFoundContent={awaitingCodexCatalog ? '正在获取模型列表…' : undefined}
         onChange={selectAlias}
         size="middle"
         showSearch
@@ -519,11 +528,9 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
       {!pinned ? (
         <Select
           showSearch
-          value={currentModel}
-          loading={effectiveTool === 'codex' && codex.loading}
-          onOpenChange={(open) => {
-            if (open && effectiveTool === 'codex') codex.refresh();
-          }}
+          value={currentModel || undefined}
+          loading={awaitingCodexCatalog}
+          notFoundContent={awaitingCodexCatalog ? '正在获取模型列表…' : undefined}
           onChange={selectAlias}
           optionLabelProp="label"
           filterOption={(input, option) => (option?.searchText ?? '').includes(input.toLowerCase())}

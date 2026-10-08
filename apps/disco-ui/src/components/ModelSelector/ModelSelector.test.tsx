@@ -1,5 +1,5 @@
 import type { DiscoClient } from '@disco-live/client';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { LocaleProvider } from '../../contexts/LocaleContext';
 import { ModelSelector } from './ModelSelector';
@@ -142,6 +142,26 @@ describe('ModelSelector (Codex)', () => {
       { id: 'old-hidden', displayName: 'Hidden', hidden: true, isDefault: false },
     ],
   };
+  it('waits for initial discovery before showing selectable fallback models', async () => {
+    let finish!: (value: typeof catalog) => void;
+    const find = vi.fn(() => new Promise<typeof catalog>((resolve) => (finish = resolve)));
+    const client = { service: () => ({ find }) } as unknown as DiscoClient;
+    render(
+      <ModelSelector
+        agentic_tool="codex"
+        client={client}
+        value={{ mode: 'alias', model: 'gpt-6-astra' }}
+      />
+    );
+    fireEvent.mouseDown(screen.getByRole('combobox'));
+    expect(screen.getByText('正在获取模型列表…')).toBeInTheDocument();
+    expect(screen.queryByText('GPT-5.6 Sol')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '刷新列表' })).not.toBeInTheDocument();
+    await waitFor(() => expect(find).toHaveBeenCalledOnce());
+    await act(async () => finish(catalog));
+    expect(await screen.findByText('New model')).toBeInTheDocument();
+    expect(screen.queryByText('GPT-5.6 Sol')).not.toBeInTheDocument();
+  });
   it('loads new models, preserves an absent default and replaces it only on an explicit click', async () => {
     const find = vi.fn().mockResolvedValue(catalog);
     const onChange = vi.fn();

@@ -9,12 +9,17 @@ const REFRESH_MS = 5 * 60_000;
 interface CatalogState {
   catalog: CodexModelCatalog;
   loading: boolean;
+  resolved: boolean;
 }
-const EMPTY: CatalogState = { catalog: fallbackCodexModelCatalog(), loading: false };
+const EMPTY: CatalogState = {
+  catalog: fallbackCodexModelCatalog(),
+  loading: false,
+  resolved: false,
+};
 interface CatalogStore {
   state: CatalogState;
   listeners: Set<(state: CatalogState) => void>;
-  refresh: (force?: boolean) => void;
+  refresh: () => void;
 }
 const stores = new WeakMap<DiscoClient, CatalogStore>();
 
@@ -30,8 +35,8 @@ function storeFor(client: DiscoClient): CatalogStore {
   const store: CatalogStore = {
     state: EMPTY,
     listeners: new Set(),
-    refresh(force = false) {
-      if (pending || (!force && Date.now() - updated < REFRESH_MS)) return;
+    refresh() {
+      if (pending || Date.now() - updated < REFRESH_MS) return;
       pending = true;
       const currentGeneration = generation;
       store.state = { ...store.state, loading: true };
@@ -44,6 +49,7 @@ function storeFor(client: DiscoClient): CatalogStore {
             throw new Error('Empty catalog');
           store.state = {
             loading: false,
+            resolved: true,
             catalog:
               catalog.source === 'static' && store.state.catalog.source !== 'static'
                 ? { ...store.state.catalog, source: 'cached' }
@@ -54,6 +60,7 @@ function storeFor(client: DiscoClient): CatalogStore {
           if (generation !== currentGeneration) return;
           store.state = {
             loading: false,
+            resolved: true,
             catalog: {
               ...store.state.catalog,
               source: store.state.catalog.source === 'static' ? 'static' : 'cached',
@@ -105,5 +112,5 @@ export function useCodexModels(client?: DiscoClient | null, enabled = true) {
       window.removeEventListener('focus', refresh);
     };
   }, [store]);
-  return { ...(store?.state ?? EMPTY), refresh: () => store?.refresh(true) };
+  return store?.state ?? EMPTY;
 }

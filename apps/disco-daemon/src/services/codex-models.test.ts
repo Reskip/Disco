@@ -1,4 +1,4 @@
-import { beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({ run: vi.fn(), key: vi.fn(), route: vi.fn() }));
 vi.mock('@disco/core/config', async () => ({
@@ -44,6 +44,7 @@ beforeEach(() => {
     data: { source: 'dynamic', default: 'new', models: [{ id: 'new' }] },
   });
 });
+afterEach(() => vi.restoreAllMocks());
 const service = () =>
   createCodexModelsService({ get: () => ({}), service: () => ({}) } as never, {} as never);
 const params = (id: string) => ({
@@ -64,6 +65,54 @@ it('derives execution identity only from auth and resolves credentials on every 
   });
   expect(mocks.run.mock.calls[1][1].env.CODEX_HOME).toBe('/users/user-b/.codex');
   expect(JSON.stringify(await catalog.find(params('user-b')))).not.toContain('user-key');
+  expect(mocks.run).toHaveBeenCalledTimes(2);
+  expect(mocks.key).toHaveBeenCalledTimes(3);
+});
+it('invalidates the server cache when the resolved credential changes', async () => {
+  const catalog = service();
+  await catalog.find(params('user-a'));
+  await catalog.find(params('user-a'));
+  expect(mocks.run).toHaveBeenCalledOnce();
+  mocks.key.mockResolvedValue({
+    useNativeAuth: false,
+    apiKey: 'replacement-key',
+    connection: { OPENAI_API_KEY: 'replacement-key' },
+  });
+  await catalog.find(params('user-a'));
+  expect(mocks.run).toHaveBeenCalledTimes(2);
+  expect(mocks.run.mock.calls[1][1].env.OPENAI_API_KEY).toBe('replacement-key');
+});
+it('serves a stale catalog immediately and refreshes it without a user action', async () => {
+  let now = 1_000;
+  vi.spyOn(Date, 'now').mockImplementation(() => now);
+  const catalog = service();
+  await catalog.find(params('user-a'));
+  mocks.run.mockResolvedValue({
+    success: true,
+    data: { source: 'dynamic', default: 'newer', models: [{ id: 'newer' }] },
+  });
+  now += 30 * 60_000 + 1;
+  expect((await catalog.find(params('user-a'))).default).toBe('new');
+  await vi.waitFor(async () =>
+    expect((await catalog.find(params('user-a'))).default).toBe('newer')
+  );
+  expect(mocks.run).toHaveBeenCalledTimes(2);
+});
+it('deduplicates concurrent discovery and does not cache a failed fallback', async () => {
+  let finish!: (value: unknown) => void;
+  mocks.run.mockImplementationOnce(() => new Promise((resolve) => (finish = resolve)));
+  const catalog = service();
+  const first = catalog.find(params('user-a'));
+  const second = catalog.find(params('user-a'));
+  await vi.waitFor(() => expect(mocks.run).toHaveBeenCalledOnce());
+  finish({ success: true, data: { source: 'dynamic', default: 'new', models: [{ id: 'new' }] } });
+  expect((await first).source).toBe('dynamic');
+  expect((await second).source).toBe('dynamic');
+
+  mocks.run.mockRejectedValue(new Error('offline'));
+  expect((await catalog.find(params('user-b'))).source).toBe('static');
+  expect((await catalog.find(params('user-b'))).source).toBe('static');
+  expect(mocks.run).toHaveBeenCalledTimes(3);
 });
 it('never returns another user catalog on failure or missing authentication', async () => {
   const catalog = service();

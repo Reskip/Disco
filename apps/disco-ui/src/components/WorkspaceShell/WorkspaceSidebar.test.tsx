@@ -216,13 +216,14 @@ describe('WorkspaceSidebar', () => {
     expect(document.querySelector('.disco-workspace-session-dot')).not.toBeInTheDocument();
   });
 
-  it('手机端只保留基础会话入口，隐藏搜索、设置、编辑和对话管理', async () => {
+  it('手机端保留搜索和设置入口，并使用适合触摸的账号菜单', async () => {
     const callbacks = renderSidebar(false, true);
 
     expect(screen.getByRole('button', { name: '新建独立对话' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '与 代码智能体 开始新对话' })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '搜索对话' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '打开设置' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '搜索对话' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '打开设置' }));
+    expect(callbacks.onOpenSettings).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole('button', { name: '代码智能体 的操作' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '对话操作' })).not.toBeInTheDocument();
 
@@ -232,7 +233,7 @@ describe('WorkspaceSidebar', () => {
     fireEvent.click(accountButton);
     expect(await screen.findByRole('menuitem', { name: /退出登录/ })).toBeInTheDocument();
     expect(document.querySelector('.disco-workspace-mobile-account-menu')).not.toBeNull();
-    expect(screen.queryByText('设置')).not.toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /设置/ })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('menuitem', { name: /退出登录/ }));
     expect(callbacks.onLogout).toHaveBeenCalledTimes(1);
   });

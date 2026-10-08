@@ -63,6 +63,10 @@ function makeSeamClient() {
     connect: vi.fn(() => {
       io.connected = true; // wait-for-connection resolves on next check
     }),
+    disconnect: vi.fn(() => {
+      io.connected = false;
+      io.active = false;
+    }),
   });
 
   const client = permissive({
@@ -256,6 +260,53 @@ describe('useDiscoClient session-streams announce seam', () => {
     });
 
     expect(client.io.connect).toHaveBeenCalledTimes(initialConnectCalls + 1);
+    unmount();
+  });
+
+  it('replaces a half-open connected transport on foreground and coalesces wake signals', async () => {
+    const { client, create } = makeSeamClient();
+    vi.mocked(createClient).mockReturnValue(client as never);
+    const { unmount } = renderHook(() =>
+      useDiscoClient({ url: 'http://daemon.test', accessToken: 'access-token' })
+    );
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+    const original = Object.getOwnPropertyDescriptor(document, 'visibilityState');
+    try {
+      const initialConnectCalls = client.io.connect.mock.calls.length;
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+      act(() => document.dispatchEvent(new Event('visibilitychange')));
+      expect(client.io.disconnect).not.toHaveBeenCalled();
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+      act(() => {
+        document.dispatchEvent(new Event('visibilitychange'));
+        window.dispatchEvent(new Event('focus'));
+        window.dispatchEvent(new Event('pageshow'));
+      });
+      expect(client.io.disconnect).toHaveBeenCalledTimes(1);
+      expect(client.io.connect).toHaveBeenCalledTimes(initialConnectCalls + 1);
+      expect(createClient).toHaveBeenCalledWith('http://daemon.test', false, { ackTimeout: 30000 });
+    } finally {
+      unmount();
+      if (original) Object.defineProperty(document, 'visibilityState', original);
+      else Reflect.deleteProperty(document, 'visibilityState');
+    }
+  });
+
+  it('restarts retry timers that were active when the browser was suspended', async () => {
+    const { client, create } = makeSeamClient();
+    vi.mocked(createClient).mockReturnValue(client as never);
+    const { unmount } = renderHook(() =>
+      useDiscoClient({ url: 'http://daemon.test', accessToken: 'access-token' })
+    );
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+    client.io.connected = false;
+    client.io.active = true;
+    act(() => {
+      window.dispatchEvent(new Event('pagehide'));
+      window.dispatchEvent(new Event('pageshow'));
+    });
+    expect(client.io.disconnect).toHaveBeenCalledTimes(1);
+    expect(client.io.connected).toBe(true);
     unmount();
   });
 

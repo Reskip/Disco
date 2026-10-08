@@ -451,7 +451,7 @@ export const WorkspaceSidebar: React.FC<WorkspaceSidebarProps> = ({
         borderRight: `1px solid ${token.colorBorderSecondary}`,
       }}
     >
-      <div style={{ padding: '10px 12px 9px' }}>
+      <div className="disco-workspace-sidebar-header" style={{ padding: '10px 12px 9px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 9 }}>
           <button
             type="button"
@@ -459,32 +459,30 @@ export const WorkspaceSidebar: React.FC<WorkspaceSidebarProps> = ({
             aria-label="返回主页"
             onClick={onGoHome}
           >
-            <BrandMark size={60} />
+            <BrandMark size={mobile ? 40 : 60} />
             <Typography.Text strong>Disco</Typography.Text>
           </button>
           {creating && <Spin size="small" />}
-          {!mobile && (
-            <>
-              <Tooltip title="搜索对话（Ctrl/⌘ K）">
-                <Button
-                  type="text"
-                  shape="circle"
-                  aria-label="搜索对话"
-                  icon={<SearchOutlined />}
-                  onClick={onOpenSearch}
-                />
-              </Tooltip>
-              <Tooltip title="设置">
-                <Button
-                  type="text"
-                  shape="circle"
-                  aria-label="打开设置"
-                  icon={<SettingOutlined />}
-                  onClick={onOpenSettings}
-                />
-              </Tooltip>
-            </>
-          )}
+          <Tooltip title="搜索对话（Ctrl/⌘ K）">
+            <Button
+              type="text"
+              shape="circle"
+              aria-label="搜索对话"
+              size={mobile ? 'large' : 'middle'}
+              icon={<SearchOutlined />}
+              onClick={onOpenSearch}
+            />
+          </Tooltip>
+          <Tooltip title="设置">
+            <Button
+              type="text"
+              shape="circle"
+              aria-label="打开设置"
+              size={mobile ? 'large' : 'middle'}
+              icon={<SettingOutlined />}
+              onClick={onOpenSettings}
+            />
+          </Tooltip>
         </div>
         <Tooltip title={workspaceReady ? undefined : '本地工作区尚未就绪'}>
           <Button
@@ -766,13 +764,11 @@ export const WorkspaceSidebar: React.FC<WorkspaceSidebarProps> = ({
                 boxShadow: token.boxShadowSecondary,
                 padding: token.paddingXXS,
               },
-              items: mobile
-                ? [{ key: 'logout', icon: <LogoutOutlined />, label: '退出登录', danger: true }]
-                : [
-                    { key: 'settings', icon: <SettingOutlined />, label: '设置' },
-                    { type: 'divider' },
-                    { key: 'logout', icon: <LogoutOutlined />, label: '退出登录', danger: true },
-                  ],
+              items: [
+                { key: 'settings', icon: <SettingOutlined />, label: '设置' },
+                { type: 'divider' },
+                { key: 'logout', icon: <LogoutOutlined />, label: '退出登录', danger: true },
+              ],
               onClick: ({ key }) => {
                 if (key === 'settings') onOpenSettings();
                 if (key === 'logout') onLogout?.();

@@ -61,4 +61,25 @@ describe('installVisualViewportSizing', () => {
     );
     dispose();
   });
+
+  it('repairs stale viewport sizing after a page is restored without a resize event', () => {
+    const viewport = Object.assign(new EventTarget(), { height: 436, offsetTop: 18 });
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: viewport });
+    const dispose = installVisualViewportSizing();
+    viewport.height = 812;
+    viewport.offsetTop = 0;
+    window.dispatchEvent(new Event('pageshow'));
+    expect(document.documentElement.style.getPropertyValue('--disco-visible-viewport-height')).toBe(
+      '812px'
+    );
+    expect(document.documentElement.style.getPropertyValue('--disco-visible-viewport-top')).toBe(
+      '0px'
+    );
+    dispose();
+    viewport.height = 300;
+    window.dispatchEvent(new Event('pageshow'));
+    expect(document.documentElement.style.getPropertyValue('--disco-visible-viewport-height')).toBe(
+      ''
+    );
+  });
 });

@@ -58,32 +58,17 @@ export function useSharedReactiveSession(
     };
   }, [client, sessionId, enabled, taskHydration, messageView]);
 
-  // Re-trigger resync() when an external signal suggests our error state may
-  // be stale. The reactive session itself only resyncs on socket `connect`
-  // events — but auth-recovery happens on other channels too:
-  //
-  // - Auth recovery in useAuth fires `TOKENS_REFRESHED_EVENT` after a
-  //   successful token replacement that the panel didn't trigger.
-  // - When a tab regains focus after a long background, useAuth's
-  //   visibilitychange handler may have refreshed tokens silently.
-  //
-  // Without these listeners, a transient 401 surfaced during a previous
-  // `resync()` (e.g. socket reconnected before access-token replacement
-  // landed) leaves the panel stuck on a "jwt expired" banner indefinitely.
-  //
-  // We retry while `state.error` is set but skip `state.terminal` errors —
-  // session-removed and similar non-recoverable conditions. Otherwise a tab
-  // returning from background after a session was deleted would refetch on
-  // every focus change forever.
-  //
-  // No local inflight guard is needed — `ReactiveSessionHandle.resync()` is
-  // single-flighted, so duplicate calls collapse onto the same promise.
+  // A suspended browser can miss events without reporting an error. Catch up
+  // the mounted session on foreground and after socket authentication, even
+  // when its cached state looks healthy. resync() preserves existing content
+  // and coalesces concurrent requests; deleted/inaccessible sessions stay put.
   useEffect(() => {
-    if (!handle) return;
+    if (!handle || !client) return;
 
     const tryResync = () => {
       const s = handle.state;
-      if (!s.error || s.terminal) return;
+      if (document.visibilityState === 'hidden' || !client.io.connected || s.loading || s.terminal)
+        return;
       void handle.resync();
     };
 
@@ -95,13 +80,17 @@ export function useSharedReactiveSession(
     };
 
     document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('pageshow', tryResync);
     window.addEventListener(TOKENS_REFRESHED_EVENT, onTokensRefreshed);
+    client.on('authenticated', tryResync);
 
     return () => {
       document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('pageshow', tryResync);
       window.removeEventListener(TOKENS_REFRESHED_EVENT, onTokensRefreshed);
+      client.off('authenticated', tryResync);
     };
-  }, [handle]);
+  }, [handle, client]);
 
   return { handle, state };
 }

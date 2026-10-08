@@ -368,6 +368,20 @@
     transform: translateX(0);
   }
 
+  .disco-workspace-brand-home > .ant-typography {
+    overflow: hidden;
+    font-size: 24px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .disco-workspace-sidebar-header .ant-btn-circle {
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
+    flex-shrink: 0;
+  }
+
   .disco-workspace-new-chat.ant-btn,
   .disco-workspace-session-select,
   .disco-workspace-agent-toggle {

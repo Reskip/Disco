@@ -717,6 +717,43 @@ describe('ReactiveSessionHandle stream subscription', () => {
     expect(mock.order).toEqual(['subscribe', 'unsubscribe']);
   });
 
+  it('clears streams whose end or persisted message was missed while keeping ongoing streams', async () => {
+    const opts: MockClientOptions = {
+      tasks: [makeTask('finished', TaskStatus.RUNNING), makeTask('ongoing', TaskStatus.RUNNING)],
+      messagesByTask: {},
+    };
+    const mock = createMockClient(opts);
+    const handle = new ReactiveSessionHandle(mock.client, SESSION_ID, { taskHydration: 'eager' });
+    await handle.ready();
+    for (const [messageId, taskId] of [
+      ['missed-end', 'finished'],
+      ['persisted', 'ongoing'],
+      ['still-streaming', 'ongoing'],
+    ]) {
+      mock.emitServiceEvent('messages', 'streaming:start', {
+        session_id: SESSION_ID,
+        task_id: taskId,
+        message_id: messageId,
+        role: 'assistant',
+        timestamp: new Date().toISOString(),
+      });
+    }
+    expect(handle.state.streamingMessages.size).toBe(3);
+    opts.tasks = [
+      makeTask('finished', TaskStatus.COMPLETED),
+      makeTask('ongoing', TaskStatus.RUNNING),
+    ];
+    opts.messagesByTask = {
+      ongoing: [{ ...makeMessage('ongoing', 1), message_id: 'persisted' as Message['message_id'] }],
+    };
+    await handle.resync();
+    expect([...handle.state.streamingMessages.keys()]).toEqual(['still-streaming']);
+    expect(handle.state.tasks.find((task) => task.task_id === 'finished')?.status).toBe(
+      TaskStatus.COMPLETED
+    );
+    handle.dispose();
+  });
+
   it('re-subscribes on reconnect and awaits the ack before resyncing', async () => {
     // Deferred create lets us prove the resync ordering: hydration must not run
     // while the re-subscribe ack is pending, only after it resolves.
@@ -1184,6 +1221,27 @@ describe('ReactiveSessionHandle stream subscription', () => {
 });
 
 describe('shared reactive session idle cache', () => {
+  it('defers idle transcript catch-up until it is reopened after reconnect', async () => {
+    const mock = createMockClient({
+      tasks: [makeTask('task-1', TaskStatus.RUNNING)],
+      messagesByTask: {},
+    });
+    const active = retainReactiveSession(mock.client, SESSION_ID, { taskHydration: 'none' });
+    const cached = retainReactiveSession(mock.client, SESSION_ID, { taskHydration: 'eager' });
+    await Promise.all([active.ready(), cached.ready()]);
+    releaseReactiveSession(mock.client, SESSION_ID, { taskHydration: 'eager' });
+    const fetched = mock.messageFindAll.mock.calls.length;
+    mock.fireIo('disconnect');
+    mock.fireIo('connect');
+    await Promise.all([active.ready(), cached.ready()]);
+    expect(mock.messageFindAll).toHaveBeenCalledTimes(fetched);
+    const reopened = retainReactiveSession(mock.client, SESSION_ID, { taskHydration: 'eager' });
+    expect(reopened).toBe(cached);
+    await vi.waitFor(() => expect(mock.messageFindAll).toHaveBeenCalledTimes(fetched + 1));
+    active.dispose();
+    cached.dispose();
+  });
+
   it('reuses a recently viewed transcript and disposes it after the idle TTL', async () => {
     const mock = createMockClient({
       tasks: [makeTask('task-1', TaskStatus.COMPLETED)],

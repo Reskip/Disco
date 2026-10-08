@@ -21,16 +21,23 @@ export function installVisualViewportSizing(): () => void {
     rootStyle.setProperty(VISIBLE_VIEWPORT_HEIGHT, formatPixels(height));
     rootStyle.setProperty(VISIBLE_VIEWPORT_TOP, formatPixels(offsetTop));
   };
+  const onVisibilityChange = () => {
+    if (document.visibilityState === 'visible') update();
+  };
 
   update();
   window.addEventListener('resize', update, { passive: true });
   window.addEventListener('orientationchange', update, { passive: true });
+  window.addEventListener('pageshow', update);
+  document.addEventListener('visibilitychange', onVisibilityChange);
   visualViewport?.addEventListener('resize', update, { passive: true });
   visualViewport?.addEventListener('scroll', update, { passive: true });
 
   return () => {
     window.removeEventListener('resize', update);
     window.removeEventListener('orientationchange', update);
+    window.removeEventListener('pageshow', update);
+    document.removeEventListener('visibilitychange', onVisibilityChange);
     visualViewport?.removeEventListener('resize', update);
     visualViewport?.removeEventListener('scroll', update);
     rootStyle.removeProperty(VISIBLE_VIEWPORT_HEIGHT);

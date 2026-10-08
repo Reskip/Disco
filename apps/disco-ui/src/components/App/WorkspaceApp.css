@@ -2606,16 +2606,37 @@
     position: relative;
     z-index: 8;
     box-sizing: border-box;
-    min-height: calc(52px + env(safe-area-inset-top));
-    padding-top: calc(9px + env(safe-area-inset-top)) !important;
+    min-height: calc(60px + env(safe-area-inset-top));
+    padding-top: calc(8px + env(safe-area-inset-top)) !important;
+    padding-bottom: 8px !important;
     padding-right: max(12px, env(safe-area-inset-right)) !important;
-    padding-left: max(12px, env(safe-area-inset-left)) !important;
+    padding-left: calc(64px + env(safe-area-inset-left)) !important;
   }
 
   .disco-session-header .ant-btn {
     width: 44px;
     min-width: 44px;
     height: 44px;
+    flex-shrink: 0;
+  }
+
+  .disco-session-title-text {
+    font-size: 15px !important;
+    line-height: 20px;
+  }
+
+  .disco-session-title-input {
+    height: 44px;
+    font-size: 16px !important;
+  }
+
+  .disco-session-body {
+    min-height: 0;
+    padding-inline: max(12px, env(safe-area-inset-left)) max(12px, env(safe-area-inset-right)) !important;
+  }
+
+  .disco-session-body [data-testid='conversation-scroll-container'] {
+    scrollbar-gutter: auto !important;
   }
 
   .disco-token-user-row {
@@ -2703,11 +2724,11 @@
     line-height: 1.45;
   }
 
-  .disco-workspace-mobile-menu {
+  .disco-workspace-mobile-menu.ant-btn {
     position: absolute;
     z-index: 20;
-    top: 10px;
-    left: 10px;
+    top: calc(8px + env(safe-area-inset-top));
+    left: calc(10px + env(safe-area-inset-left));
     display: inline-flex;
     width: 44px;
     min-width: 44px;
@@ -2748,6 +2769,11 @@
 
   .disco-conversation-transcript {
     padding-inline: 2px;
+  }
+
+  .disco-message-markdown {
+    font-size: 15px;
+    line-height: 1.65;
   }
 
   .disco-workspace-settings-modal .ant-tabs-left {
@@ -3314,11 +3340,8 @@
 
   .disco-session-composer-anchor,
   .disco-session-floating-dock {
-    width: min(
-      calc(100% - 24px),
-      var(--disco-chat-effective-width, var(--disco-chat-content-width))
-    );
-    max-width: calc(100% - 24px);
+    width: min(100%, var(--disco-chat-effective-width, var(--disco-chat-content-width)));
+    max-width: 100%;
   }
 
   .disco-task-plan-popover .ant-popover-inner {

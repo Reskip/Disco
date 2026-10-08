@@ -6,7 +6,12 @@ import type {
   SessionPromptResult,
   Task,
 } from '@disco/core/client';
-import { MESSAGE_PAGINATION, PAGINATION, TaskStatus } from '@disco/core/client';
+import {
+  isTerminalTaskStatus,
+  MESSAGE_PAGINATION,
+  PAGINATION,
+  TaskStatus,
+} from '@disco/core/client';
 
 export type TaskHydrationMode = 'none' | 'lazy' | 'eager';
 
@@ -620,7 +625,11 @@ export class ReactiveSessionHandle {
       loadedTaskIds,
       // Repair task_id on any stream initialized from a chunk that arrived
       // before Tasks were hydrated (task_id was undefined then).
-      streamingMessages: restampStreamingTaskIds(args.previous.streamingMessages, tasks),
+      streamingMessages: reconcileStreamingMessages(
+        args.previous.streamingMessages,
+        tasks,
+        messagesByTask
+      ),
       queuedTasks: sortTasksByQueuePosition([...queuedById.values()]),
       loading: false,
       error: null,
@@ -726,7 +735,16 @@ export class ReactiveSessionHandle {
       // so a chunk arriving after the join lands on top of the resynced state.
       this.readyPromise = this.subscribeThenHydrate(
         resubscribeSessionStream(this.client, this.sessionId),
-        () => this.resync()
+        async () => {
+          // Recently closed panels stay cached, but waking a phone should not
+          // download every previously visited transcript alongside the open
+          // one. Rejoin their rooms now and catch up when a panel is reopened.
+          if (IDLE_SHARED_REACTIVE_HANDLES.has(this)) {
+            STALE_IDLE_REACTIVE_HANDLES.add(this);
+            return;
+          }
+          await this.resync();
+        }
       );
     };
     const onSocketDisconnect = () => {
@@ -1369,7 +1387,11 @@ export class ReactiveSessionHandle {
           queuedTasks: sortTasksByQueuePosition([...queuedById.values()]),
           messagesByTask,
           loadedTaskIds,
-          streamingMessages: restampStreamingTaskIds(prev.streamingMessages, tasks),
+          streamingMessages: reconcileStreamingMessages(
+            prev.streamingMessages,
+            tasks,
+            messagesByTask
+          ),
           error: null,
           terminal: false,
           lastSyncedAt: new Date().toISOString(),
@@ -1711,6 +1733,8 @@ const SHARED_REACTIVE_SESSIONS = new WeakMap<
   DiscoClient,
   Map<string, SharedReactiveSessionEntry>
 >();
+const IDLE_SHARED_REACTIVE_HANDLES = new WeakSet<ReactiveSessionHandle>();
+const STALE_IDLE_REACTIVE_HANDLES = new WeakSet<ReactiveSessionHandle>();
 export const SHARED_REACTIVE_SESSION_IDLE_TTL_MS = 15 * 60 * 1000;
 const SHARED_REACTIVE_SESSION_MAX_IDLE_ENTRIES = 12;
 
@@ -1777,6 +1801,10 @@ export function retainReactiveSession(
     if (existing.disposeTimer) clearTimeout(existing.disposeTimer);
     existing.disposeTimer = null;
     existing.refCount += 1;
+    IDLE_SHARED_REACTIVE_HANDLES.delete(existing.handle);
+    if (STALE_IDLE_REACTIVE_HANDLES.delete(existing.handle)) {
+      void existing.handle.ready().then(() => existing.handle.resync());
+    }
     return existing.handle;
   }
 
@@ -1817,6 +1845,7 @@ export function releaseReactiveSession(
 
   if (entry.refCount <= 0) return;
   entry.refCount -= 1;
+  if (entry.refCount === 0) IDLE_SHARED_REACTIVE_HANDLES.add(entry.handle);
   if (entry.refCount > 0) return;
 
   entry.lastReleasedAt = Date.now();
@@ -1857,6 +1886,31 @@ function restampStreamingTaskIds(
     if (!message.task_id) {
       if (next === streamingMessages) next = new Map(streamingMessages);
       next.set(id, { ...message, task_id: activeTaskId });
+    }
+  }
+  return next;
+}
+
+/** Reconcile missed message-created/stream-end/task-completed events on wake. */
+function reconcileStreamingMessages(
+  streamingMessages: ReactiveStreamingMessagesById,
+  tasks: Task[],
+  messagesByTask: ReactiveMessagesByTask
+): ReactiveStreamingMessagesById {
+  let next = restampStreamingTaskIds(streamingMessages, tasks);
+  if (next.size === 0) return next;
+  const persistedIds = new Set<string>(
+    [...messagesByTask.values()].flatMap((messages) =>
+      messages.map((message) => message.message_id)
+    )
+  );
+  const completedTaskIds = new Set<string>(
+    tasks.filter((task) => isTerminalTaskStatus(task.status)).map((task) => task.task_id)
+  );
+  for (const [id, message] of streamingMessages) {
+    if (persistedIds.has(id) || (message.task_id && completedTaskIds.has(message.task_id))) {
+      if (next === streamingMessages) next = new Map(streamingMessages);
+      next.delete(id);
     }
   }
   return next;

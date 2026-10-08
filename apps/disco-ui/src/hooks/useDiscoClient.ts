@@ -72,6 +72,8 @@ export function useDiscoClient(options: UseDiscoClientOptions = {}): UseDiscoCli
     let mounted = true;
     let client: DiscoClient | null = null;
     let hasConnectedOnce = false; // Track if we've ever connected successfully
+    let backgrounded = document.visibilityState === 'hidden';
+    let wakeReconnectPending = false;
 
     // Bookkeeping for the manual reconnect path used on 'io server disconnect'.
     // socket.io does NOT auto-reconnect for that reason, so we kick it
@@ -133,7 +135,10 @@ export function useDiscoClient(options: UseDiscoClientOptions = {}): UseDiscoCli
       setError(null);
 
       // Create client (autoConnect: false, so we control connection timing)
-      client = createClient(url, false);
+      // Timed acknowledgements also reject pending RPCs on disconnect. Without
+      // them an RPC sent just before suspension can stay unresolved forever,
+      // pinning a reactive session's single-flight resync to the dead socket.
+      client = createClient(url, false, { ackTimeout: 30000 });
       clientRef.current = client;
 
       // Register an around-hook that transparently recovers from mid-session
@@ -235,6 +240,7 @@ export function useDiscoClient(options: UseDiscoClientOptions = {}): UseDiscoCli
       // Setup socket event listeners BEFORE connecting
       client.io.on('connect', async () => {
         if (mounted) {
+          wakeReconnectPending = false;
           const isReconnect = hasConnectedOnce;
           hasConnectedOnce = true; // Mark that we've successfully connected
           // Reset manual-reconnect backoff now that we're connected again.
@@ -517,27 +523,37 @@ export function useDiscoClient(options: UseDiscoClientOptions = {}): UseDiscoCli
     };
     window.addEventListener(TOKENS_REFRESHED_EVENT, handleTokensRefreshed);
 
-    // A mobile page can return from BFCache or OS suspension with React still
-    // mounted but the Socket.IO transport closed. Socket.IO cannot reconnect
-    // a socket that the page lifecycle explicitly closed, so kick it on every
-    // foreground/network recovery signal. `connect()` is idempotent while an
-    // attempt is already active; the connect handler above performs JWT/refresh
-    // authentication before publishing `connected=true`.
-    const reconnectOnBrowserWake = () => {
+    // Mobile browsers can freeze heartbeat/retry timers while leaving
+    // `connected` or `active` true on a dead transport. Returning from the
+    // background must establish a fresh connection, not trust those flags.
+    // Keep the same client, transcript cache and drafts; the connect flow
+    // re-authenticates and reactive sessions rejoin before catching up.
+    const reconnectOnBrowserWake = (event?: Event) => {
       if (!mounted || !client || !hasToken) return;
-      if (document.visibilityState === 'hidden' || client.io.connected) return;
-      if ((client.io as { active?: boolean }).active === true) return;
+      if (document.visibilityState === 'hidden') return;
+      const restored =
+        backgrounded || (event?.type === 'pageshow' && (event as PageTransitionEvent).persisted);
+      backgrounded = false;
+      if (client.io.connected && !restored && event?.type !== 'online') return;
+      if (wakeReconnectPending && !restored) return;
+      wakeReconnectPending = true;
 
       clearManualReconnectTimer();
       setConnecting(true);
       setError(null);
+      if (client.io.connected || client.io.active) client.io.disconnect();
       client.io.connect();
     };
+    const handlePageHide = () => {
+      backgrounded = true;
+    };
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') reconnectOnBrowserWake();
+      if (document.visibilityState === 'hidden') backgrounded = true;
+      else reconnectOnBrowserWake();
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', handlePageHide);
     window.addEventListener('pageshow', reconnectOnBrowserWake);
     window.addEventListener('focus', reconnectOnBrowserWake);
     window.addEventListener('online', reconnectOnBrowserWake);
@@ -549,6 +565,7 @@ export function useDiscoClient(options: UseDiscoClientOptions = {}): UseDiscoCli
       clearDisconnectGrace();
       window.removeEventListener(TOKENS_REFRESHED_EVENT, handleTokensRefreshed);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', handlePageHide);
       window.removeEventListener('pageshow', reconnectOnBrowserWake);
       window.removeEventListener('focus', reconnectOnBrowserWake);
       window.removeEventListener('online', reconnectOnBrowserWake);

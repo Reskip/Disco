@@ -29,6 +29,7 @@ import { getDaemonUrl } from '../../config/daemon';
 import { useAppActions } from '../../contexts/AppActionsContext';
 import { useConnectionDisabled } from '../../contexts/ConnectionContext';
 import { useCodexModels } from '../../hooks/useCodexModels';
+import { MOBILE_COMPOSER_QUERY, useMediaQuery } from '../../hooks/useMediaQuery';
 import { useSharedReactiveSession } from '../../hooks/useSharedReactiveSession';
 import { useDiscoStore } from '../../store/discoStore';
 import { selectUserById } from '../../store/selectors';
@@ -280,6 +281,7 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
   uploadPolicy,
 }) => {
   const { token } = theme.useToken();
+  const mobileComposer = useMediaQuery(MOBILE_COMPOSER_QUERY);
   const { showSuccess, showInfo, showError } = useThemedMessage();
   const connectionDisabled = useConnectionDisabled();
 
@@ -781,7 +783,7 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
           onSubmit={stableFooterHandlers.onSendPrompt}
           hasExternalInput={hasComposerAttachments && !pendingComposerSend}
           placeholder={isRunning ? '输入下一条消息，当前任务完成后自动开始' : '随心输入'}
-          autoSize={{ minRows: 3, maxRows: 10 }}
+          autoSize={{ minRows: mobileComposer ? 2 : 3, maxRows: mobileComposer ? 5 : 10 }}
           client={client}
           userById={userById}
           onFilesDrop={addComposerAttachments}
@@ -820,6 +822,7 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
     pendingComposerSend,
     composerDropActive,
     hasComposerAttachments,
+    mobileComposer,
     isRunning,
     client,
     userById,
@@ -1406,7 +1409,11 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
                       textAlign: 'left',
                     }}
                   >
-                    <Typography.Text strong style={{ fontSize: 14, ...getSessionTitleStyles(2) }}>
+                    <Typography.Text
+                      className="disco-session-title-text"
+                      strong
+                      style={{ fontSize: 14, ...getSessionTitleStyles(2) }}
+                    >
                       {session.title || session.description
                         ? getSessionDisplayTitle(session, { includeAgentFallback: false })
                         : '未命名对话'}
@@ -1429,6 +1436,7 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
             <Tooltip title="返回首页">
               <Button
                 type="text"
+                aria-label="返回首页"
                 icon={<CloseOutlined />}
                 onClick={onClose}
                 style={{ marginLeft: token.sizeUnit }}

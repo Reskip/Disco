@@ -1,5 +1,5 @@
 import type { User } from '@disco-live/client';
-import { act, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { App as AntApp } from 'antd';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -16,12 +16,19 @@ vi.mock('../HomePage/useDailyHomeGreeting', () => ({
   ],
 }));
 vi.mock('../SessionPanel', () => ({ SessionPanel: () => null }));
+const mediaState = vi.hoisted(() => ({ mobile: false }));
+vi.mock('../../hooks/useMediaQuery', async (original) => ({
+  ...(await original<typeof import('../../hooks/useMediaQuery')>()),
+  useMediaQuery: () => mediaState.mobile,
+}));
 vi.mock('../WorkspaceShell', async () => {
   const { WorkspaceSidebar } = await import('../WorkspaceShell/WorkspaceSidebar');
   return {
     WorkspaceSidebar,
-    WorkspaceSettingsModal: () => null,
-    WorkspaceSessionSearchModal: () => null,
+    WorkspaceSettingsModal: ({ open }: { open: boolean }) =>
+      open ? <div role="dialog" aria-label="测试设置" /> : null,
+    WorkspaceSessionSearchModal: ({ open }: { open: boolean }) =>
+      open ? <div role="dialog" aria-label="测试搜索" /> : null,
     WorkspaceAgentEditModal: () => null,
   };
 });
@@ -41,7 +48,24 @@ function workspace(user: User) {
 }
 
 describe('home and sidebar current-user identity', () => {
-  beforeEach(() => discoStore.setState({ ...EMPTY_MAPS }));
+  beforeEach(() => {
+    mediaState.mobile = false;
+    discoStore.setState({ ...EMPTY_MAPS });
+  });
+
+  it('opens settings on mobile instead of hiding or discarding the action', () => {
+    mediaState.mobile = true;
+    const { container } = render(workspace(USER));
+    fireEvent.click(container.querySelector<HTMLButtonElement>('[aria-label="打开设置"]')!);
+    expect(container.querySelector('[role="dialog"][aria-label="测试设置"]')).not.toBeNull();
+  });
+
+  it('opens conversation search on mobile', () => {
+    mediaState.mobile = true;
+    const { container } = render(workspace(USER));
+    fireEvent.click(container.querySelector<HTMLButtonElement>('[aria-label="搜索对话"]')!);
+    expect(container.querySelector('[role="dialog"][aria-label="测试搜索"]')).not.toBeNull();
+  });
 
   it('shows the authenticated name on the first render before the user directory arrives', () => {
     const { container } = render(workspace(USER));

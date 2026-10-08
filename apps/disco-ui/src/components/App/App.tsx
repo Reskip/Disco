@@ -214,8 +214,6 @@ export const App: React.FC<AppProps> = ({
 
   useEffect(() => {
     if (!mobileLayout) return;
-    setSearchOpen(false);
-    setSettingsOpen(false);
     setEditingAgentId(null);
   }, [mobileLayout]);
 
@@ -303,7 +301,6 @@ export const App: React.FC<AppProps> = ({
   }, [client, selectedSession]);
 
   useEffect(() => {
-    if (mobileLayout) return;
     if (openSettingsTab || openUserSettings) {
       mobileLayerRef.current = { sidebar: false, settings: true, agent: false };
       setMobileSidebarOpen(false);
@@ -311,7 +308,7 @@ export const App: React.FC<AppProps> = ({
       setSettingsOpen(true);
       markMobileLayer('settings');
     }
-  }, [initialUserSettingsTab, markMobileLayer, mobileLayout, openSettingsTab, openUserSettings]);
+  }, [initialUserSettingsTab, markMobileLayer, openSettingsTab, openUserSettings]);
 
   const closeSettings = useCallback(() => {
     mobileLayerRef.current.settings = false;
@@ -322,14 +319,13 @@ export const App: React.FC<AppProps> = ({
   }, [dismissMobileLayer, onSettingsClose, onUserSettingsClose]);
 
   const openSettings = useCallback(() => {
-    if (mobileLayout) return;
     mobileLayerRef.current = { sidebar: false, settings: true, agent: false };
     setMobileSidebarOpen(false);
     setSettingsInitialTab('profile');
     setArchivedPreviewSessionId(null);
     setSettingsOpen(true);
     markMobileLayer('settings');
-  }, [markMobileLayer, mobileLayout]);
+  }, [markMobileLayer]);
 
   const openAgentEditor = useCallback(
     (agentId: string) => {
@@ -729,39 +725,37 @@ export const App: React.FC<AppProps> = ({
           </div>
         </main>
         <Upload style={{ display: 'none' }} openFileDialogOnClick={false} showUploadList={false} />
+        <WorkspaceSessionSearchModal
+          open={searchOpen}
+          client={client}
+          onClose={() => setSearchOpen(false)}
+          onOpenSession={(sessionId) => {
+            setSearchOpen(false);
+            handleSessionClick(sessionId);
+          }}
+          onOpenArchivedSession={openArchivedSessionManager}
+        />
+        <WorkspaceSettingsModal
+          open={settingsOpen}
+          currentUser={user}
+          users={Array.from(userById.values())}
+          client={client}
+          initialTab={settingsInitialTab}
+          initialArchivedSessionId={archivedPreviewSessionId}
+          onClose={closeSettings}
+          onCreateUser={onCreateUser}
+          onUpdateUser={onUpdateUser}
+          onDeleteUser={onDeleteUser}
+          onLogout={onLogout}
+        />
         {!mobileLayout && (
-          <>
-            <WorkspaceSessionSearchModal
-              open={searchOpen}
-              client={client}
-              onClose={() => setSearchOpen(false)}
-              onOpenSession={(sessionId) => {
-                setSearchOpen(false);
-                handleSessionClick(sessionId);
-              }}
-              onOpenArchivedSession={openArchivedSessionManager}
-            />
-            <WorkspaceSettingsModal
-              open={settingsOpen}
-              currentUser={user}
-              users={Array.from(userById.values())}
-              client={client}
-              initialTab={settingsInitialTab}
-              initialArchivedSessionId={archivedPreviewSessionId}
-              onClose={closeSettings}
-              onCreateUser={onCreateUser}
-              onUpdateUser={onUpdateUser}
-              onDeleteUser={onDeleteUser}
-              onLogout={onLogout}
-            />
-            <WorkspaceAgentEditModal
-              open={Boolean(editingAgentId)}
-              client={client}
-              agent={editingAgent}
-              onDeleteAgent={deleteAgentFromSidebar}
-              onClose={closeAgentEditor}
-            />
-          </>
+          <WorkspaceAgentEditModal
+            open={Boolean(editingAgentId)}
+            client={client}
+            agent={editingAgent}
+            onDeleteAgent={deleteAgentFromSidebar}
+            onClose={closeAgentEditor}
+          />
         )}
       </Layout>
     </AppActionsProvider>

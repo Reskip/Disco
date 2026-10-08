@@ -16,8 +16,19 @@ import {
   getCodexCatalogSelectionError,
   getCodexReplacementModel,
 } from '@disco-live/client';
-import { AutoComplete, Button, Flex, Select, Space, Tag, Tooltip, Typography, theme } from 'antd';
-import { useEffect, useState } from 'react';
+import {
+  AutoComplete,
+  Button,
+  Flex,
+  type RefSelectProps,
+  Select,
+  Space,
+  Tag,
+  Tooltip,
+  Typography,
+  theme,
+} from 'antd';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useLocale } from '../../contexts/LocaleContext';
 import { useCodexModels } from '../../hooks/useCodexModels';
 import { AdvisorModelSelect } from './AdvisorModelSelect';
@@ -55,6 +66,8 @@ export interface ModelSelectorProps {
   catalogEnabled?: boolean;
   /** Render as a single compact dropdown suitable for popovers/toolbars. */
   compact?: boolean;
+  /** Fit the compact picker to a touch toolbar without opening the keyboard. */
+  mobile?: boolean;
   getPopupContainer?: (triggerNode: HTMLElement) => HTMLElement;
   /**
    * Render the Claude Code advisor model select inline. Surfaces that relocate
@@ -148,11 +161,45 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
   client,
   catalogEnabled = true,
   compact = false,
+  mobile = false,
   getPopupContainer,
   showAdvisor = true,
 }) => {
   const { token } = theme.useToken();
   const { locale } = useLocale();
+  const compactSelectRef = useRef<RefSelectProps>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [mobileMenuSize, setMobileMenuSize] = useState({ width: 320, height: 256 });
+  const fitMobileMenu = useCallback(() => {
+    const element = compactSelectRef.current?.nativeElement;
+    if (!mobile || !element) return;
+    const rect = element.getBoundingClientRect();
+    const scale = element.offsetHeight ? rect.height / element.offsetHeight : 1;
+    const viewport = window.visualViewport;
+    const top = viewport?.offsetTop ?? 0;
+    const height = viewport?.height ?? window.innerHeight;
+    const available = Math.max(rect.top - top, top + height - rect.bottom);
+    setMobileMenuSize({
+      width: Math.min(
+        320,
+        Math.floor((viewport?.width ?? window.innerWidth) / scale - token.marginSM * 2)
+      ),
+      height: Math.max(
+        44,
+        Math.min(256, Math.floor((available - token.marginXS) / scale - token.paddingXS * 2))
+      ),
+    });
+  }, [mobile, token.marginSM, token.marginXS, token.paddingXS]);
+  useEffect(() => {
+    if (!mobile || !menuOpen) return;
+    fitMobileMenu();
+    window.addEventListener('resize', fitMobileMenu);
+    window.visualViewport?.addEventListener('resize', fitMobileMenu);
+    return () => {
+      window.removeEventListener('resize', fitMobileMenu);
+      window.visualViewport?.removeEventListener('resize', fitMobileMenu);
+    };
+  }, [mobile, menuOpen, fitMobileMenu]);
 
   // Determine which model list to use based on agentic_tool (with backwards compat for agent prop)
   const effectiveTool = agentic_tool || agent || 'claude-code';
@@ -430,7 +477,15 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
   const renderAliasOption = (optionValue: string) => {
     const data = aliasOptions.find((o) => o.value === optionValue);
     return (
-      <Flex justify="space-between" align="start" gap={12} style={{ minWidth: 300 }}>
+      <Flex
+        justify="space-between"
+        align={mobile ? 'center' : 'start'}
+        gap={12}
+        style={{
+          minWidth: mobile ? 0 : 300,
+          minHeight: mobile ? token.controlHeightLG : undefined,
+        }}
+      >
         {/* whiteSpace:normal + flex:1/minWidth:0 lets descriptions wrap to
             multiple lines instead of antd's default option ellipsis. */}
         <div style={{ lineHeight: 1.3, whiteSpace: 'normal', flex: 1, minWidth: 0 }}>
@@ -483,15 +538,28 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
     }
     const modelSelect = (
       <Select
+        ref={compactSelectRef}
+        aria-label="选择模型"
         value={currentModel || undefined}
         loading={awaitingCodexCatalog}
         notFoundContent={awaitingCodexCatalog ? '正在获取模型列表…' : undefined}
         onChange={selectAlias}
         size="middle"
-        showSearch
+        showSearch={!mobile}
         filterOption={(input, option) => (option?.searchText ?? '').includes(input.toLowerCase())}
         optionLabelProp="label"
-        popupMatchSelectWidth={false}
+        popupMatchSelectWidth={mobile ? mobileMenuSize.width : false}
+        popupAlign={
+          mobile
+            ? { overflow: { adjustX: true, adjustY: true, shiftX: true, shiftY: true } }
+            : undefined
+        }
+        listHeight={mobile ? mobileMenuSize.height : 256}
+        onOpenChange={(open) => {
+          if (open) fitMobileMenu();
+          setMenuOpen(open);
+        }}
+        getPopupContainer={getPopupContainer}
         style={{ width: '100%', fontSize: token.fontSize }}
         options={compactOptions}
         optionRender={(option) => renderAliasOption(String(option.value))}

@@ -13,7 +13,7 @@ import type {
   Session,
 } from '@disco-live/client';
 import { getCodexCatalogSelectionError, getCodexReplacementModel } from '@disco-live/client';
-import { Button, Segmented, Space, Tooltip, Typography } from 'antd';
+import { Button, Dropdown, Segmented, Space, Tooltip, Typography } from 'antd';
 import React from 'react';
 import { useCodexModels } from '../../hooks/useCodexModels';
 import { MOBILE_COMPOSER_QUERY, useMediaQuery } from '../../hooks/useMediaQuery';
@@ -96,6 +96,10 @@ export const SimpleSessionFooter = React.memo<SimpleSessionFooterProps>(
     }, [serviceTier]);
 
     const managedByPreset = Boolean(session.agentic_tool_preset_id);
+    const changeServiceTier = (value: 'default' | 'fast') => {
+      setOptimisticServiceTier(value);
+      onServiceTierChange(value);
+    };
     const supportsEffort = Boolean(toolCaps?.reasoningEffortLevels?.length);
     const resolvedEffort =
       effortLevel ??
@@ -113,10 +117,36 @@ export const SimpleSessionFooter = React.memo<SimpleSessionFooterProps>(
       hasInput &&
       !connectionDisabled;
     const followUpDescription = '消息会进入队列，当前任务完整结束后再自动开始';
+    const modelAvailabilityError =
+      session.agentic_tool === 'codex'
+        ? getCodexCatalogSelectionError(
+            codex.catalog,
+            modelConfig ? { ...modelConfig, effort: undefined } : undefined
+          )
+        : undefined;
+    const modelControl = (
+      <div
+        className="disco-simple-composer-model"
+        title={managedByPreset ? '此会话由预设配置管理' : undefined}
+        inert={managedByPreset}
+        style={{ opacity: managedByPreset ? 0.65 : 1 }}
+      >
+        <ModelSelector
+          value={modelConfig}
+          onChange={onModelConfigChange}
+          agentic_tool={session.agentic_tool}
+          client={client}
+          catalogEnabled={session.created_by === currentUserId}
+          mobile={mobileComposer}
+          showAdvisor={!mobileComposer}
+          compact
+        />
+      </div>
+    );
 
     return (
       <div className={`disco-simple-composer${mobileComposer ? ' is-mobile-simplified' : ''}`}>
-        {mobileComposer && modelError && (
+        {mobileComposer && modelError && modelError !== modelAvailabilityError && (
           <div role="status">
             <Typography.Text type="warning">{modelError}</Typography.Text>
             {replacement && !managedByPreset && (
@@ -152,25 +182,7 @@ export const SimpleSessionFooter = React.memo<SimpleSessionFooterProps>(
           </Tooltip>
 
           <div data-testid="session-controls" className="disco-simple-composer-controls">
-            {!mobileComposer && (
-              <div
-                className="disco-simple-composer-model"
-                title={managedByPreset ? '此会话由预设配置管理' : undefined}
-                style={{
-                  opacity: managedByPreset ? 0.65 : 1,
-                  pointerEvents: managedByPreset ? 'none' : undefined,
-                }}
-              >
-                <ModelSelector
-                  value={modelConfig}
-                  onChange={onModelConfigChange}
-                  agentic_tool={session.agentic_tool}
-                  client={client}
-                  catalogEnabled={session.created_by === currentUserId}
-                  compact
-                />
-              </div>
-            )}
+            {modelControl}
 
             {!mobileComposer && supportsEffort && toolCaps?.reasoningEffortLevels && (
               <div
@@ -198,18 +210,38 @@ export const SimpleSessionFooter = React.memo<SimpleSessionFooterProps>(
               </div>
             )}
 
-            {session.agentic_tool === 'codex' && (
+            {session.agentic_tool === 'codex' && mobileComposer && (
+              <Dropdown
+                trigger={['click']}
+                disabled={managedByPreset}
+                menu={{
+                  selectedKeys: [optimisticServiceTier],
+                  items: [
+                    { key: 'default', label: '普通', style: { minHeight: 44 } },
+                    { key: 'fast', label: '快速', style: { minHeight: 44 } },
+                  ],
+                  onClick: ({ key }) => changeServiceTier(key as 'default' | 'fast'),
+                }}
+              >
+                <Button
+                  data-testid="service-tier-control"
+                  className="disco-mobile-service-tier-control"
+                  type="text"
+                  aria-label={`切换速度，当前${optimisticServiceTier === 'fast' ? '快速' : '普通'}`}
+                  disabled={managedByPreset}
+                >
+                  {optimisticServiceTier === 'fast' ? '快速' : '普通'}
+                </Button>
+              </Dropdown>
+            )}
+            {session.agentic_tool === 'codex' && !mobileComposer && (
               <Segmented
                 data-testid="service-tier-control"
                 className="disco-service-tier-control"
                 size="middle"
                 value={optimisticServiceTier}
                 disabled={managedByPreset}
-                onChange={(value) => {
-                  const nextValue = value as 'default' | 'fast';
-                  setOptimisticServiceTier(nextValue);
-                  onServiceTierChange(nextValue);
-                }}
+                onChange={(value) => changeServiceTier(value as 'default' | 'fast')}
                 options={[
                   { label: '普通', value: 'default' },
                   {

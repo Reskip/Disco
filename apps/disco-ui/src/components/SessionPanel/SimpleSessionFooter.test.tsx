@@ -3,10 +3,20 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { App, ConfigProvider } from 'antd';
 import type React from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { ModelSelectorProps } from '../ModelSelector/ModelSelector';
 import { SimpleSessionFooter } from './SimpleSessionFooter';
 
 vi.mock('../ModelSelector', () => ({
-  ModelSelector: () => <div data-testid="model-selector-stub">Codex 模型</div>,
+  ModelSelector: ({ value, onChange, mobile }: ModelSelectorProps) => (
+    <button
+      type="button"
+      data-testid="model-selector-stub"
+      data-mobile={mobile}
+      onClick={() => onChange?.({ ...value, mode: 'alias', model: 'gpt-6-sol' })}
+    >
+      {value?.model ?? 'Codex 模型'}
+    </button>
+  ),
 }));
 
 vi.mock('../EffortSelector', () => ({
@@ -176,14 +186,65 @@ describe('SimpleSessionFooter', () => {
     expect(send?.querySelector('.anticon-send')).toBeInTheDocument();
   });
 
-  it('手机输入区不提供模型和思考深度，运行时只保留停止而不允许排队', () => {
+  it('手机输入区提供模型选择，运行时仍保留停止而不允许排队', () => {
     useMobileMediaQuery();
     render(<SimpleSessionFooter {...baseProps} isRunning hasInput />, { wrapper: Wrapper });
 
-    expect(screen.queryByTestId('model-selector-stub')).not.toBeInTheDocument();
+    expect(screen.getByTestId('model-selector-stub')).toHaveAttribute('data-mobile', 'true');
+    expect(screen.getByTestId('session-controls')).toContainElement(
+      screen.getByTestId('model-selector-stub')
+    );
     expect(screen.getByTestId('service-tier-control')).toBeInTheDocument();
     expect(screen.queryByTestId('effort-bar-control')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '排队消息' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '停止' })).toBeEnabled();
+  });
+
+  it('手机显示当前会话的模型，并通过原会话回调保存选择', () => {
+    useMobileMediaQuery();
+    const onModelConfigChange = vi.fn();
+    render(
+      <SimpleSessionFooter
+        {...baseProps}
+        modelConfig={{ mode: 'alias', model: 'gpt-6-astra', effort: 'high' }}
+        onModelConfigChange={onModelConfigChange}
+      />,
+      { wrapper: Wrapper }
+    );
+
+    expect(screen.getByTestId('model-selector-stub')).toHaveTextContent('gpt-6-astra');
+    fireEvent.click(screen.getByTestId('model-selector-stub'));
+    expect(onModelConfigChange).toHaveBeenCalledExactlyOnceWith({
+      mode: 'alias',
+      model: 'gpt-6-sol',
+      effort: 'high',
+    });
+    expect(screen.getByRole('button', { name: '发送' })).toBeEnabled();
+  });
+
+  it('预设管理的会话模型在手机上仍不可交互', () => {
+    useMobileMediaQuery();
+    render(
+      <SimpleSessionFooter
+        {...baseProps}
+        session={{ ...session, agentic_tool_preset_id: 'preset-1' }}
+      />,
+      { wrapper: Wrapper }
+    );
+
+    expect(screen.getByTestId('model-selector-stub').parentElement).toHaveAttribute('inert');
+  });
+
+  it('手机把速度切换收进当前档位的下拉菜单，仍即时保存选择', () => {
+    useMobileMediaQuery();
+    const onServiceTierChange = vi.fn();
+    render(<SimpleSessionFooter {...baseProps} onServiceTierChange={onServiceTierChange} />, {
+      wrapper: Wrapper,
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '切换速度，当前普通' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: '快速' }));
+    expect(onServiceTierChange).toHaveBeenCalledExactlyOnceWith('fast');
+    expect(screen.getByRole('button', { name: '切换速度，当前快速' })).toBeInTheDocument();
   });
 });

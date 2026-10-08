@@ -113,6 +113,29 @@ describe('ModelSelector (Claude)', () => {
 });
 
 describe('ModelSelector (Codex)', () => {
+  it('lets a mobile chat select a model without an editable search input', () => {
+    const onChange = vi.fn();
+    const { container } = render(
+      <ModelSelector
+        agentic_tool="codex"
+        compact
+        mobile
+        value={{ mode: 'alias', model: 'gpt-5.6-sol', effort: 'high' }}
+        onChange={onChange}
+      />
+    );
+
+    const picker = screen.getByRole('combobox', { name: '选择模型' });
+    expect(picker).toHaveAttribute('readonly');
+    fireEvent.mouseDown(picker);
+    fireEvent.click(container.ownerDocument.querySelector('[title="GPT-6 Astra"]')!);
+    expect(onChange).toHaveBeenCalledExactlyOnceWith({
+      mode: 'alias',
+      model: 'gpt-6-astra',
+      effort: 'high',
+    });
+  });
+
   it('shows plain model names without descriptions or recommendation, account or default badges', () => {
     render(
       <LocaleProvider>

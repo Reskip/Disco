@@ -3311,21 +3311,27 @@
 
   .disco-simple-composer-toolbar {
     align-items: flex-end;
-    gap: 8px;
+    gap: 4px;
   }
 
   .disco-simple-composer-controls {
     display: flex;
     min-width: 0;
-    flex: 0 0 auto;
-    gap: 6px;
+    flex: 1;
+    gap: 4px;
   }
 
   .disco-simple-composer-model {
-    width: 100%;
-    min-width: 0;
-    grid-column: auto;
+    width: auto;
+    min-width: 64px;
+    flex: 1;
+  }
+
+  .disco-mobile-service-tier-control {
+    width: 44px;
+    min-width: 44px;
     flex: none;
+    padding-inline: 0;
   }
 
   .disco-simple-composer-effort,

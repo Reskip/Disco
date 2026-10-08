@@ -1,4 +1,4 @@
-import type { DiscoClient, User } from '@disco-live/client';
+import type { CodexModelCatalog, DiscoClient, TokenPricingRate, User } from '@disco-live/client';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { App as AntApp } from 'antd';
 import { describe, expect, it, vi } from 'vitest';
@@ -33,6 +33,111 @@ const ADMIN = {
 } as unknown as User;
 
 describe('WorkspaceSettingsModal', () => {
+  it('等待当前模型列表，允许补全新模型报价，并保留历史报价', async () => {
+    const saved: TokenPricingRate = {
+      inputUsdPerMillion: 2,
+      cachedInputUsdPerMillion: 0.2,
+      outputUsdPerMillion: 5,
+      source: 'manual',
+      updatedAt: '2026-10-08T00:00:00Z',
+    };
+    const user = {
+      ...ADMIN,
+      preferences: { tokenPricing: { models: { 'retired-model': saved, 'gpt-5.6-sol': saved } } },
+    } as User;
+    let resolveCatalog!: (catalog: CodexModelCatalog) => void;
+    const catalogRequest = new Promise<CodexModelCatalog>((resolve) => {
+      resolveCatalog = resolve;
+    });
+    const client = {
+      service: (path: string) => {
+        if (path === 'codex-models') return { find: () => catalogRequest };
+        if (path === 'users') return { get: async () => user };
+        return { find: async () => [] };
+      },
+    } as unknown as DiscoClient;
+    const onUpdateUser = vi.fn(async () => {});
+    render(
+      <AntApp>
+        <LocaleProvider>
+          <WorkspaceSettingsModal
+            open
+            currentUser={user}
+            users={[user]}
+            client={client}
+            initialTab="pricing"
+            onClose={() => {}}
+            onUpdateUser={onUpdateUser}
+          />
+        </LocaleProvider>
+      </AntApp>
+    );
+    expect(screen.getByText('正在加载模型列表…')).toBeInTheDocument();
+    expect(screen.queryByLabelText('gpt-5.6-sol 输入 USD/1M')).not.toBeInTheDocument();
+    resolveCatalog({
+      source: 'dynamic',
+      default: 'gpt-6-sol',
+      models: ['gpt-6-sol', 'gpt-5.6-sol', 'hidden-model'].map((id) => ({
+        id,
+        displayName: id,
+        hidden: id === 'hidden-model',
+        isDefault: id === 'gpt-6-sol',
+      })),
+    });
+    const input = await screen.findByLabelText('gpt-6-sol 输入 USD/1M');
+    const cache = screen.getByLabelText('gpt-6-sol Cache USD/1M');
+    const output = screen.getByLabelText('gpt-6-sol 输出 USD/1M');
+    const savePricingButton = screen.getByRole('button', { name: '保存报价' });
+    expect(input).toHaveValue('');
+    expect(screen.getByLabelText('gpt-5.6-sol 输入 USD/1M')).toHaveValue('2.0000');
+    expect(screen.getByText('待补全')).toBeInTheDocument();
+    expect(screen.queryByText('retired-model')).not.toBeInTheDocument();
+    expect(screen.queryByText('hidden-model')).not.toBeInTheDocument();
+
+    fireEvent.click(savePricingButton);
+    await waitFor(() => expect(onUpdateUser).toHaveBeenCalledTimes(1));
+    expect(onUpdateUser.mock.calls[0]).toEqual([
+      'admin-1',
+      expect.objectContaining({
+        preferences: expect.objectContaining({
+          tokenPricing: expect.objectContaining({
+            models: { 'retired-model': saved, 'gpt-5.6-sol': saved },
+          }),
+        }),
+      }),
+    ]);
+
+    fireEvent.change(input, { target: { value: '3' } });
+    expect(savePricingButton).toBeDisabled();
+    fireEvent.change(cache, { target: { value: '0' } });
+    fireEvent.change(output, { target: { value: '9' } });
+    expect(savePricingButton).toBeEnabled();
+    fireEvent.change(input, { target: { value: '' } });
+    expect(savePricingButton).toBeDisabled();
+    fireEvent.change(input, { target: { value: '3' } });
+    fireEvent.click(savePricingButton);
+    await waitFor(() => expect(onUpdateUser).toHaveBeenCalledTimes(2));
+    expect(onUpdateUser.mock.calls[1]).toEqual([
+      'admin-1',
+      expect.objectContaining({
+        preferences: expect.objectContaining({
+          tokenPricing: expect.objectContaining({
+            models: {
+              'retired-model': saved,
+              'gpt-5.6-sol': saved,
+              'gpt-6-sol': expect.objectContaining({
+                inputUsdPerMillion: 3,
+                cachedInputUsdPerMillion: 0,
+                outputUsdPerMillion: 9,
+                source: 'manual',
+              }),
+            },
+          }),
+        }),
+      }),
+    ]);
+  });
+
   it('从账号目录补全认证上下文缺失的登录账号，并提供头像上传入口', async () => {
     const sparseCurrentUser = { ...ADMIN, username: undefined } as unknown as User;
     render(

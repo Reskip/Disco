@@ -1,13 +1,40 @@
 import {
+  type CodexModelCatalog,
   DEFAULT_CNY_PER_USD,
   getOfficialTokenPricing,
-  OFFICIAL_TOKEN_PRICING,
   type LeaderboardEntry,
+  OFFICIAL_TOKEN_PRICING,
   type TokenPricingPreferences,
   type TokenPricingRate,
 } from '@disco-live/client';
 
 const ONE_MILLION = 1_000_000;
+
+export interface TokenPricingDraft extends Partial<TokenPricingRate> {
+  model: string;
+}
+
+/** Display the same visible models as the selector without inventing missing prices. */
+export function getCatalogTokenPricingRows(
+  catalog: CodexModelCatalog,
+  drafts: TokenPricingDraft[]
+): TokenPricingDraft[] {
+  const rates = new Map(drafts.map((row) => [row.model, row]));
+  return catalog.models
+    .filter((model) => !model.hidden)
+    .map(({ id }) => rates.get(id) ?? { model: id, ...getOfficialTokenPricing(id) });
+}
+
+export function hasCompleteTokenPricing(
+  row: TokenPricingDraft
+): row is TokenPricingDraft & TokenPricingRate {
+  return (
+    Boolean(row.source && row.updatedAt) &&
+    [row.inputUsdPerMillion, row.cachedInputUsdPerMillion, row.outputUsdPerMillion].every(
+      (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0
+    )
+  );
+}
 
 export function getEffectiveTokenPricing(
   modelId: string,
@@ -52,7 +79,9 @@ export function estimateEntriesCostCny(
   preferences?: TokenPricingPreferences
 ): number {
   const cnyPerUsd = Math.max(0, preferences?.cnyPerUsd ?? DEFAULT_CNY_PER_USD);
-  return entries.reduce((sum, entry) => sum + estimateEntryCostUsd(entry, preferences), 0) * cnyPerUsd;
+  return (
+    entries.reduce((sum, entry) => sum + estimateEntryCostUsd(entry, preferences), 0) * cnyPerUsd
+  );
 }
 
 export function formatEstimatedCny(value: number, locale: string): string {

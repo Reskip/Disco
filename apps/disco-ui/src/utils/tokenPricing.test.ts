@@ -1,10 +1,16 @@
-import type { LeaderboardEntry, TokenPricingPreferences } from '@disco-live/client';
+import type {
+  CodexModelCatalog,
+  LeaderboardEntry,
+  TokenPricingPreferences,
+} from '@disco-live/client';
 import { describe, expect, it } from 'vitest';
 import {
   estimateEntriesCostCny,
   estimateEntryCostUsd,
   formatEstimatedCny,
+  getCatalogTokenPricingRows,
   getEffectiveTokenPricing,
+  hasCompleteTokenPricing,
 } from './tokenPricing';
 
 const entry = (overrides: Partial<LeaderboardEntry> = {}): LeaderboardEntry => ({
@@ -22,6 +28,52 @@ const entry = (overrides: Partial<LeaderboardEntry> = {}): LeaderboardEntry => (
 });
 
 describe('token pricing', () => {
+  it('uses current catalog order, omits hidden models, and leaves unknown prices unset', () => {
+    const catalog: CodexModelCatalog = {
+      source: 'dynamic',
+      default: 'gpt-6-sol',
+      models: ['gpt-6-sol', 'gpt-5.6-sol', 'hidden-model'].map((id) => ({
+        id,
+        displayName: id,
+        hidden: id === 'hidden-model',
+        isDefault: id === 'gpt-6-sol',
+      })),
+    };
+    const manual = {
+      model: 'gpt-5.6-sol',
+      inputUsdPerMillion: 2,
+      cachedInputUsdPerMillion: 0.2,
+      outputUsdPerMillion: 5,
+      source: 'manual' as const,
+      updatedAt: '2026-10-09T00:00:00Z',
+    };
+    const rows = getCatalogTokenPricingRows(catalog, [manual, { model: 'retired-model' }]);
+    expect(rows).toEqual([{ model: 'gpt-6-sol' }, manual]);
+    expect(hasCompleteTokenPricing(rows[0]!)).toBe(false);
+    expect(hasCompleteTokenPricing(rows[1]!)).toBe(true);
+  });
+
+  it('distinguishes incomplete pricing from a deliberately entered zero rate', () => {
+    const draft = { model: 'new-model', source: 'manual' as const, updatedAt: '2026-10-09' };
+    expect(hasCompleteTokenPricing({ ...draft, inputUsdPerMillion: 0 })).toBe(false);
+    expect(
+      hasCompleteTokenPricing({
+        ...draft,
+        inputUsdPerMillion: 0,
+        cachedInputUsdPerMillion: 0,
+        outputUsdPerMillion: 0,
+      })
+    ).toBe(true);
+    expect(
+      hasCompleteTokenPricing({
+        ...draft,
+        inputUsdPerMillion: Number.NaN,
+        cachedInputUsdPerMillion: 0,
+        outputUsdPerMillion: 1,
+      })
+    ).toBe(false);
+  });
+
   it('prices cached input separately using the official model table', () => {
     expect(estimateEntryCostUsd(entry())).toBeCloseTo(0.0456, 8);
   });

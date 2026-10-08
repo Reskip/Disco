@@ -22,7 +22,6 @@ import type {
   CreateUserInput,
   DiscoClient,
   EffortLevel,
-  TokenPricingRate,
   UpdateUserInput,
   User,
   UserRole,
@@ -66,6 +65,11 @@ import {
 } from '../../utils/displayScale';
 import { getDiscoPortalContainer } from '../../utils/portalContainer';
 import { getPreferredReasoningEffort } from '../../utils/reasoningEffort';
+import {
+  getCatalogTokenPricingRows,
+  hasCompleteTokenPricing,
+  type TokenPricingDraft,
+} from '../../utils/tokenPricing';
 import { EffortSelector } from '../EffortSelector';
 import { type ModelConfig, ModelSelector } from '../ModelSelector';
 import { UserIdentityAvatar } from '../UserIdentityAvatar';
@@ -97,10 +101,6 @@ interface NewUserValues {
   username: string;
   password: string;
   role: UserRole;
-}
-
-interface PricingRow extends TokenPricingRate {
-  model: string;
 }
 
 export interface WorkspaceSettingsModalProps {
@@ -168,7 +168,7 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
   const [passwordEditing, setPasswordEditing] = useState(false);
   const [savingModels, setSavingModels] = useState(false);
   const [savingPricing, setSavingPricing] = useState(false);
-  const [pricingRows, setPricingRows] = useState<PricingRow[]>([]);
+  const [pricingRows, setPricingRows] = useState<TokenPricingDraft[]>([]);
   const [cnyPerUsd, setCnyPerUsd] = useState(DEFAULT_CNY_PER_USD);
   const [pricingAutoUpdate, setPricingAutoUpdate] = useState(true);
   const [passwordChanged, setPasswordChanged] = useState(false);
@@ -210,6 +210,14 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
   const effortLevels = AGENTIC_TOOL_CAPABILITIES.codex.reasoningEffortLevels ?? [];
   const preferredEffort = getPreferredReasoningEffort(effortLevels) ?? 'xhigh';
   const codex = useCodexModels(client, open);
+  const pricingCatalogPending = Boolean(client && !codex.resolved);
+  const visiblePricingRows = useMemo(
+    () => (pricingCatalogPending ? [] : getCatalogTokenPricingRows(codex.catalog, pricingRows)),
+    [codex.catalog, pricingCatalogPending, pricingRows]
+  );
+  const pricingIncomplete = pricingRows.some(
+    (row) => row.source === 'manual' && !hasCompleteTokenPricing(row)
+  );
   const watchedModel = Form.useWatch('modelConfig', modelForm);
   const watchedEffort = Form.useWatch('effort', modelForm);
   const watchedAvatarUrl = Form.useWatch('avatar_url', profileForm);
@@ -435,27 +443,31 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
     field: 'inputUsdPerMillion' | 'cachedInputUsdPerMillion' | 'outputUsdPerMillion',
     value: number | null
   ) => {
-    setPricingRows((rows) =>
-      rows.map((row) =>
-        row.model === model
-          ? {
-              ...row,
-              [field]: Math.max(0, value ?? 0),
-              source: 'manual',
-              updatedAt: new Date().toISOString(),
-            }
-          : row
-      )
-    );
+    setPricingRows((rows) => {
+      const current = rows.find((row) => row.model === model) ??
+        visiblePricingRows.find((row) => row.model === model) ?? { model };
+      const updated: TokenPricingDraft = {
+        ...current,
+        [field]: value === null ? undefined : Math.max(0, value),
+        source: 'manual',
+        updatedAt: new Date().toISOString(),
+      };
+      return [...rows.filter((row) => row.model !== model), updated];
+    });
   };
 
   const savePricing = async () => {
-    if (!currentUser || !onUpdateUser) return;
-    const overrides = Object.fromEntries(
-      pricingRows
-        .filter((row) => row.source !== 'official' || !(row.model in OFFICIAL_TOKEN_PRICING))
-        .map(({ model, ...rate }) => [model, rate])
-    );
+    if (!currentUser || !onUpdateUser || pricingIncomplete) return;
+    const overrides = {
+      // A removed or hidden model still needs its rate for historical estimates.
+      ...(currentUser.preferences?.tokenPricing?.models ?? {}),
+      ...Object.fromEntries(
+        pricingRows
+          .filter(hasCompleteTokenPricing)
+          .filter((row) => row.source !== 'official' || !(row.model in OFFICIAL_TOKEN_PRICING))
+          .map(({ model, ...rate }) => [model, rate])
+      ),
+    };
     setSavingPricing(true);
     try {
       await Promise.resolve(
@@ -915,7 +927,7 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
       </Typography.Title>
       <Typography.Paragraph type="secondary" style={{ maxWidth: 680 }}>
         用于首页人民币费用估算。默认采用 OpenAI 官方 API 标价；Cache 输入与普通输入分别计价。
-        未识别的新模型可由轻量模型异步补全，也可以直接修改表格。
+        模型与当前可用列表同步。没有报价的模型显示待补全，使用后可自动补全，也可以手动填写。
       </Typography.Paragraph>
       <div
         className="disco-token-pricing-toolbar"
@@ -936,6 +948,7 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
           <Space size={8}>
             <Typography.Text>美元兑人民币</Typography.Text>
             <InputNumber
+              aria-label="美元兑人民币"
               min={0}
               step={0.01}
               precision={4}
@@ -953,13 +966,15 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
           查看官方报价
         </Typography.Link>
       </div>
-      <Table<PricingRow>
+      <Table<TokenPricingDraft>
         className="disco-token-pricing-table"
         rowKey="model"
         size="small"
         pagination={false}
         tableLayout="fixed"
-        dataSource={pricingRows}
+        loading={pricingCatalogPending}
+        dataSource={visiblePricingRows}
+        locale={{ emptyText: pricingCatalogPending ? '正在加载模型列表…' : '暂无可用模型' }}
         columns={[
           {
             title: '模型',
@@ -982,12 +997,14 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
             title: `${title} USD/1M`,
             dataIndex: field,
             width: '19%',
-            render: (value: number, row: PricingRow) => (
+            render: (value: number | undefined, row: TokenPricingDraft) => (
               <InputNumber
+                aria-label={`${row.model} ${title} USD/1M`}
                 min={0}
                 step={0.01}
                 precision={4}
                 value={value}
+                placeholder="未配置"
                 onChange={(next) => updatePricingRow(row.model, field, next)}
                 style={{ width: '100%' }}
               />
@@ -997,11 +1014,16 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
             title: '来源',
             dataIndex: 'source',
             width: '17%',
-            render: (source: PricingRow['source']) => (
-              <Tag color={source === 'manual' ? 'blue' : source === 'automatic' ? 'cyan' : 'green'}>
-                {source === 'manual' ? '手动' : source === 'automatic' ? '自动' : '官方'}
-              </Tag>
-            ),
+            render: (source: TokenPricingDraft['source']) =>
+              source ? (
+                <Tag
+                  color={source === 'manual' ? 'blue' : source === 'automatic' ? 'cyan' : 'green'}
+                >
+                  {source === 'manual' ? '手动' : source === 'automatic' ? '自动' : '官方'}
+                </Tag>
+              ) : (
+                <Tag>待补全</Tag>
+              ),
           },
         ]}
       />
@@ -1010,6 +1032,7 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
           type="primary"
           className="disco-settings-save-button"
           loading={savingPricing}
+          disabled={pricingCatalogPending || pricingIncomplete}
           onClick={() => void savePricing()}
         >
           保存报价
@@ -1018,6 +1041,11 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
           费用仅作 API 等价估算，不代表订阅额度扣费。
         </Typography.Text>
       </Space>
+      {pricingIncomplete && (
+        <Typography.Paragraph type="warning" style={{ marginTop: token.marginSM }}>
+          请填全已编辑模型的输入、Cache 和输出报价；未配置不代表免费。
+        </Typography.Paragraph>
+      )}
     </div>
   );
 

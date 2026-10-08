@@ -6,6 +6,22 @@
 
 /* Global styles for Disco UI */
 
+/* Tapping a control must not magnify the app. Keep native scrolling and
+   component touch gestures, but prevent double-tap zoom on controls. */
+#root :is(button, input, textarea, select, a, [role="button"], [role="combobox"], [contenteditable="true"]) {
+  touch-action: manipulation;
+}
+
+@media (max-width: 600px), (pointer: coarse) {
+  /* iOS may zoom even a readonly Select input on focus. Cover every input,
+     including portalled forms, and keep its rendered type at least 16px when
+     the user chooses a smaller Disco display scale. Control heights and
+     Select labels retain their existing layout. */
+  #root :is(input, textarea, select, [contenteditable="true"]) {
+    font-size: max(16px, calc(16px / var(--disco-display-scale, 1))) !important;
+  }
+}
+
 /* The approved quota strip reflows into two compact rows on narrow screens. */
 .disco-home-quota-row {
   display: grid;

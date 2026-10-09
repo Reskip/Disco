@@ -1,5 +1,6 @@
-import type { DiscoClient, User } from '@disco-live/client';
+import type { DiscoClient, UpdateUserInput, User } from '@disco-live/client';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { useState } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { StorageSettingsPanel } from './StorageSettingsPanel';
 
@@ -13,8 +14,21 @@ describe('storage retention settings', () => {
     const client = {
       service: () => ({ get: vi.fn(async () => latest) }),
     } as unknown as DiscoClient;
-    const onUpdateUser = vi.fn(async () => {});
-    render(<StorageSettingsPanel currentUser={user} client={client} onUpdateUser={onUpdateUser} />);
+    const onUpdateUser = vi.fn(async (_id: string, _updates: UpdateUserInput) => {});
+    function RealtimeAccount() {
+      const [current, setCurrent] = useState(user);
+      return (
+        <StorageSettingsPanel
+          currentUser={current}
+          client={client}
+          onUpdateUser={async (id, updates: UpdateUserInput) => {
+            await onUpdateUser(id, updates);
+            setCurrent({ ...current, ...updates } as User);
+          }}
+        />
+      );
+    }
+    render(<RealtimeAccount />);
     expect(screen.getByText('7 天')).toBeInTheDocument();
     fireEvent.mouseDown(screen.getByRole('combobox', { name: '临时文件与缓存保留时间' }));
     fireEvent.click(await screen.findByText('30 天'));

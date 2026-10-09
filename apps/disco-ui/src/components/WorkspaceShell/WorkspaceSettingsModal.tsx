@@ -1238,6 +1238,7 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
               children: (
                 <div style={SETTINGS_SECTION_STYLE}>
                   <StorageSettingsPanel
+                    key={currentUser?.user_id}
                     currentUser={currentUser}
                     client={client}
                     onUpdateUser={onUpdateUser}

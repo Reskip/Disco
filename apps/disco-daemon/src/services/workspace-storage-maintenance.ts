@@ -40,7 +40,7 @@ export class WorkspaceStorageMaintenance {
 
   private schedule(delay: number): void {
     this.timer = setTimeout(() => {
-      this.running = this.runOnce()
+      this.running = this.runOnce(false, () => !this.stopped)
         .catch((error: unknown) =>
           console.warn('[storage] Temporary-file cleanup failed; will retry', error)
         )
@@ -58,7 +58,7 @@ export class WorkspaceStorageMaintenance {
     await this.running;
   }
 
-  async runOnce(dryRun = false): Promise<void> {
+  async runOnce(dryRun = false, shouldContinue: () => boolean = () => true): Promise<void> {
     const tenancy = resolveMultiTenancyConfig(this.config);
     // Auth-resolved or remotely mounted execution requires host-owned scoped
     // maintenance. This worker only knows its standalone local account tree.
@@ -69,7 +69,7 @@ export class WorkspaceStorageMaintenance {
     )) as Array<{ id: UserID; data: { preferences?: UserPreferences } }>;
     const worktreesRoot = resolve(getWorktreesRoot(tenantId));
     for (const owner of owners) {
-      if (this.stopped && !dryRun) break;
+      if (!shouldContinue()) break;
       const retentionDays = resolveIntermediateRetentionDays(
         owner.data?.preferences as UserPreferences | undefined
       );
@@ -78,7 +78,7 @@ export class WorkspaceStorageMaintenance {
       // Enforce exactly one known account below the configured storage root.
       if (resolve(join(userRoot, '..')) !== worktreesRoot) continue;
       const isIdle = async () => {
-        if (this.stopped && !dryRun) return false;
+        if (!shouldContinue()) return false;
         const active = (await runWithTenantDatabaseScope(this.db, tenantId, (db) =>
           select(db, { id: tasks.task_id })
             .from(tasks)

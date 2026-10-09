@@ -16,10 +16,10 @@ export function StorageSettingsPanel({
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string>();
+  const storedDays = resolveIntermediateRetentionDays(currentUser?.preferences);
   useEffect(() => {
-    setDays(resolveIntermediateRetentionDays(currentUser?.preferences));
-    setSaved(false);
-  }, [currentUser]);
+    setDays(storedDays);
+  }, [storedDays]);
 
   const save = async () => {
     if (!currentUser || !onUpdateUser) return;

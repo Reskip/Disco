@@ -236,6 +236,7 @@ export async function publishGeneratedArtifacts(input: {
   daemonUrl: string;
   sessionToken: string | undefined;
   filePaths: ReadonlyArray<string>;
+  purpose?: 'tool-preview';
   fetchImpl?: FetchLike;
 }): Promise<ArtifactPublicationToolUse[]> {
   const uniqueFiles = [
@@ -265,7 +266,10 @@ export async function publishGeneratedArtifacts(input: {
           method: 'tools/call',
           params: {
             name: DISCO_MCP_METHOD_NAMES.filesPublish,
-            arguments: { files: files.map((filePath) => ({ path: filePath })) },
+            arguments: {
+              files: files.map((filePath) => ({ path: filePath })),
+              ...(input.purpose ? { purpose: input.purpose } : {}),
+            },
           },
         }),
       });

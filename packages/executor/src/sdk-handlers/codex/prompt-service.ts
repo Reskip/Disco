@@ -221,9 +221,11 @@ export function buildDiscoManagedLifecycleInstruction(
 
 ${options.agentSession ? `使用 Disco 托管记忆方法；不要通过 Shell 直接修改长期记忆文件。\n\n${buildAgentLearningInstruction()}` : '独立会话不保存人格或长期记忆。'}
 
-向用户交付本地文件时，使用 Disco 托管文件发布方法。只有该操作成功返回的文件才算已交付；仅在回复中写文件名或路径不算发送。
+交付文件须调用 Disco 托管文件发布方法并成功返回；只写文件名或路径不算交付。
 
-需要补充信息或选择时，用 ${DISCO_MCP_METHOD_NAMES.askQuestions} 显示提问卡片，不用原生 request_user_input / AskUserQuestion。返回等待状态不代表作答或批准；继续独立工作，依赖答案时结束本轮，用户提交后自动继续。勿重复列题，凭据用环境变量表单。
+临时预览和缓存放 .disco/tmp/ 按设置清理；上传、源文件及成果另存。
+
+提问用 ${DISCO_MCP_METHOD_NAMES.askQuestions} 显示卡片，勿用 request_user_input / AskUserQuestion。等待状态不代表作答或批准；继续独立工作，依赖答案时结束本轮，用户提交后自动继续。勿重复列题，凭据用环境变量表单。
 
 Windows PowerShell 读写文本时显式指定 UTF-8。
 
@@ -2045,6 +2047,7 @@ export class CodexPromptService {
               daemonUrl: await publicationDaemonUrl(),
               sessionToken: mcpToken,
               filePaths: [filePath],
+              purpose: 'tool-preview',
             });
             const attachment = extractExplicitlyPublishedAttachments(publicationToolUses).find(
               (candidate) => candidate.mimeType.toLowerCase().startsWith('image/')

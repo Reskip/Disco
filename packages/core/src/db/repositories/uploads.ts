@@ -5,6 +5,7 @@ import type {
   Upload,
   UploadMetadata,
   UploadOwner,
+  UploadProvenance,
   UploadRef,
   UserID,
 } from '@disco/core/types';
@@ -27,9 +28,8 @@ function logical(row: UploadRow, tenantId: TenantID): Upload {
     size: row.size_bytes,
     checksum: row.checksum,
     status: row.status,
-    // Historical gateway upload values are deliberately collapsed at the
-    // repository boundary. Disco exposes browser uploads only.
-    provenance: 'browser',
+    // Legacy gateway values retain the ordinary durable-upload contract.
+    provenance: row.provenance === 'tool-preview' ? 'tool-preview' : 'browser',
     createdAt: new Date(row.created_at).toISOString(),
     expiresAt: row.expires_at ? new Date(row.expires_at).toISOString() : null,
   };
@@ -83,7 +83,8 @@ export class UploadRepository {
   async findActiveByChecksum(
     tenantId: TenantID,
     owner: Pick<UploadOwner, 'createdBy' | 'sessionId' | 'agentId'>,
-    checksum: string
+    checksum: string,
+    provenance: UploadProvenance = 'browser'
   ): Promise<Upload | null> {
     const row = await select(this.db)
       .from(uploads)
@@ -93,7 +94,12 @@ export class UploadRepository {
           eq(uploads.session_id, owner.sessionId),
           owner.agentId ? eq(uploads.agent_id, owner.agentId) : isNull(uploads.agent_id),
           eq(uploads.checksum, checksum),
-          eq(uploads.status, 'active')
+          eq(uploads.status, 'active'),
+          isNull(uploads.expires_at),
+          // A permanent thumbnail must never stand in for a delivered original.
+          provenance === 'tool-preview'
+            ? eq(uploads.provenance, 'tool-preview')
+            : eq(uploads.provenance, 'browser')
         )
       )
       .one();

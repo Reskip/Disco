@@ -382,15 +382,36 @@ export interface OnboardingState {
   teammateEmoji?: string;
 }
 
-/**
- * User preferences structure
- */
+export const DEFAULT_INTERMEDIATE_RETENTION_DAYS = 7;
+export const MAX_INTERMEDIATE_RETENTION_DAYS = 3650;
+
+export interface StoragePreferences {
+  /** Applies only to unexposed temporary workspace files and regenerable caches. 0 disables cleanup. */
+  intermediateRetentionDays?: number;
+}
+
+export function isValidIntermediateRetentionDays(value: unknown): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isSafeInteger(value) &&
+    value >= 0 &&
+    value <= MAX_INTERMEDIATE_RETENTION_DAYS
+  );
+}
+
+export function resolveIntermediateRetentionDays(preferences?: UserPreferences): number {
+  const value = preferences?.storage?.intermediateRetentionDays;
+  return isValidIntermediateRetentionDays(value) ? value : DEFAULT_INTERMEDIATE_RETENTION_DAYS;
+}
+
+/** User preferences structure. */
 export interface UserPreferences {
   audio?: AudioPreferences;
   eventStream?: EventStreamPreferences;
   onboarding?: OnboardingState;
   /** Per-user token-price overrides used by the private usage dashboard. */
   tokenPricing?: TokenPricingPreferences;
+  storage?: StoragePreferences;
   // Future preferences can be added here
   [key: string]: unknown;
 }

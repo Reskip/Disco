@@ -30,6 +30,7 @@ import { containAllTrackedExecutors } from './executor-tracking.js';
 import { SchedulerService } from './services/scheduler.js';
 import { SessionQueueWorker } from './services/session-queue-worker.js';
 import { TaskRuntimeReconciler } from './services/task-runtime-reconciler.js';
+import { WorkspaceStorageMaintenance } from './services/workspace-storage-maintenance.js';
 import { appendSystemMessage } from './utils/append-system-message.js';
 
 const DEBUG_STARTUP =
@@ -644,6 +645,12 @@ export async function startup(ctx: StartupContext): Promise<void> {
   app.set('scheduler', schedulerService);
   schedulerService.start();
 
+  const storageMaintenance =
+    ctx.taskRuntimePolicy === 'standalone'
+      ? new WorkspaceStorageMaintenance(db, config)
+      : undefined;
+  storageMaintenance?.start();
+
   // 8. Graceful shutdown handler
   const shutdown = async (signal: string) => {
     console.log(`\n⏳ Received ${signal}, shutting down gracefully...`);
@@ -665,6 +672,7 @@ export async function startup(ctx: StartupContext): Promise<void> {
       // Stop durable Session queue discovery. Any in-flight database claim is
       // still safe; stop only prevents the next local scan.
       sessionQueueWorker?.stop();
+      await storageMaintenance?.stop();
 
       if (shouldContainLocalExecutorsOnShutdown(ctx.taskRuntimePolicy)) {
         // Preserve the historical standalone shutdown contract.

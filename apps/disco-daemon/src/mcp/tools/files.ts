@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { realpath, stat } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { Readable } from 'node:stream';
 import {
   classifyPublishedFileDisplayType,
   inferPublishedFileMimeType,
@@ -20,11 +21,13 @@ import type {
 import type { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import { getUploadStagingStore } from '../../utils/upload-staging.js';
+import { UploadThumbnailCache } from '../../utils/upload-thumbnail.js';
 import type { McpContext } from '../server.js';
 import { textResult } from '../server.js';
 import { runWithMcpTenantDatabaseScope } from '../tenant-scope.js';
 
 const publicationInFlight = new Map<string, Promise<UploadPromptAttachment>>();
+const previewThumbnails = new UploadThumbnailCache();
 
 async function sha256(filePath: string): Promise<string> {
   const hash = createHash('sha256');
@@ -104,9 +107,15 @@ export function registerFileTools(
           )
           .min(1)
           .max(20),
+        purpose: z
+          .literal('tool-preview')
+          .optional()
+          .describe(
+            'For host image inspection only: retain a small permanent preview. Omit when delivering the original file.'
+          ),
       }),
     },
-    async args => {
+    async (args) => {
       const session = ctx.authenticatedSession;
       const tenantId = ctx.baseServiceParams.tenant?.tenant_id;
       if (!session || !ctx.sessionId || !tenantId) {
@@ -127,6 +136,7 @@ export function registerFileTools(
           runWithMcpTenantDatabaseScope(ctx, () => work()));
 
       const published: UploadPromptAttachment[] = [];
+      const provenance = args.purpose === 'tool-preview' ? 'tool-preview' : 'browser';
       for (const requested of args.files) {
         const { absolutePath } = await resolveFileForPublication({
           workingDirectory: session.working_directory,
@@ -134,26 +144,46 @@ export function registerFileTools(
         });
         const fileStat = await stat(absolutePath);
         const checksum = await sha256(absolutePath);
-        const lockKey = `${tenantId}:${sessionId}:${checksum}`;
+        const lockKey = `${tenantId}:${owner.createdBy}:${sessionId}:${provenance}:${checksum}`;
         let pending = publicationInFlight.get(lockKey);
         if (!pending) {
           pending = (async () => {
+            const name = absolutePath.split(/[\\/]/).at(-1) ?? 'file';
+            // The original stays in the workspace. Never copy full-resolution
+            // inspection images into durable attachment storage a second time.
+            const preview =
+              provenance === 'tool-preview'
+                ? await previewThumbnails.get(lockKey, async () => createReadStream(absolutePath))
+                : undefined;
+            const publishedChecksum = preview
+              ? createHash('sha256').update(preview).digest('hex')
+              : checksum;
             const existing = dependencies.repository
               ? await withinTenant(tenantId, () =>
-                  dependencies.repository!.findActiveByChecksum(tenantId, owner, checksum)
+                  dependencies.repository!.findActiveByChecksum(
+                    tenantId,
+                    owner,
+                    publishedChecksum,
+                    provenance
+                  )
                 )
-              : await runWithMcpTenantDatabaseScope(ctx, db =>
-                  new UploadRepository(db).findActiveByChecksum(tenantId, owner, checksum)
+              : await runWithMcpTenantDatabaseScope(ctx, (db) =>
+                  new UploadRepository(db).findActiveByChecksum(
+                    tenantId,
+                    owner,
+                    publishedChecksum,
+                    provenance
+                  )
                 );
             if (existing) return asAttachment(existing);
             const metadata = await store.stage({
               owner,
-              name: absolutePath.split(/[\\/]/).at(-1) ?? 'file',
-              mimeType: inferPublishedFileMimeType(absolutePath),
-              provenance: 'browser',
-              body: createReadStream(absolutePath),
-              sizeHint: fileStat.size,
-              checksum,
+              name: preview ? `${name}.preview.webp` : name,
+              mimeType: preview ? 'image/webp' : inferPublishedFileMimeType(absolutePath),
+              provenance,
+              body: preview ? Readable.from(preview) : createReadStream(absolutePath),
+              sizeHint: preview?.length ?? fileStat.size,
+              checksum: publishedChecksum,
               ttlMs: 0,
             });
             return {
@@ -173,7 +203,7 @@ export function registerFileTools(
         published: true,
         sessionId,
         userId: ctx.userId,
-        files: published.map(file => ({
+        files: published.map((file) => ({
           ...file,
           fileId: file.ref,
           sessionId,
@@ -188,7 +218,10 @@ export function registerFileTools(
       };
       const result = {
         ...publication,
-        instruction: '这些文件已经交付；在最终回复中简要说明即可，不要声称未发布的文件已经发送。',
+        instruction:
+          provenance === 'tool-preview'
+            ? '这是长期保留的检查预览；原文件尚未交付，交付原文件时省略 purpose 参数。'
+            : '这些文件已经交付；在最终回复中简要说明即可，不要声称未发布的文件已经发送。',
       };
       return {
         ...textResult(result),

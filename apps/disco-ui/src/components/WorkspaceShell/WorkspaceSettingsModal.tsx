@@ -78,6 +78,7 @@ import { RuntimeCapabilitiesPanel } from './RuntimeCapabilitiesPanel';
 import { SchedulesManagementPanel } from './SchedulesManagementPanel';
 import { SharedCodexSettings } from './SharedCodexSettings';
 import { SkillsManagementPanel } from './SkillsManagementPanel';
+import { StorageSettingsPanel } from './StorageSettingsPanel';
 
 interface ProfileValues {
   name?: string;
@@ -1129,6 +1130,7 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
     { value: 'profile', label: '个人资料' },
     { value: 'models', label: '模型与思考' },
     { value: 'appearance', label: '界面' },
+    { value: 'storage', label: '存储' },
     { value: 'security', label: '账号与安全' },
     { value: 'skills', label: '技能管理' },
     { value: 'archives', label: '已归档会话' },
@@ -1225,6 +1227,23 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
                 </span>
               ),
               children: securityPanel,
+            },
+            {
+              key: 'storage',
+              label: (
+                <span>
+                  <InboxOutlined /> 存储
+                </span>
+              ),
+              children: (
+                <div style={SETTINGS_SECTION_STYLE}>
+                  <StorageSettingsPanel
+                    currentUser={currentUser}
+                    client={client}
+                    onUpdateUser={onUpdateUser}
+                  />
+                </div>
+              ),
             },
             {
               key: 'skills',

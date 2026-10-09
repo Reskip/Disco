@@ -4,7 +4,7 @@ import type { TenantID } from './tenant';
 /** Opaque identifier for bytes held at the ingress (boundary B) staging layer. */
 export type UploadRef = string & { readonly __brand: 'UploadRef' };
 
-export type UploadProvenance = 'browser';
+export type UploadProvenance = 'browser' | 'tool-preview';
 export type UploadStatus = 'pending' | 'active' | 'deleting';
 
 export interface UploadOwner {
@@ -79,6 +79,7 @@ export function sanitizeUploadFilename(value: string): string {
     ...basename
       .normalize('NFC')
       .replace(/\.\./g, '_')
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: Upload names must strip C0 and C1 controls.
       .replace(/[\u0000-\u001f\u007f-\u009f<>:"/\\|?*]/gu, '_')
       .replace(/[. ]+$/g, ''),
   ]

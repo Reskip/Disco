@@ -5,6 +5,30 @@ import {
 } from './generated-artifact-publication.js';
 
 describe('generated artifact publication bridge', () => {
+  it('requests the permanent thumbnail path explicitly for image inspection only', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          result: {
+            structuredContent: { type: 'disco_file_publication', published: true, files: [] },
+          },
+        }),
+        { headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    await publishGeneratedArtifacts({
+      daemonUrl: 'http://localhost',
+      sessionToken: 'owned-token',
+      filePaths: ['preview.png'],
+      purpose: 'tool-preview',
+      fetchImpl,
+    });
+    const request = JSON.parse(String(fetchImpl.mock.calls[0]![1]!.body));
+    expect(request.params.arguments).toEqual({
+      files: [{ path: 'preview.png' }],
+      purpose: 'tool-preview',
+    });
+  });
   it('collects only host-declared generated artifacts across supported output kinds', () => {
     const declaration = JSON.stringify({
       type: 'disco_generated_artifacts',

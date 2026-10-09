@@ -1288,7 +1288,7 @@ export const uploads = pgTable(
       .notNull()
       .default('active'),
     provenance: text('provenance', {
-      enum: ['browser', 'gateway-slack', 'mcp-slack'],
+      enum: ['browser', 'tool-preview', 'gateway-slack', 'mcp-slack'],
     }).notNull(),
     created_at: t.timestamp('created_at').notNull(),
     expires_at: t.timestamp('expires_at'),

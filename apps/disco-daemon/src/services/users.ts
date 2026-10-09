@@ -10,8 +10,8 @@ import {
   normalizeAgenticToolModelConfiguration,
 } from '@disco/agentic-tools/config';
 import {
-  assertInlineAgenticConfigurationAllowed,
   assertEnvVarScope,
+  assertInlineAgenticConfigurationAllowed,
   getEnvVarBlockReason,
   isEnvVarAllowed,
   normalizeStoredEnvMap,
@@ -58,6 +58,7 @@ import {
   extractAgenticToolsPublicValues,
   hasMinimumRole,
   isValidExecutionHomeKey,
+  isValidIntermediateRetentionDays,
   normalizeRole,
   ROLES,
   toAgenticToolsStatus,
@@ -80,9 +81,7 @@ function queryString(value: unknown): string | undefined {
 function normalizeLoginIdentifier(value: string): string {
   const normalized = value.trim().toLowerCase();
   if (!/^[\p{L}\p{N}][\p{L}\p{N}\p{M}._-]{1,63}$/u.test(normalized)) {
-    throw new BadRequest(
-      'Username must be 2-64 letters, numbers, dots, underscores, or hyphens.'
-    );
+    throw new BadRequest('Username must be 2-64 letters, numbers, dots, underscores, or hyphens.');
   }
   return normalized;
 }
@@ -457,6 +456,16 @@ export class UsersService {
    */
   async patch(id: UserID, data: UpdateUserData, params?: Params): Promise<User> {
     assertValidExecutionHomeKeyWrite(data.unix_username);
+    if (data.preferences && Object.hasOwn(data.preferences, 'storage')) {
+      const storage = data.preferences.storage;
+      if (!storage || typeof storage !== 'object' || Array.isArray(storage)) {
+        throw new BadRequest('存储设置格式无效');
+      }
+      const days = (storage as Record<string, unknown>).intermediateRetentionDays;
+      if (days !== undefined && !isValidIntermediateRetentionDays(days)) {
+        throw new BadRequest('临时文件保留天数须为 0 至 3650 的整数，0 表示不自动清理');
+      }
+    }
     const now = new Date();
     const updates: Record<string, unknown> = { updated_at: now };
 
@@ -574,9 +583,7 @@ export class UsersService {
                       model: modelConfig.model,
                       ...(modelConfig.provider ? { provider: modelConfig.provider } : {}),
                       ...(modelConfig.effort ? { effort: modelConfig.effort } : {}),
-                      ...(modelConfig.serviceTier
-                        ? { serviceTier: modelConfig.serviceTier }
-                        : {}),
+                      ...(modelConfig.serviceTier ? { serviceTier: modelConfig.serviceTier } : {}),
                       ...(modelConfig.advisorModel
                         ? { advisorModel: modelConfig.advisorModel }
                         : {}),

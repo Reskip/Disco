@@ -1,13 +1,16 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createHash, randomBytes } from 'node:crypto';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { UploadRef } from '@disco/core/types';
+import type { UploadOwner, UploadRef } from '@disco/core/types';
 import type { McpServer } from '@modelcontextprotocol/server';
+import sharp from 'sharp';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { LocalUploadStagingStore } from '../../host/local/upload-staging-store.js';
 import type { McpContext } from '../server.js';
 import { registerFileTools } from './files.js';
 
-type ToolHandler = (args: { files: Array<{ path: string }> }) => Promise<{
+type ToolHandler = (args: { files: Array<{ path: string }>; purpose?: 'tool-preview' }) => Promise<{
   content: Array<{ type: string; text: string }>;
 }>;
 
@@ -60,6 +63,58 @@ async function fixture() {
 }
 
 describe('Disco explicit file publication', () => {
+  it('stores a small permanent inspection preview and keeps a separate full original delivery', async () => {
+    const f = await fixture();
+    const image = await sharp(randomBytes(1200 * 900 * 3), {
+      raw: { width: 1200, height: 900, channels: 3 },
+    })
+      .png()
+      .toBuffer();
+    const source = join(f.sessionPath, '测试.png');
+    await writeFile(source, image);
+    const owner = {
+      tenantId: 'tenant-one',
+      createdBy: 'user-one',
+      sessionId: 'session-one',
+      agentId: null,
+    } as UploadOwner;
+    const store = new LocalUploadStagingStore(() => join(f.root, 'uploads'), { ttlMs: 1 });
+    const handler = captureHandler(f.ctx, {
+      store,
+      repository: { findActiveByChecksum: vi.fn(async () => null) },
+      withinTenant: async (_tenant, work) => work(),
+    });
+    const preview = JSON.parse(
+      (await handler({ files: [{ path: source }], purpose: 'tool-preview' })).content[0]!.text
+    ).files[0];
+    const original = JSON.parse((await handler({ files: [{ path: source }] })).content[0]!.text)
+      .files[0];
+    expect(preview.ref).not.toBe(original.ref);
+    const previewMetadata = await store.inspect({ ...owner, ref: preview.ref });
+    expect(previewMetadata).toMatchObject({
+      mimeType: 'image/webp',
+      provenance: 'tool-preview',
+      expiresAt: null,
+    });
+    const chunks: Buffer[] = [];
+    for await (const chunk of await store.read({ ...owner, ref: preview.ref }))
+      chunks.push(Buffer.from(chunk));
+    const bytes = Buffer.concat(chunks);
+    const dimensions = await sharp(bytes).metadata();
+    expect(Math.max(dimensions.width!, dimensions.height!)).toBeLessThanOrEqual(640);
+    expect(bytes.length).toBeLessThan(image.length / 4);
+    expect(previewMetadata.checksum).toBe(createHash('sha256').update(bytes).digest('hex'));
+    expect(await store.inspect({ ...owner, ref: original.ref })).toMatchObject({
+      size: image.length,
+      mimeType: 'image/png',
+      provenance: 'browser',
+      expiresAt: null,
+    });
+    expect(await readFile(source)).toEqual(image);
+    expect(await store.cleanupExpired({ tenantId: owner.tenantId }, new Date('2100-01-01'))).toBe(
+      0
+    );
+  });
   it('publishes a real session-relative file and preserves a Chinese filename', async () => {
     const f = await fixture();
     await writeFile(join(f.sessionPath, '报告.txt'), 'hello');

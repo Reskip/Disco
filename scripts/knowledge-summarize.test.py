@@ -96,7 +96,7 @@ class SummaryProviderTests(unittest.TestCase):
                     return '{"abstract":"late","overview":"late completion"}'
                 def close(self): pass
             with patch.dict("sys.modules", {"openviking_cli.utils.config.vlm_config": SimpleNamespace(VLMConfig=FakeVLM)}):
-                with self.assertRaisesRegex(RuntimeError, "SUMMARY_CANCELLED"):
+                with self.assertRaisesRegex(module.SummaryFailure, "CANCELLED"):
                     module.summarize("synthetic", {"vlm": {"provider": "openai-codex"}}, cache_dir=cache, tombstone=tombstone)
                 self.assertFalse(cache.exists())
 
@@ -109,6 +109,92 @@ class SummaryProviderTests(unittest.TestCase):
             ]:
                 with self.assertRaises(ValueError):
                     module.summarize("private archive", {"vlm": provider})
+
+    def test_complete_json_wrappers_are_accepted_but_partial_or_ambiguous_results_are_not(self):
+        valid = '{"abstract":"summary","overview":"note"}'
+        self.assertEqual(module.parse_summary("```json\n" + valid + "\n```")["overview"], "note")
+        self.assertEqual(module.parse_summary("结果：\n" + valid)["overview"], "note")
+        for invalid in [valid[:-1], valid + valid, '{"broken":' + valid, '[' + valid + ']', '{"overview":"bad\nJSON","abstract":"a"}']:
+            with self.subTest(invalid=invalid), self.assertRaises(module.SummaryFailure) as raised:
+                module.parse_summary(invalid)
+            self.assertEqual(raised.exception.code, "SUMMARY_FORMAT_INVALID")
+        with self.assertRaises(module.SummaryFailure) as raised: module.parse_summary("  ")
+        self.assertEqual(raised.exception.code, "SUMMARY_EMPTY")
+
+    def test_stream_failure_and_incomplete_outputs_cannot_masquerade_as_success(self):
+        class Stream:
+            closed = False
+            def __init__(self, events): self.events = events
+            def __iter__(self): return iter(self.events)
+            def close(self): self.closed = True
+        text = {"type": "response.output_text.delta", "delta": '{"abstract":"plausible","overview":"partial"}'}
+        for terminal, code in [
+            ({"type": "response.failed", "response": {"error": {"code": "usage_limit_reached", "message": "SECRET"}}}, "SUMMARY_RATE_LIMITED"),
+            ({"type": "response.failed", "response": {"error": {"code": "model_not_found"}}}, "SUMMARY_MODEL_UNAVAILABLE"),
+            ({"type": "response.incomplete", "response": {"incomplete_details": {"reason": "max_output_tokens"}}}, "SUMMARY_INCOMPLETE"),
+            ({"type": "error", "code": "invalid_api_key", "message": "SECRET"}, "SUMMARY_AUTH_REQUIRED"),
+            (None, "SUMMARY_INCOMPLETE"),
+            ({"type": "response.completed"}, "SUMMARY_INCOMPLETE"),
+        ]:
+            stream = Stream([text] + ([terminal] if terminal else []))
+            with self.subTest(code=code), self.assertRaises(module.SummaryFailure) as raised:
+                list(module.checked_events(stream))
+            self.assertEqual(raised.exception.code, code)
+            self.assertNotIn("SECRET", str(raised.exception))
+            self.assertTrue(stream.closed)
+        stream = Stream([text, {"type": "response.completed", "response": {"status": "completed"}}])
+        self.assertEqual(len(list(module.checked_events(stream))), 2)
+        self.assertTrue(stream.closed)
+
+    def test_sdk_guard_is_restored_and_catches_adapter_ignored_terminal_event(self):
+        class Responses:
+            def create(self, **kwargs):
+                return iter([{"type": "response.incomplete", "response": {"incomplete_details": {"reason": "max_output_tokens"}}}])
+        original = Responses.create
+        with patch.dict("sys.modules", {"openai.resources.responses": SimpleNamespace(Responses=Responses)}):
+            with self.assertRaises(module.SummaryFailure), module.checked_codex_responses():
+                # This mirrors the installed adapter's iteration: without the
+                # guard it ignores the event and returns an empty success.
+                for _ in Responses().create(stream=True): pass
+        self.assertIs(Responses.create, original)
+
+    def test_structured_failures_keep_specific_causes_without_exposing_messages(self):
+        class ProviderError(Exception): pass
+        for kind, expected in [("authentication_error", "SUMMARY_AUTH_REQUIRED"), ("quota_exhausted", "SUMMARY_RATE_LIMITED"), ("model_not_found", "SUMMARY_MODEL_UNAVAILABLE"), ("input_too_large", "SUMMARY_INPUT_TOO_LARGE"), ("content_safety", "SUMMARY_CONTENT_BLOCKED")]:
+            error = ProviderError("SECRET")
+            error.kind = SimpleNamespace(value=kind)
+            self.assertEqual(module.error_code(error), expected)
+        outer = ProviderError("SECRET")
+        outer.kind = SimpleNamespace(value="transient_network_error")
+        outer.__cause__ = TimeoutError("SECRET")
+        self.assertEqual(module.error_code(outer), "SUMMARY_TIMEOUT")
+        outer.__cause__ = ValueError("SECRET")
+        self.assertEqual(module.error_code(outer), "SUMMARY_NETWORK")
+        outer.__cause__ = module.SummaryFailure("SUMMARY_INCOMPLETE", phase="stream")
+        self.assertEqual(module.error_code(outer), "SUMMARY_INCOMPLETE")
+        class CodexAuthError(RuntimeError): pass
+        auth = CodexAuthError("SECRET")
+        self.assertEqual(module.error_code(auth), "SUMMARY_AUTH_REQUIRED")
+        auth.__cause__ = TimeoutError("SECRET")
+        self.assertEqual(module.error_code(auth), "SUMMARY_TIMEOUT")
+
+    def test_archive_only_is_a_strict_boolean_and_keeps_explanatory_content(self):
+        base = {"abstract": "连通测试", "overview": "只有连通测试，没有可复用信息。", "topic": "新同义主题"}
+        result = module.parse_summary(json.dumps({**base, "archiveOnly": True, "reason": "只需保留记录"}))
+        self.assertTrue(result["archiveOnly"])
+        self.assertEqual(result["topic"], "其他")
+        self.assertEqual(result["reason"], "只需保留记录")
+        self.assertNotIn("archiveOnly", module.parse_summary(json.dumps({**base, "archiveOnly": "true"})))
+
+    def test_cache_storage_failure_is_reported_without_repeating_model_call(self):
+        class FakeVLM:
+            def __init__(self, **configuration): pass
+            def get_completion(self, **arguments): return '{"abstract":"saved","overview":"completed result"}'
+            def close(self): pass
+        with tempfile.TemporaryDirectory() as directory, patch.dict("sys.modules", {"openviking_cli.utils.config.vlm_config": SimpleNamespace(VLMConfig=FakeVLM)}), patch.object(module.Path, "write_text", side_effect=OSError("PRIVATE PATH")):
+            with self.assertRaises(module.SummaryFailure) as raised:
+                module.summarize("synthetic", {"vlm": {"provider": "openai-codex"}}, cache_dir=Path(directory))
+            self.assertEqual(raised.exception.code, "SUMMARY_CACHE_UNAVAILABLE")
 
 
 if __name__ == "__main__":

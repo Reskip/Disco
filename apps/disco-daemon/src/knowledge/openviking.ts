@@ -55,6 +55,8 @@ export interface KnowledgeSummary {
   title?: string;
   topic?: string;
   tags?: string[];
+  archiveOnly?: boolean;
+  reason?: string;
 }
 
 const providerMessages: Record<string, string> = {
@@ -69,10 +71,41 @@ const providerMessages: Record<string, string> = {
   SUMMARY_RATE_LIMITED: '摘要额度暂时不足，将稍后自动重试',
   SUMMARY_AUTH_REQUIRED: '摘要账号需要重新登录，原文与索引保持可用',
   SUMMARY_TIMEOUT: '本轮摘要整理尚未完成，将从已完成的片段继续',
+  SUMMARY_FORMAT_INVALID: '摘要返回格式不完整，将稍后重新整理；原文保持可用',
+  SUMMARY_EMPTY: '摘要模型未返回内容，将稍后重新整理',
+  SUMMARY_INCOMPLETE: '摘要响应中途结束，将从已完成的片段继续',
+  SUMMARY_NETWORK: '摘要服务连接失败，将稍后自动重试',
+  SUMMARY_SERVICE_UNAVAILABLE: '摘要服务暂时不可用，将稍后自动重试',
+  SUMMARY_MODEL_UNAVAILABLE: '当前摘要模型不可用，请检查模型配置',
+  SUMMARY_CONFIGURATION: '摘要模型配置不兼容，请检查后台配置',
+  SUMMARY_INPUT_TOO_LARGE: '摘要片段超过模型可处理范围，原文与索引保持可用',
+  SUMMARY_CONTENT_BLOCKED: '摘要模型未能处理这份资料，原文与索引保持可用',
+  SUMMARY_CACHE_UNAVAILABLE: '摘要进度缓存无法写入，请检查存储空间与权限',
+  SUMMARY_REDUCTION_FAILED: '资料片段过多且无法合并，请调整整理范围',
+  SUMMARY_FAILED: '资料摘要未生成，原文与索引保持可用',
   CANCELLED: '后台处理已暂停，将在下次继续',
 };
 
+const summaryRetryMs: Record<string, number> = {
+  SUMMARY_NETWORK: 30_000,
+  SUMMARY_SERVICE_UNAVAILABLE: 30_000,
+  SUMMARY_TIMEOUT: 60_000,
+  SUMMARY_FORMAT_INVALID: 300_000,
+  SUMMARY_EMPTY: 300_000,
+  SUMMARY_INCOMPLETE: 300_000,
+  SUMMARY_FAILED: 300_000,
+  SUMMARY_RATE_LIMITED: 1_800_000,
+  SUMMARY_AUTH_REQUIRED: 3_600_000,
+  SUMMARY_MODEL_UNAVAILABLE: 3_600_000,
+  SUMMARY_CONFIGURATION: 3_600_000,
+  SUMMARY_CACHE_UNAVAILABLE: 3_600_000,
+  SUMMARY_CONTENT_BLOCKED: 3_600_000,
+  SUMMARY_INPUT_TOO_LARGE: 3_600_000,
+  SUMMARY_REDUCTION_FAILED: 3_600_000,
+};
+
 export class OpenVikingError extends Error {
+  readonly retryAfterMs?: number;
   constructor(
     message: string,
     readonly code: string,
@@ -80,7 +113,34 @@ export class OpenVikingError extends Error {
   ) {
     super(providerMessages[code] ?? message);
     this.name = 'OpenVikingError';
+    this.retryAfterMs = summaryRetryMs[code];
   }
+}
+
+function summaryDiagnostic(value: unknown): Record<string, string | number> {
+  const input = record(value);
+  const result: Record<string, string | number> = {};
+  if (
+    typeof input?.phase === 'string' &&
+    ['stream', 'parse', 'cache', 'configuration', 'reduce', 'cancel'].includes(input.phase)
+  )
+    result.phase = input.phase;
+  if (
+    typeof input?.exceptionType === 'string' &&
+    /^[A-Za-z][A-Za-z0-9_]{0,79}$/.test(input.exceptionType)
+  )
+    result.exceptionType = input.exceptionType;
+  for (const key of ['responseCharacters', 'jsonPosition']) {
+    const count = input?.[key];
+    if (
+      typeof count === 'number' &&
+      Number.isSafeInteger(count) &&
+      count >= 0 &&
+      count <= 2_000_000
+    )
+      result[key] = count;
+  }
+  return result;
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -605,49 +665,85 @@ export class OpenVikingClient {
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
       throw new OpenVikingError('检索条数无效', 'INVALID_LIMIT');
     }
+    const epoch = this.cancellationEpoch;
     const identity = await this.identity(owner);
     const root = this.root(owner);
     const targets = options.documentIds?.map((id) => `${root}/${safeEntryId(id)}`);
-    const result = record(
-      await this.request(identity, '/api/v1/search/find', 'POST', {
-        query,
-        target_uri: targets ?? root,
-        limit,
-        level: 2,
-        context_type: 'resource',
-        tags: ['disco_index=active'],
-        read_content: true,
-      })
-    );
-    if (!Array.isArray(result?.resources)) {
-      throw new OpenVikingError('语义索引返回格式无效', 'INVALID_RESPONSE');
-    }
     const allowed = options.documentIds ? new Set(options.documentIds) : undefined;
     const seen = new Set<string>();
     const hits: OpenVikingSearchHit[] = [];
-    for (const value of result.resources) {
-      const item = record(value);
-      if (typeof item?.uri !== 'string' || !item.uri.startsWith(`${root}/`)) continue;
-      const name = item.uri.slice(root.length + 1);
-      const match = /^([a-zA-Z0-9][a-zA-Z0-9_-]{0,159})\/(content|part-\d{10})\.md$/.exec(name);
-      if (!match || (allowed && !allowed.has(match[1]))) continue;
-      const id = match[1];
-      if (seen.has(id)) continue;
-      seen.add(id);
-      hits.push({
-        id,
-        uri: item.uri,
-        excerpt:
-          typeof item.content === 'string'
-            ? item.content
-            : typeof item.abstract === 'string'
-              ? item.abstract
-              : '',
-        ...(typeof item.score === 'number' && Number.isFinite(item.score)
-          ? { score: item.score }
-          : {}),
-      });
-      if (hits.length === limit) break;
+    const deadline = Date.now() + this.requestTimeoutMs;
+    // Ranked chunks from one long conversation must not consume every document
+    // candidate. Subsequent rounds exclude whole already-seen documents using
+    // the existing per-chunk entry tags, within one overall request deadline.
+    for (let round = 0; round < 4 && hits.length < limit; round++) {
+      this.assertActive(epoch);
+      if (allowed && seen.size >= allowed.size) break;
+      const previousSize = seen.size;
+      const nodeLimit = Math.max(40, Math.min(200, (limit - hits.length) * 4));
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      let result: Record<string, unknown> | undefined;
+      try {
+        result = record(
+          await this.request(
+            identity,
+            '/api/v1/search/find',
+            'POST',
+            {
+              query,
+              target_uri: targets ?? root,
+              limit: nodeLimit,
+              level: 2,
+              context_type: 'resource',
+              tags: ['disco_index=active'],
+              ...(seen.size
+                ? {
+                    filter: {
+                      op: 'must_not',
+                      field: 'search_tags',
+                      conds: [...seen].map((id) => `disco_entry=${id}`),
+                    },
+                  }
+                : {}),
+              read_content: true,
+            },
+            remaining
+          )
+        );
+      } catch (error) {
+        if (!hits.length || (error instanceof OpenVikingError && error.code === 'CANCELLED'))
+          throw error;
+        break;
+      }
+      if (!Array.isArray(result?.resources)) {
+        throw new OpenVikingError('语义索引返回格式无效', 'INVALID_RESPONSE');
+      }
+      for (const value of result.resources) {
+        const item = record(value);
+        if (typeof item?.uri !== 'string' || !item.uri.startsWith(`${root}/`)) continue;
+        const name = item.uri.slice(root.length + 1);
+        const match = /^([a-zA-Z0-9][a-zA-Z0-9_-]{0,159})\/(content|part-\d{10})\.md$/.exec(name);
+        if (!match || (allowed && !allowed.has(match[1]))) continue;
+        const id = match[1];
+        if (seen.has(id)) continue;
+        seen.add(id);
+        hits.push({
+          id,
+          uri: item.uri,
+          excerpt:
+            typeof item.content === 'string'
+              ? item.content
+              : typeof item.abstract === 'string'
+                ? item.abstract
+                : '',
+          ...(typeof item.score === 'number' && Number.isFinite(item.score)
+            ? { score: item.score }
+            : {}),
+        });
+        if (hits.length === limit) break;
+      }
+      if (seen.size === previousSize || result.resources.length < nodeLimit) break;
     }
     return hits;
   }
@@ -780,13 +876,19 @@ export class OpenVikingClient {
         if (settled) return;
         if (code !== 0) {
           try {
-            const failure = record(JSON.parse(output))?.error;
+            const response = record(JSON.parse(output));
+            const failure = response?.error;
             if (
-              failure === 'SUMMARY_RATE_LIMITED' ||
-              failure === 'SUMMARY_AUTH_REQUIRED' ||
-              failure === 'CANCELLED'
-            )
+              typeof failure === 'string' &&
+              (Object.hasOwn(summaryRetryMs, failure) || failure === 'CANCELLED')
+            ) {
+              if (failure !== 'CANCELLED')
+                console.warn('[knowledge] 摘要处理未完成', {
+                  code: failure,
+                  ...summaryDiagnostic(response?.diagnostic),
+                });
               return fail(failure);
+            }
           } catch {
             /* Only the fixed helper error codes are exposed. */
           }
@@ -799,7 +901,7 @@ export class OpenVikingClient {
             typeof result.overview !== 'string' ||
             !result.overview.trim()
           )
-            return fail('INVALID_RESPONSE');
+            return fail('SUMMARY_FORMAT_INVALID');
           settled = true;
           release();
           clearTimeout(timer);
@@ -811,9 +913,17 @@ export class OpenVikingClient {
             ...(Array.isArray(result.tags) && result.tags.every((tag) => typeof tag === 'string')
               ? { tags: result.tags as string[] }
               : {}),
+            ...(result.archiveOnly === true
+              ? {
+                  archiveOnly: true,
+                  ...(typeof result.reason === 'string'
+                    ? { reason: result.reason.slice(0, 300) }
+                    : {}),
+                }
+              : {}),
           });
         } catch {
-          fail('INVALID_RESPONSE');
+          fail('SUMMARY_FORMAT_INVALID');
         }
       });
       child.stdin.end(

@@ -54,6 +54,46 @@ describe('knowledge HTTP client', () => {
     expect(authenticatedFetch).toHaveBeenCalledTimes(1);
   });
 
+  it('loads the list, overview and processing status through one catalog request', async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValue(new Response('{}', { status: 200 }));
+    await knowledgeApi.catalog('资料', 'manual', 20, undefined, {
+      materialType: 'image',
+      level: 'source',
+    });
+    const url = new URL(vi.mocked(authenticatedFetch).mock.calls[0][0] as string);
+    expect(url.pathname).toBe('/knowledge/catalog');
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      query: '资料',
+      source: 'manual',
+      offset: '20',
+      limit: '20',
+      materialType: 'image',
+      level: 'source',
+    });
+    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('pins subsequent reading segments to their content version and leaves edit reads complete', async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(
+      async () => new Response('{}', { status: 200 })
+    );
+    await knowledgeApi.detail('entry-a', undefined, {
+      offset: 40_000,
+      limit: 40_000,
+      contentHash: 'version-a',
+    });
+    await knowledgeApi.detail('entry-a');
+    const first = new URL(vi.mocked(authenticatedFetch).mock.calls[0][0] as string);
+    expect(Object.fromEntries(first.searchParams)).toEqual({
+      offset: '40000',
+      limit: '40000',
+      contentHash: 'version-a',
+    });
+    expect(vi.mocked(authenticatedFetch).mock.calls[1][0]).toBe(
+      'https://disco.example/knowledge/entries/entry-a'
+    );
+  });
+
   it('streams a full authenticated export to the chosen file without buffering a blob', async () => {
     const chunks: Uint8Array[] = [];
     const closed = vi.fn();

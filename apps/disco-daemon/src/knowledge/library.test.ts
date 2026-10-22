@@ -70,6 +70,32 @@ describe('portable knowledge library', () => {
     expect(await library.get(owner, image.entry.id)).not.toBeNull();
   });
 
+  it('ranks multi-term Chinese catalog matches without requiring the entire question verbatim', async () => {
+    const relevant = (await library.upsertSource(owner, {
+      ...source,
+      sourceId: 'upload-life',
+      title: '上传生命周期',
+      markdown: '# 上传生命周期\n上传时可以切换会话，上传在后台继续。',
+    }))!;
+    await library.upsertSource(owner, {
+      ...source,
+      sourceId: 'upload-image',
+      title: '图片文件',
+      markdown: '上传图片后可以下载。',
+    });
+    await library.upsertSource(otherUser, {
+      ...source,
+      sourceId: 'private',
+      title: '切换会话 上传',
+      markdown: '另一个用户的资料',
+    });
+    const catalog = await library.catalog(owner, { query: '切换会话 上传' });
+    expect(catalog.entries[0].id).toBe(relevant.entry.id);
+    expect(catalog.entries[0].snippet).toContain('后台继续');
+    expect(catalog.status.total).toBe(2);
+    expect((await library.catalog(owner, { query: 'ERR_MODULE_NOT_FOUND' })).entries).toEqual([]);
+  });
+
   it('streams and validates raw archives without losing the old revision', async () => {
     const entry = (await library.upsertSource(owner, source))!;
     await library.preserveRawRevision(owner, entry.entry.id);
@@ -123,6 +149,25 @@ describe('portable knowledge library', () => {
       automated: true,
     });
     expect((await library.get(owner, draft.entry.id))?.entry.title).toBe('人工新标题');
+  });
+
+  it('honors provider retry cooldowns and removes stale indexing errors after a human edit', async () => {
+    const record = (await library.upsertSource(owner, source))!;
+    const before = Date.now();
+    await library.markSummaryFailed(
+      owner,
+      record.entry.id,
+      record.contentHash,
+      '额度不足',
+      3_600_000
+    );
+    const failed = (await library.get(owner, record.entry.id))!;
+    expect(Date.parse(failed.entry.summaryRetryAt!) - before).toBeGreaterThanOrEqual(3_600_000);
+    await library.markIndexed(owner, record.entry.id, record.contentHash, '旧索引失败');
+    const edited = (await library.edit(owner, record.entry.id, '人工修正后的内容'))!;
+    expect(edited.entry.indexStatus).toBe('pending');
+    expect(edited.entry.indexMessage).toBeUndefined();
+    expect(edited.entry.indexRetryAt).toBeUndefined();
   });
 
   it('preserves full raw records and readable Markdown with deterministic, per-owner IDs', async () => {

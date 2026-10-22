@@ -305,6 +305,68 @@ describe('knowledge background synchronization', () => {
     );
   });
 
+  it('keeps trivial exchanges fully archived without manufacturing a knowledge note', async () => {
+    const session = await createSession(primary, '连通测试');
+    await append(session, 0, '测试');
+    await runtime.runOnce(false);
+    const source = (await runtime.library.list(owner)).entries[0];
+    await runtime.library.markIndexed(owner, source.id);
+    Object.defineProperty(runtime, 'engine', {
+      value: {
+        summarizeContent: vi.fn().mockResolvedValue({
+          abstract: '仅一次连通测试',
+          overview: '收到回复，无其他结论。',
+          archiveOnly: true,
+          reason: '没有可复用知识。',
+        }),
+      },
+    });
+    await runtime.runSummaryOnce();
+    expect((await runtime.library.list(owner, { kind: 'note' })).total).toBe(0);
+    const kept = await runtime.library.get(owner, source.id);
+    expect(kept?.markdown).toContain('测试');
+    expect(kept?.entry.summaryDisposition).toBe('archive_only');
+    expect((await runtime.status(owner)).processing?.summary).toMatchObject({
+      completed: 1,
+      archivedOnly: 1,
+      pending: 0,
+    });
+  });
+
+  it('prioritizes explicit synthesis across owners before unattended historical summaries', async () => {
+    const session = await createSession(primary, '后台历史');
+    await append(session, 0, '后台需要整理的资料');
+    await runtime.runOnce(false);
+    const archived = (await runtime.library.list(owner)).entries[0];
+    await runtime.library.markIndexed(owner, archived.id);
+    const source = (await runtime.library.upsertSource(otherOwner, {
+      source: 'manual',
+      sourceId: 'requested-source',
+      kind: 'note',
+      title: '主动选择的资料',
+      markdown: '用户现在希望整理这些结论',
+    }))!;
+    const summarizeContent = vi.fn().mockResolvedValue({
+      abstract: '主动任务完成',
+      overview: '用户选择的来源结论',
+      archiveOnly: true,
+    });
+    Object.defineProperty(runtime, 'engine', { value: { summarizeContent } });
+    const draft = await runtime.organize(otherOwner, {
+      entryIds: [source.entry.id],
+      mode: 'automatic',
+    });
+    await runtime.runSummaryOnce();
+    expect(summarizeContent).toHaveBeenCalledTimes(1);
+    expect(summarizeContent.mock.calls[0][0]).toEqual(otherOwner);
+    expect((await runtime.library.get(otherOwner, draft.entry.id))?.entry.generation?.state).toBe(
+      'complete'
+    );
+    expect((await runtime.library.list(owner, { kind: 'note' })).total).toBe(0);
+    await runtime.runSummaryOnce();
+    expect(summarizeContent).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps manual takeover when a queued automatic draft finishes late', async () => {
     const source = (await runtime.library.upsertSource(owner, {
       source: 'manual',

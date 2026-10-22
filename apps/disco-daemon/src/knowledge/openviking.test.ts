@@ -196,6 +196,57 @@ describe('OpenViking derived index isolation', () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it('excludes a long conversation after its chunks crowd the first page to retrieve other documents', async () => {
+    const { client, fetcher, responder } = setup();
+    const crowded = client.documentUri(owner, 'crowded');
+    responder
+      .mockReturnValueOnce(
+        ok({
+          resources: Array.from({ length: 40 }, (_, index) => ({
+            uri: crowded.replace('content.md', `part-${String(index).padStart(10, '0')}.md`),
+            content: `原文片段 ${index}`,
+            score: 1,
+          })),
+        })
+      )
+      .mockReturnValueOnce(
+        ok({
+          resources: [
+            { uri: client.documentUri(owner, 'second'), content: '另一份相关原文', score: 0.8 },
+            {
+              uri: client.documentUri(secondOwner, 'private'),
+              content: '其它用户的原文',
+              score: 0.9,
+            },
+          ],
+        })
+      );
+    const result = await client.search(owner, { query: '相关原文', limit: 2 });
+    expect(result.map((hit) => hit.id)).toEqual(['crowded', 'second']);
+    const searches = fetcher.mock.calls.filter(
+      ([url]) => new URL(String(url)).pathname === '/api/v1/search/find'
+    );
+    expect(searches).toHaveLength(2);
+    expect(JSON.parse(searches[1][1]!.body as string)).toMatchObject({
+      filter: { op: 'must_not', field: 'search_tags', conds: ['disco_entry=crowded'] },
+      tags: ['disco_index=active'],
+    });
+  });
+
+  it('stops if a provider ignores diversity exclusions instead of looping over the same chunks', async () => {
+    const { client, responder } = setup();
+    responder.mockReturnValue(
+      ok({
+        resources: Array.from({ length: 40 }, () => ({
+          uri: client.documentUri(owner, 'only'),
+          content: '同一条原文',
+        })),
+      })
+    );
+    expect(await client.search(owner, { query: '原文', limit: 3 })).toHaveLength(1);
+    expect(responder).toHaveBeenCalledTimes(2);
+  });
+
   it('updates an existing directory and clears obsolete chunks without triggering the provider delete summarizer', async () => {
     const { client, fetcher } = setup();
     const original = fetcher.getMockImplementation()!;
@@ -416,6 +467,83 @@ describe('OpenViking derived index isolation', () => {
       client.summarizeContent(owner, { id: 'manual', content: '来源正文' })
     ).rejects.toMatchObject({ code: 'NOT_CONFIGURED' });
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('exposes safe summary failure categories and minimum retry intervals from the helper', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'disco-summary-failure-'));
+    const script = join(base, 'summary.cjs');
+    const logger = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      for (const [code, delay] of [
+        ['SUMMARY_FORMAT_INVALID', 300_000],
+        ['SUMMARY_INCOMPLETE', 300_000],
+        ['SUMMARY_AUTH_REQUIRED', 3_600_000],
+        ['SUMMARY_RATE_LIMITED', 1_800_000],
+        ['SUMMARY_NETWORK', 30_000],
+      ]) {
+        await writeFile(
+          script,
+          `process.stdin.resume();process.stdin.on('end',()=>{process.stdout.write(${JSON.stringify(JSON.stringify({ error: code, diagnostic: { phase: 'parse', exceptionType: 'SummaryFailure', responseCharacters: 30, jsonPosition: 29, token: 'NEVER_LOG_SECRET', message: 'NEVER_LOG_SECRET' } }))});process.exitCode=1;});`
+        );
+        const { client } = setup(undefined, {
+          pythonExecutable: process.execPath,
+          scriptPath: script,
+          configPath: join(base, 'config.json'),
+        });
+        await expect(
+          client.summarizeContent(owner, { id: 'synthetic', content: 'synthetic' })
+        ).rejects.toMatchObject({ code, retryAfterMs: delay });
+      }
+      expect(JSON.stringify(logger.mock.calls)).not.toContain('NEVER_LOG_SECRET');
+      expect(logger.mock.calls[0][1]).toEqual({
+        code: 'SUMMARY_FORMAT_INVALID',
+        phase: 'parse',
+        exceptionType: 'SummaryFailure',
+        responseCharacters: 30,
+        jsonPosition: 29,
+      });
+      await writeFile(
+        script,
+        `process.stdin.resume();process.stdin.on('end',()=>{process.stdout.write('{"error":"SECRET_PROVIDER_TEXT"}');process.exitCode=1;});`
+      );
+      const { client } = setup(undefined, {
+        pythonExecutable: process.execPath,
+        scriptPath: script,
+        configPath: join(base, 'config.json'),
+      });
+      await expect(
+        client.summarizeContent(owner, { id: 'synthetic', content: 'synthetic' })
+      ).rejects.toMatchObject({
+        code: 'SUMMARY_FAILED',
+        message: '资料摘要未生成，原文与索引保持可用',
+      });
+    } finally {
+      logger.mockRestore();
+      await removeFixture(base);
+    }
+  });
+
+  it('preserves explicit archive-only decisions but never coerces string values', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'disco-summary-disposition-'));
+    const script = join(base, 'summary.cjs');
+    try {
+      for (const archiveOnly of [true, 'true']) {
+        await writeFile(
+          script,
+          `process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(${JSON.stringify(JSON.stringify({ abstract: '连通测试', overview: '原始记录已保留，无额外知识。', archiveOnly, reason: '仅连通测试' }))}));`
+        );
+        const { client } = setup(undefined, {
+          pythonExecutable: process.execPath,
+          scriptPath: script,
+          configPath: join(base, 'config.json'),
+        });
+        const result = await client.summarizeContent(owner, { id: 'synthetic', content: '测试' });
+        expect(result.archiveOnly).toBe(archiveOnly === true ? true : undefined);
+        expect(result.overview).toBe('原始记录已保留，无额外知识。');
+      }
+    } finally {
+      await removeFixture(base);
+    }
   });
 
   it('deletes only the selected derived summary cache and prevents its recreation', async () => {

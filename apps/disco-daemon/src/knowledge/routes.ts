@@ -12,6 +12,7 @@ import type { Application } from '@disco/core/feathers';
 import type {
   AuthenticatedParams,
   KnowledgeKind,
+  KnowledgeListOptions,
   KnowledgeMaterialType,
   KnowledgeOrganization,
   KnowledgeOwner,
@@ -115,6 +116,25 @@ function grouping(value: unknown): KnowledgeOrganization | undefined {
   return { topic, level, state, tags: data.tags as string[] | undefined };
 }
 
+function listOptions(query: Request['query']): KnowledgeListOptions {
+  return {
+    query: scalar(query.query),
+    source: sourceFilter(query.source),
+    kind: choice<KnowledgeKind>(query.kind, ['conversation', 'document', 'note'], '资料类型'),
+    materialType: choice<KnowledgeMaterialType>(
+      query.materialType,
+      ['conversation', 'image', 'document', 'file', 'note'],
+      '文件类型'
+    ),
+    level: choice(query.level, ['source', 'summary', 'knowledge'] as const, '知识层级'),
+    topic: scalar(query.topic),
+    reviewState: choice(query.reviewState, ['draft', 'reviewed'] as const, '确认状态'),
+    includeHistory: query.includeHistory === 'true',
+    offset: numberField(query.offset, 0, Number.MAX_SAFE_INTEGER),
+    limit: Math.max(1, numberField(query.limit, 40, 100)),
+  };
+}
+
 export async function registerKnowledgeRoutes(input: {
   app: Application;
   db: TenantScopeAwareDatabase;
@@ -166,29 +186,13 @@ export async function registerKnowledgeRoutes(input: {
   router.get('/overview', async (req, res) =>
     res.json(await runtime.library.overview(ownerOf(req)))
   );
+  router.get('/catalog', async (req, res) => {
+    const owner = ownerOf(req);
+    const catalog = await runtime.library.catalog(owner, listOptions(req.query));
+    res.json({ ...catalog, status: await runtime.status(owner, catalog.status) });
+  });
   router.get('/entries', async (req, res) => {
-    res.json(
-      await runtime.library.list(ownerOf(req), {
-        query: scalar(req.query.query),
-        source: sourceFilter(req.query.source),
-        kind: choice<KnowledgeKind>(
-          req.query.kind,
-          ['conversation', 'document', 'note'],
-          '资料类型'
-        ),
-        materialType: choice<KnowledgeMaterialType>(
-          req.query.materialType,
-          ['conversation', 'image', 'document', 'file', 'note'],
-          '文件类型'
-        ),
-        level: choice(req.query.level, ['source', 'summary', 'knowledge'] as const, '知识层级'),
-        topic: scalar(req.query.topic),
-        reviewState: choice(req.query.reviewState, ['draft', 'reviewed'] as const, '确认状态'),
-        includeHistory: req.query.includeHistory === 'true',
-        offset: numberField(req.query.offset, 0, Number.MAX_SAFE_INTEGER),
-        limit: Math.max(1, numberField(req.query.limit, 40, 100)),
-      })
-    );
+    res.json(await runtime.library.list(ownerOf(req), listOptions(req.query)));
   });
   router.post('/search', async (req, res) => {
     const entryIds = req.body?.entryIds;
@@ -210,7 +214,44 @@ export async function registerKnowledgeRoutes(input: {
   router.get('/entries/:id', async (req, res) => {
     const detail = await runtime.library.get(ownerOf(req), String(req.params.id));
     if (!detail) throw missing();
+    if (req.query.contentHash !== undefined && req.query.contentHash !== detail.contentHash)
+      throw new KnowledgeConflictError();
+    if (req.query.offset !== undefined || req.query.limit !== undefined) {
+      let offset = Math.min(
+        detail.markdown.length,
+        numberField(req.query.offset, 0, Number.MAX_SAFE_INTEGER)
+      );
+      const limit = Math.max(1, numberField(req.query.limit, 40000, 100000));
+      if (offset > 0 && /[\uDC00-\uDFFF]/.test(detail.markdown[offset] ?? '')) offset--;
+      let end = Math.min(detail.markdown.length, offset + limit);
+      if (end < detail.markdown.length && /[\uDC00-\uDFFF]/.test(detail.markdown[end])) end++;
+      const totalChars = detail.markdown.length;
+      detail.markdown = detail.markdown.slice(offset, end);
+      detail.page = {
+        offset,
+        totalChars,
+        nextOffset: end < totalChars ? end : null,
+        hasMore: end < totalChars,
+      };
+    }
     res.json(detail);
+  });
+  router.get('/entries/:id/markdown', async (req, res) => {
+    const result = await runtime.library.openMarkdown(ownerOf(req), String(req.params.id));
+    if (!result) throw missing();
+    const safeTitle = Array.from(result.title.replace(/[\\/:*?"<>|\r\n\0]/g, '_'))
+      .slice(0, 160)
+      .join('');
+    const filename = `${safeTitle.replace(/\.md$/i, '') || '知识资料'}.md`;
+    res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+    res.setHeader('Content-Length', String(result.size));
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`
+    );
+    res.once('close', () => result.body.destroy());
+    result.body.on('error', () => res.destroy());
+    result.body.pipe(res);
   });
   router.post('/entries', async (req, res) => {
     const title = textField(req.body?.title, '标题').trim();

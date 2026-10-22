@@ -28,6 +28,7 @@ import type {
   KnowledgeSourceInput,
 } from '@disco/core/types';
 import { canSummarize, materialType, organization, retryDate } from './organization.js';
+import { searchTerms } from './search.js';
 import type { HostAttachmentReference } from './sources.js';
 
 interface StoredEntry extends KnowledgeEntry {
@@ -543,6 +544,8 @@ export class KnowledgeLibrary {
       }
       entry.contentHash = hash;
       entry.humanEdited = true;
+      entry.summaryDisposition = undefined;
+      entry.summaryReason = undefined;
       entry.updatedAt = nowAfter(entry.updatedAt);
       entry.sizeBytes = Buffer.byteLength(markdown);
       entry.indexStatus = 'pending';
@@ -697,6 +700,9 @@ export class KnowledgeLibrary {
         summaryMessage: entry?.contentHash === digest(body) ? entry?.summaryMessage : undefined,
         summaryAttempts: entry?.contentHash === digest(body) ? entry?.summaryAttempts : undefined,
         summaryRetryAt: entry?.contentHash === digest(body) ? entry?.summaryRetryAt : undefined,
+        summaryDisposition:
+          entry?.contentHash === digest(body) ? entry?.summaryDisposition : undefined,
+        summaryReason: entry?.contentHash === digest(body) ? entry?.summaryReason : undefined,
         historical: entry?.historical,
       };
       if (input.rawContent !== undefined)
@@ -756,6 +762,8 @@ export class KnowledgeLibrary {
       entry.updatedAt = nowAfter(entry.updatedAt);
       entry.sizeBytes = Buffer.byteLength(body);
       entry.humanEdited = true;
+      entry.summaryDisposition = undefined;
+      entry.summaryReason = undefined;
       if (title !== undefined) entry.title = title.trim();
       entry.organization = grouping ?? { ...organization(entry), state: 'reviewed' };
       if (body !== current.markdown) entry.organization.summary = undefined;
@@ -764,6 +772,7 @@ export class KnowledgeLibrary {
       entry.indexRetryAt = undefined;
       entry.indexAttempts = undefined;
       entry.indexMessage = undefined;
+      entry.indexError = undefined;
       await this.writeMarkdown(base, entry, body, current.contentHash);
       await this.archiveRevision(base, entry, body);
       return { entry: publicEntry(entry), markdown: body, contentHash: entry.contentHash };
@@ -783,45 +792,83 @@ export class KnowledgeLibrary {
     owner: KnowledgeOwner,
     options: KnowledgeListOptions = {}
   ): Promise<KnowledgeListResult> {
-    return this.exclusive(owner, async (base) => {
-      const query = options.query?.trim().toLocaleLowerCase();
-      const results: KnowledgeEntry[] = [];
-      for (const entry of (await this.state(base)).entries) {
-        if (entry.historical && !options.includeHistory) continue;
-        if (
-          (options.kind && entry.kind !== options.kind) ||
-          (options.source && entry.source !== options.source) ||
-          (options.materialType && materialType(entry) !== options.materialType) ||
-          (options.level && organization(entry).level !== options.level) ||
-          (options.topic && organization(entry).topic !== options.topic) ||
-          (options.reviewState && organization(entry).state !== options.reviewState)
-        )
-          continue;
-        // Lists load only metadata. Full Markdown is read for explicit search/open or background reconciliation.
-        let result = publicEntry(entry);
-        if (query) {
-          const detail = await this.refreshEntry(base, entry);
-          if (!detail) continue;
-          result = detail.entry;
-          const match = detail.markdown.toLocaleLowerCase().indexOf(query);
-          if (
-            match < 0 &&
-            !`${entry.title} ${organization(entry).topic} ${organization(entry).summary ?? ''} ${(organization(entry).tags ?? []).join(' ')}`
-              .toLocaleLowerCase()
-              .includes(query)
-          )
-            continue;
-          result.snippet = detail.markdown.slice(
-            Math.max(0, match - 60),
-            Math.max(0, match - 60) + 280
-          );
-        }
-        results.push(result);
+    return this.exclusive(owner, async (base) =>
+      this.listFromState(base, await this.state(base), options)
+    );
+  }
+
+  private async listFromState(
+    base: string,
+    state: OwnerState,
+    options: KnowledgeListOptions
+  ): Promise<KnowledgeListResult> {
+    const query = options.query?.trim().toLocaleLowerCase();
+    const terms = query ? searchTerms(query) : [];
+    const relevance = new Map<string, number>();
+    const results: KnowledgeEntry[] = [];
+    for (const entry of state.entries) {
+      if (entry.historical && !options.includeHistory) continue;
+      if (
+        (options.kind && entry.kind !== options.kind) ||
+        (options.source && entry.source !== options.source) ||
+        (options.materialType && materialType(entry) !== options.materialType) ||
+        (options.level && organization(entry).level !== options.level) ||
+        (options.topic && organization(entry).topic !== options.topic) ||
+        (options.reviewState && organization(entry).state !== options.reviewState)
+      )
+        continue;
+      // Lists load only metadata. Full Markdown is read for explicit search/open or background reconciliation.
+      let result = publicEntry(entry);
+      if (query) {
+        const detail = await this.refreshEntry(base, entry);
+        if (!detail) continue;
+        result = detail.entry;
+        const body = detail.markdown.toLocaleLowerCase();
+        const metadata =
+          `${entry.title} ${organization(entry).topic} ${organization(entry).summary ?? ''} ${(organization(entry).tags ?? []).join(' ')}`.toLocaleLowerCase();
+        const match = body.indexOf(query);
+        const positions = terms.map((term) => body.indexOf(term));
+        const bodyMatches = positions.filter((position) => position >= 0).length;
+        const metadataMatches = terms.filter((term) => metadata.includes(term)).length;
+        if (match < 0 && !metadata.includes(query) && !bodyMatches && !metadataMatches) continue;
+        relevance.set(
+          entry.id,
+          (metadata.includes(query) ? 20 : 0) +
+            (match >= 0 ? 10 : 0) +
+            metadataMatches * 2 +
+            bodyMatches
+        );
+        const firstMatch =
+          match >= 0
+            ? match
+            : (positions.filter((position) => position >= 0).sort((a, b) => a - b)[0] ?? 0);
+        result.snippet = detail.markdown.slice(
+          Math.max(0, firstMatch - 60),
+          Math.max(0, firstMatch - 60) + 280
+        );
       }
-      results.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id));
-      const offset = Number.isFinite(options.offset) ? Math.max(0, Math.floor(options.offset!)) : 0;
-      const limit = Number.isFinite(options.limit) ? Math.max(1, Math.floor(options.limit!)) : 50;
-      return { entries: results.slice(offset, offset + limit), total: results.length };
+      results.push(result);
+    }
+    results.sort(
+      (a, b) =>
+        (relevance.get(b.id) ?? 0) - (relevance.get(a.id) ?? 0) ||
+        b.updatedAt.localeCompare(a.updatedAt) ||
+        a.id.localeCompare(b.id)
+    );
+    const offset = Number.isFinite(options.offset) ? Math.max(0, Math.floor(options.offset!)) : 0;
+    const limit = Number.isFinite(options.limit) ? Math.max(1, Math.floor(options.limit!)) : 50;
+    return { entries: results.slice(offset, offset + limit), total: results.length };
+  }
+
+  /** One consistent directory read for the browser's list, facets and progress. */
+  async catalog(owner: KnowledgeOwner, options: KnowledgeListOptions = {}) {
+    return this.exclusive(owner, async (base) => {
+      const state = await this.state(base);
+      return {
+        ...(await this.listFromState(base, state, options)),
+        status: this.summarize(state),
+        overview: this.overviewFromEntries(state.entries),
+      };
     });
   }
 
@@ -842,6 +889,11 @@ export class KnowledgeLibrary {
           unsupported: state.entries.filter((entry) => entry.parseStatus === 'unsupported').length,
         },
         summary: {
+          archivedOnly: state.entries.filter(
+            (entry) =>
+              entry.summaryDisposition === 'archive_only' &&
+              entry.summaryContentHash === entry.contentHash
+          ).length,
           pending: state.entries.filter(
             (entry) =>
               (canSummarize(entry) &&
@@ -884,13 +936,17 @@ export class KnowledgeLibrary {
   }
 
   async overview(owner: KnowledgeOwner): Promise<KnowledgeOverview> {
+    return this.overviewFromEntries(await this.snapshot(owner));
+  }
+
+  private overviewFromEntries(entries: KnowledgeEntry[]): KnowledgeOverview {
     const result: KnowledgeOverview = {
       topics: [],
       counts: { source: 0, summary: 0, knowledge: 0 },
       materials: { conversation: 0, document: 0, image: 0, file: 0, note: 0 },
     };
     const topics = new Map<string, number>();
-    for (const entry of await this.snapshot(owner)) {
+    for (const entry of entries) {
       if (entry.historical) continue;
       const group = organization(entry);
       result.counts[group.level]++;
@@ -1061,14 +1117,15 @@ export class KnowledgeLibrary {
     owner: KnowledgeOwner,
     id: string,
     hash: string,
-    message: string
+    message: string,
+    minimumRetryMs = 0
   ): Promise<void> {
     await this.exclusive(owner, async (base) => {
       const entry = await this.metadata(base, id);
       if (!entry || !(await this.refreshEntry(base, entry)) || entry.contentHash !== hash) return;
       entry.summaryMessage = message;
       entry.summaryAttempts = (entry.summaryAttempts ?? 0) + 1;
-      entry.summaryRetryAt = retryDate(entry.summaryAttempts);
+      entry.summaryRetryAt = retryDate(entry.summaryAttempts, minimumRetryMs);
       await this.save(base, entry);
     });
   }
@@ -1104,13 +1161,20 @@ export class KnowledgeLibrary {
     );
   }
 
-  async markSummarized(owner: KnowledgeOwner, id: string, contentHash: string): Promise<boolean> {
+  async markSummarized(
+    owner: KnowledgeOwner,
+    id: string,
+    contentHash: string,
+    result?: { disposition: 'summarized' | 'archive_only'; reason?: string }
+  ): Promise<boolean> {
     return this.exclusive(owner, async (base) => {
       if ((await this.deletedEntries(base)).some((item) => item.id === id)) return false;
       const entry = await this.metadata(base, id);
       if (!entry || !(await this.refreshEntry(base, entry)) || entry.contentHash !== contentHash)
         return false;
       entry.summaryContentHash = contentHash;
+      entry.summaryDisposition = result?.disposition ?? 'summarized';
+      entry.summaryReason = result?.reason;
       entry.summaryMessage = undefined;
       entry.summaryRetryAt = undefined;
       entry.summaryAttempts = undefined;
@@ -1338,6 +1402,19 @@ export class KnowledgeLibrary {
 
   private validAttachmentPath(id: string, attachmentId: string, path: string): boolean {
     return new RegExp(`^assets/${id}/${attachmentId}(?:\\.[a-zA-Z0-9]{1,16})?$`).test(path);
+  }
+
+  async openMarkdown(
+    owner: KnowledgeOwner,
+    id: string
+  ): Promise<{ title: string; body: ReadStream; size: number } | null> {
+    return this.exclusive(owner, async (base) => {
+      if ((await this.deletedEntries(base)).some((item) => item.id === id)) return null;
+      const entry = await this.metadata(base, id);
+      if (!entry) return null;
+      const result = await this.readStream(base, entry.relativePath);
+      return result ? { title: entry.title, ...result } : null;
+    });
   }
 
   async openAttachment(

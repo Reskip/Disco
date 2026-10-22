@@ -62,8 +62,8 @@ export function canSummarize(entry: KnowledgeEntry): boolean {
   );
 }
 
-export function retryDate(attempts: number): string {
+export function retryDate(attempts: number, minimumMs = 0): string {
   return new Date(
-    Date.now() + Math.min(30 * 60_000, 30_000 * 2 ** Math.min(attempts - 1, 6))
+    Date.now() + Math.max(minimumMs, Math.min(30 * 60_000, 30_000 * 2 ** Math.min(attempts - 1, 6)))
   ).toISOString();
 }

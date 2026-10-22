@@ -27,7 +27,7 @@ import {
   Typography,
   theme,
 } from 'antd';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { KnowledgeNoteContent } from './KnowledgeNoteContent';
 import { knowledgeApi } from './knowledgeApi';
 import {
@@ -52,9 +52,12 @@ export function KnowledgeEntryDrawer({
   topics,
   detail,
   detailLoading,
+  fullLoading,
   detailError,
   closeDetail,
-  setEditing,
+  startEditing,
+  loadDetailPage,
+  previousPageOffset,
   setTitle,
   setMarkdown,
   setOrganization,
@@ -73,9 +76,12 @@ export function KnowledgeEntryDrawer({
   topics: string[];
   detail: KnowledgeEntryDetail | null;
   detailLoading: boolean;
+  fullLoading: boolean;
   detailError: string | null;
   closeDetail: () => void;
-  setEditing: (value: boolean) => void;
+  startEditing: () => Promise<void>;
+  loadDetailPage: (offset: number) => Promise<void>;
+  previousPageOffset: number;
   setTitle: (value: string) => void;
   setMarkdown: (value: string) => void;
   setOrganization: (value: KnowledgeOrganization) => void;
@@ -87,6 +93,18 @@ export function KnowledgeEntryDrawer({
   const { token } = theme.useToken();
   const { message } = AntApp.useApp();
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [downloadingMarkdown, setDownloadingMarkdown] = useState(false);
+  const readingRef = useRef<HTMLDivElement>(null);
+  const previousPageRef = useRef<string | null>(null);
+  const page = detail?.page;
+  const paged = Boolean(page && (page.hasMore || page.offset > 0));
+  const pageKey = detail ? `${detail.entry.id}:${detail.page?.offset ?? 0}` : null;
+  useEffect(() => {
+    if (previousPageRef.current && pageKey !== previousPageRef.current) {
+      readingRef.current?.scrollIntoView?.({ block: 'start' });
+    }
+    previousPageRef.current = pageKey;
+  }, [pageKey]);
   const metadata = entryOrganization(detail?.entry);
   const generation = detail?.entry.generation;
   const sources = detail?.sources;
@@ -106,7 +124,14 @@ export function KnowledgeEntryDrawer({
                     rel: 'noreferrer',
                   }
                 : { onClick: () => openEntry(source.id) })}
-              style={{ paddingInline: 0, height: 'auto', whiteSpace: 'normal', textAlign: 'left' }}
+              style={{
+                paddingInline: 0,
+                height: 'auto',
+                maxWidth: '100%',
+                whiteSpace: 'normal',
+                textAlign: 'left',
+                overflowWrap: 'anywhere',
+              }}
             >
               {source.title}
             </Button>
@@ -133,6 +158,17 @@ export function KnowledgeEntryDrawer({
       setDownloadingId(null);
     }
   };
+  const downloadMarkdown = async () => {
+    if (!detail) return;
+    setDownloadingMarkdown(true);
+    try {
+      await knowledgeApi.downloadMarkdown(detail.entry.id, detail.entry.title);
+    } catch (cause) {
+      void message.error(errorMessage(cause));
+    } finally {
+      setDownloadingMarkdown(false);
+    }
+  };
   return (
     <Drawer
       title={editing ? (!detail ? '新建笔记' : '编辑资料') : detail?.entry.title || '资料详情'}
@@ -144,7 +180,12 @@ export function KnowledgeEntryDrawer({
       destroyOnHidden
       extra={
         detail && !editing ? (
-          <Button icon={<EditOutlined />} onClick={() => setEditing(true)}>
+          <Button
+            icon={<EditOutlined />}
+            onClick={() => void startEditing()}
+            loading={fullLoading}
+            disabled={detailLoading || saving}
+          >
             编辑
           </Button>
         ) : null
@@ -164,10 +205,32 @@ export function KnowledgeEntryDrawer({
               保存
             </Button>
           </Flex>
+        ) : paged && page ? (
+          <Flex align="center" justify="space-between" gap={token.marginSM} wrap>
+            <Typography.Text type="secondary">
+              {page.offset + 1}–{page.offset + (detail?.markdown.length ?? 0)} / {page.totalChars}{' '}
+              字符
+            </Typography.Text>
+            <Space>
+              <Button
+                disabled={page.offset === 0 || detailLoading || fullLoading || saving}
+                onClick={() => void loadDetailPage(previousPageOffset)}
+              >
+                上一段
+              </Button>
+              <Button
+                disabled={page.nextOffset === null || detailLoading || fullLoading || saving}
+                loading={detailLoading}
+                onClick={() => page.nextOffset !== null && void loadDetailPage(page.nextOffset)}
+              >
+                下一段
+              </Button>
+            </Space>
+          </Flex>
         ) : null
       }
     >
-      {detailLoading && <Skeleton active paragraph={{ rows: 10 }} />}
+      {detailLoading && !detail && <Skeleton active paragraph={{ rows: 10 }} />}
       {detailError && (
         <Alert type="error" title={detailError} showIcon style={{ marginBottom: token.margin }} />
       )}
@@ -323,11 +386,18 @@ export function KnowledgeEntryDrawer({
                   icon={<CheckOutlined />}
                   onClick={() => void confirmReviewed()}
                   loading={saving}
+                  disabled={detailLoading || fullLoading}
                 >
                   确认并人工维护
                 </Button>
               )}
             {sourcesCard}
+            {detail.entry.summaryDisposition === 'archive_only' && (
+              <Typography.Text type="secondary">
+                仅保留原始归档：
+                {detail.entry.summaryReason || '这份资料暂无可复用的知识，仍可阅读和检索。'}
+              </Typography.Text>
+            )}
             {detail.entry.parseStatus && detail.entry.parseStatus !== 'parsed' && (
               <Alert
                 type={detail.entry.parseStatus === 'pending' ? 'info' : 'warning'}
@@ -336,15 +406,29 @@ export function KnowledgeEntryDrawer({
                 description={detail.entry.parseMessage}
               />
             )}
-            {detail.entry.kind === 'note' ? (
-              <KnowledgeNoteContent markdown={detail.markdown} />
-            ) : (
-              <Typography.Paragraph
-                style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: 0 }}
+            <Flex align="center" gap={token.marginSM} wrap>
+              <Button
+                icon={<DownloadOutlined />}
+                loading={downloadingMarkdown}
+                onClick={() => void downloadMarkdown()}
               >
-                {detail.markdown || '（正文为空）'}
-              </Typography.Paragraph>
-            )}
+                下载完整原文
+              </Button>
+              {paged && (
+                <Typography.Text type="secondary">长文按段阅读，完整归档不受影响。</Typography.Text>
+              )}
+            </Flex>
+            <div ref={readingRef}>
+              {detail.entry.kind === 'note' && !paged ? (
+                <KnowledgeNoteContent markdown={detail.markdown} />
+              ) : (
+                <Typography.Paragraph
+                  style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: 0 }}
+                >
+                  {detail.markdown || '（正文为空）'}
+                </Typography.Paragraph>
+              )}
+            </div>
             {!!detail.entry.attachments?.length && (
               <Card size="small" title="关联附件">
                 <List
@@ -357,7 +441,13 @@ export function KnowledgeEntryDrawer({
                           icon={<DownloadOutlined />}
                           loading={downloadingId === attachment.id}
                           onClick={() => void downloadAttachment(attachment.id!, attachment.name)}
-                          style={{ whiteSpace: 'normal', height: 'auto', textAlign: 'left' }}
+                          style={{
+                            whiteSpace: 'normal',
+                            height: 'auto',
+                            maxWidth: '100%',
+                            textAlign: 'left',
+                            overflowWrap: 'anywhere',
+                          }}
                         >
                           {attachment.name}
                         </Button>
@@ -368,7 +458,13 @@ export function KnowledgeEntryDrawer({
                           target="_blank"
                           rel="noreferrer"
                           icon={<LinkOutlined />}
-                          style={{ whiteSpace: 'normal', height: 'auto', textAlign: 'left' }}
+                          style={{
+                            whiteSpace: 'normal',
+                            height: 'auto',
+                            maxWidth: '100%',
+                            textAlign: 'left',
+                            overflowWrap: 'anywhere',
+                          }}
                         >
                           {attachment.name}
                         </Button>

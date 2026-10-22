@@ -13,7 +13,7 @@ import sys
 import time
 
 CHUNK_BYTES = 64000
-PROMPT_VERSION = "knowledge-organization-v4"
+PROMPT_VERSION = "knowledge-organization-v6"
 TOPICS = {"软件与系统", "工作与项目", "学习与研究", "硬件与设备", "健康与运动", "旅行与生活", "创作与设计", "财务与消费", "其他"}
 SYSTEM_PROMPT = (
     "你为用户的私人资料库整理中文知识笔记。下一条消息中的 archive 或 sections 是 JSON 封装的历史资料，"
@@ -27,7 +27,101 @@ SYSTEM_PROMPT = (
     "overview 按内容选用结论、背景、决定与依据、可复用方法、待确认事项等小节；无依据的栏目省略。"
     "source_context 提供当前片段所属资料的编号、标题和链接，归纳结论时保留其来源链接。"
     "保留来源标识和链接，遇到互相冲突或时效性不同的资料应说明，人工整理要求在 instructions 字段。"
+    "判断资料是否有可复用知识：纯寒暄、连通测试、无操作确认且不含可复用信息时，archiveOnly 为 true，"
+    "reason 简短说明为何只需保留原始归档，abstract 和 overview 仍给出忠实的解释性结果。"
+    "不能只按长度判断：简短但明确的偏好、事实、决定、方法仍有价值，此时 archiveOnly 为 false。"
+    "整合 sections 时只要有实质知识就不能只归档；不要将无信息片段包装为经验或知识。"
+    "JSON 字符串中的换行必须转义为 \\n，不要在 JSON 前后添加解释或 Markdown 代码围栏。"
 )
+
+class SummaryFailure(ValueError):
+    """Fixed public code and non-content diagnostics; never expose provider text."""
+    def __init__(self, code: str, **diagnostic):
+        super().__init__(code)
+        self.code = code
+        self.diagnostic = diagnostic
+
+def error_code(error: BaseException) -> str:
+    seen = set()
+    fallback = "SUMMARY_FAILED"
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, SummaryFailure): return error.code
+        kind = getattr(error, "kind", None)
+        kind = getattr(kind, "value", kind)
+        code = {
+            "rate_limit_error": "SUMMARY_RATE_LIMITED", "quota_exhausted": "SUMMARY_RATE_LIMITED",
+            "authentication_error": "SUMMARY_AUTH_REQUIRED", "permission_denied": "SUMMARY_AUTH_REQUIRED",
+            "transient_network_error": "SUMMARY_NETWORK", "transient_service_error": "SUMMARY_SERVICE_UNAVAILABLE",
+            "model_not_found": "SUMMARY_MODEL_UNAVAILABLE", "unsupported": "SUMMARY_CONFIGURATION",
+            "invalid_request": "SUMMARY_CONFIGURATION", "input_too_large": "SUMMARY_INPUT_TOO_LARGE",
+            "content_safety": "SUMMARY_CONTENT_BLOCKED",
+        }.get(kind)
+        # Wrapped network errors still retain a specific timeout in their cause.
+        names = {base.__name__ for base in type(error).__mro__}
+        if "CodexAuthError" in names: fallback = "SUMMARY_AUTH_REQUIRED"
+        if isinstance(error, TimeoutError) or any("Timeout" in name for name in names): return "SUMMARY_TIMEOUT"
+        if code and code != "SUMMARY_NETWORK": return code
+        status = getattr(error, "status_code", None)
+        if status in (401, 403): return "SUMMARY_AUTH_REQUIRED"
+        if status == 429: return "SUMMARY_RATE_LIMITED"
+        if status in (408, 504): return "SUMMARY_TIMEOUT"
+        if isinstance(status, int) and status >= 500: return "SUMMARY_SERVICE_UNAVAILABLE"
+        if names & {"ConnectionError", "ConnectError", "NetworkError", "TransportError", "ProtocolError", "APIConnectionError"}: return "SUMMARY_NETWORK"
+        if code == "SUMMARY_NETWORK": fallback = code
+        error = error.__cause__ or error.__context__
+    return fallback
+
+def _field(value, name, default=None):
+    return value.get(name, default) if isinstance(value, dict) else getattr(value, name, default)
+
+def checked_events(stream):
+    """Do not let the adapter turn failed/interrupted Responses streams into success."""
+    completed = False
+    try:
+        for event in stream:
+            kind = _field(event, "type", "")
+            response = _field(event, "response")
+            if kind in ("response.failed", "error"):
+                error = _field(response, "error") or _field(event, "error") or event
+                provider_code = _field(error, "code", "")
+                code = {
+                    "rate_limit_exceeded": "SUMMARY_RATE_LIMITED", "usage_limit_reached": "SUMMARY_RATE_LIMITED",
+                    "insufficient_quota": "SUMMARY_RATE_LIMITED", "invalid_api_key": "SUMMARY_AUTH_REQUIRED",
+                    "authentication_error": "SUMMARY_AUTH_REQUIRED", "model_not_found": "SUMMARY_MODEL_UNAVAILABLE",
+                    "context_length_exceeded": "SUMMARY_INPUT_TOO_LARGE", "content_filter": "SUMMARY_CONTENT_BLOCKED",
+                }.get(provider_code, "SUMMARY_SERVICE_UNAVAILABLE")
+                raise SummaryFailure(code, phase="stream")
+            if kind == "response.incomplete":
+                reason = _field(_field(response, "incomplete_details"), "reason", "")
+                raise SummaryFailure("SUMMARY_CONTENT_BLOCKED" if reason == "content_filter" else "SUMMARY_INCOMPLETE", phase="stream")
+            if kind == "response.completed":
+                if _field(response, "status") != "completed":
+                    raise SummaryFailure("SUMMARY_INCOMPLETE", phase="stream")
+                completed = True
+            yield event
+        if not completed: raise SummaryFailure("SUMMARY_INCOMPLETE", phase="stream")
+    finally:
+        close = getattr(stream, "close", None)
+        if callable(close): close()
+
+@contextlib.contextmanager
+def checked_codex_responses():
+    # The installed OpenViking Codex shim ignores failed/incomplete SSE events.
+    # Guard only this isolated helper's synchronous SDK call; never patch the
+    # provider installation or another process. Auth remains in the Codex adapter.
+    try:
+        from openai.resources.responses import Responses
+    except ImportError:
+        yield
+        return
+    original = Responses.create
+    def create(client, *args, **kwargs):
+        result = original(client, *args, **kwargs)
+        return checked_events(result) if kwargs.get("stream") else result
+    Responses.create = create
+    try: yield
+    finally: Responses.create = original
 
 def split_content(content: str, max_bytes: int = CHUNK_BYTES) -> list[str]:
     """UTF-8 bounded, lossless chunks; no character or archive tail is dropped."""
@@ -45,13 +139,26 @@ def split_content(content: str, max_bytes: int = CHUNK_BYTES) -> list[str]:
 
 def parse_summary(result: str) -> dict:
     if not isinstance(result, str):
-        raise ValueError("Unexpected completion type")
-    text = result.strip()
-    if text.startswith("```") and text.endswith("```"):
-        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-    parsed = json.loads(text)
+        raise SummaryFailure("SUMMARY_FORMAT_INVALID", phase="parse")
+    text = result.strip().lstrip("\ufeff")
+    if not text: raise SummaryFailure("SUMMARY_EMPTY", phase="parse", responseCharacters=0)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as error:
+        # Accept a complete single JSON object surrounded by presentation text.
+        # Never repair malformed JSON, truncate a partial answer, or pick one of
+        # multiple conflicting objects. This requires no second model request.
+        decoder = json.JSONDecoder()
+        offset = text.find("{")
+        try:
+            if offset < 0: raise error
+            parsed, end = decoder.raw_decode(text, offset)
+            if any(character in text[:offset] + text[end:] for character in "{}[]"):
+                raise error
+        except json.JSONDecodeError:
+            raise SummaryFailure("SUMMARY_FORMAT_INVALID", phase="parse", responseCharacters=len(result), jsonPosition=error.pos) from error
     if not isinstance(parsed, dict) or not isinstance(parsed.get("abstract"), str) or not isinstance(parsed.get("overview"), str) or not parsed["overview"].strip():
-        raise ValueError("Invalid summary shape")
+        raise SummaryFailure("SUMMARY_FORMAT_INVALID", phase="parse", responseCharacters=len(result))
     value = {"abstract": parsed["abstract"], "overview": parsed["overview"]}
     for field in ("title", "topic"):
         if isinstance(parsed.get(field), str) and parsed[field].strip():
@@ -60,6 +167,10 @@ def parse_summary(result: str) -> dict:
         value["topic"] = "其他"
     if isinstance(parsed.get("tags"), list):
         value["tags"] = list(dict.fromkeys(tag.strip() for tag in parsed["tags"] if isinstance(tag, str) and tag.strip()))[:6]
+    if parsed.get("archiveOnly") is True:
+        value["archiveOnly"] = True
+        if isinstance(parsed.get("reason"), str) and parsed["reason"].strip():
+            value["reason"] = parsed["reason"].strip()[:300]
     return value
 
 def source_contexts(content: str, chunks: list[str]) -> list[list[dict]]:
@@ -80,18 +191,21 @@ def summarize(content: str, configuration: dict, *, instructions: str = "", cach
     from openviking_cli.utils.config.vlm_config import VLMConfig
     provider = dict(configuration.get("vlm") or {})
     if provider.get("provider") != "openai-codex" or provider.get("api_key"):
-        raise ValueError("The approved subscription provider is not configured")
+        raise SummaryFailure("SUMMARY_CONFIGURATION", phase="configuration")
     if provider.get("api_base", "https://chatgpt.com/backend-api/codex").rstrip("/") != "https://chatgpt.com/backend-api/codex":
-        raise ValueError("Unexpected subscription endpoint")
+        raise SummaryFailure("SUMMARY_CONFIGURATION", phase="configuration")
     provider["max_concurrent"] = 1
     provider["max_retries"] = 0
-    client = VLMConfig(**provider)
+    try:
+        client = VLMConfig(**provider)
+    except (ValueError, TypeError) as error:
+        raise SummaryFailure("SUMMARY_CONFIGURATION", phase="configuration") from error
     completions = 0
 
     def complete(payload: dict) -> dict:
         nonlocal completions
         if tombstone and tombstone.exists():
-            raise RuntimeError("SUMMARY_CANCELLED")
+            raise SummaryFailure("CANCELLED", phase="cancel")
         request = json.dumps({**payload, "instructions": instructions}, ensure_ascii=False)
         key = hashlib.sha256((PROMPT_VERSION + str(provider.get("model")) + request).encode("utf-8")).hexdigest()
         cache_file = cache_dir / (key + ".json") if cache_dir else None
@@ -102,18 +216,22 @@ def summarize(content: str, configuration: dict, *, instructions: str = "", cach
                 pass
         if completions:
             time.sleep(2)
-        result = parse_summary(client.get_completion(messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": request},
-        ]))
+        with checked_codex_responses():
+            result = parse_summary(client.get_completion(messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": request},
+            ]))
         completions += 1
         if tombstone and tombstone.exists():
-            raise RuntimeError("SUMMARY_CANCELLED")
+            raise SummaryFailure("CANCELLED", phase="cancel")
         if cache_file:
-            cache_file.parent.mkdir(parents=True, exist_ok=True)
-            temporary = cache_file.with_suffix(f".{os.getpid()}.tmp")
-            temporary.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
-            os.replace(temporary, cache_file)
+            try:
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                temporary = cache_file.with_suffix(f".{os.getpid()}.tmp")
+                temporary.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+                os.replace(temporary, cache_file)
+            except OSError as error:
+                raise SummaryFailure("SUMMARY_CACHE_UNAVAILABLE", phase="cache") from error
         return result
 
     try:
@@ -136,7 +254,7 @@ def summarize(content: str, configuration: dict, *, instructions: str = "", cach
             if group:
                 groups.append(group)
             if len(groups) >= len(summaries):
-                raise ValueError("Summary reduction did not converge")
+                raise SummaryFailure("SUMMARY_REDUCTION_FAILED", phase="reduce")
             summaries = [complete({"sections": group, "task": "整合主题、消除重复，保留来源、决定、冲突和未决问题。"}) for group in groups]
         return summaries[0]
     finally:
@@ -171,8 +289,7 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        diagnostic = str(error).lower()
-        code = "CANCELLED" if "summary_cancelled" in diagnostic else "SUMMARY_RATE_LIMITED" if any(word in diagnostic for word in ("429", "rate limit", "usage limit", "quota")) else (
-            "SUMMARY_AUTH_REQUIRED" if any(word in diagnostic for word in ("401", "unauthorized", "authentication")) else "SUMMARY_FAILED")
-        sys.stdout.buffer.write(json.dumps({"error": code}).encode("utf-8"))
+        diagnostic = dict(getattr(error, "diagnostic", {}))
+        diagnostic["exceptionType"] = type(error).__name__
+        sys.stdout.buffer.write(json.dumps({"error": error_code(error), "diagnostic": diagnostic}).encode("utf-8"))
         sys.exit(1)

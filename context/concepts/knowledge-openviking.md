@@ -56,6 +56,12 @@ Each entry owns a separate directory with `content.md` followed by numbered
 inactive using `vectors_only`; OpenViking's DELETE would otherwise invoke a
 semantic refresh. Search requires `disco_index=active`, maps chunks to the entry
 ID, and reads current matching content instead of a potentially stale summary.
+Up to four retrieval rounds exclude already represented entry tags so one long
+document's chunks cannot consume the entire result set. All rounds share one
+request deadline. Owner-scoped keyword retrieval runs alongside semantic search;
+rank fusion combines unique documents. Semantic excerpts must occur verbatim in
+the current original, and keyword excerpts are chosen around matched terms.
+Returned match offsets and content hashes let readers verify the source passage.
 
 The separate `scripts/knowledge-summarize.py` process calls the configured Codex
 subscription provider without tools. Small sources use one completion; large
@@ -66,6 +72,20 @@ that begin midway through a document, preserving source IDs and links. Prompts
 extract conclusions, decisions, reusable methods and unresolved conflicts instead
 of rewriting the transcript in chronological order. Input is never truncated,
 and original library files are never written by the helper.
+Prompt version v6 permits an explicit `archiveOnly` decision for greeting-only,
+connection-test or no-action records without reusable information. Short but
+substantive preferences or decisions remain eligible. Automatic organization
+records the disposition without producing a knowledge note; explicit synthesis
+still receives a truthful explanatory summary.
+
+The helper guards the installed Codex adapter's synchronous Responses stream:
+failed/incomplete or missing completion events cannot become partial successes.
+It accepts a complete JSON object inside a presentation wrapper, but never
+repairs malformed/truncated JSON or selects one of several conflicting objects.
+Fixed failure codes distinguish formatting, interruption, timeout, connectivity,
+authentication, quota, model/configuration and local cache errors. Logs include
+only bounded structural diagnostics, never response bodies or credentials.
+The provider supplies minimum retry delays appropriate to those categories.
 
 Intermediate results are resumable under the protected operator configuration
 directory's `summary-work/<owner-account-hash>/<entry-id>/`, keyed by content,

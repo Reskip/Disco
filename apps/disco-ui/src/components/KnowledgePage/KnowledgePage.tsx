@@ -51,6 +51,18 @@ import {
   SOURCE_LABELS,
 } from './knowledgePresentation';
 
+function boundedReadingDetail(value: KnowledgeEntryDetail): KnowledgeEntryDetail {
+  if (value.markdown.length <= 40_000 || value.page) return value;
+  // Mutation responses contain the full saved document. Keep reading just as
+  // bounded as a normal paginated request, including after an edit or review.
+  const boundary = /[\uD800-\uDBFF]/u.test(value.markdown[39_999]) ? 39_999 : 40_000;
+  return {
+    ...value,
+    markdown: value.markdown.slice(0, boundary),
+    page: { offset: 0, totalChars: value.markdown.length, nextOffset: boundary, hasMore: true },
+  };
+}
+
 export function KnowledgePage({
   mobile = false,
   entryId,
@@ -89,6 +101,7 @@ export function KnowledgePage({
   const [creating, setCreating] = useState(false);
   const [detail, setDetail] = useState<KnowledgeEntryDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [fullLoading, setFullLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState('');
@@ -101,8 +114,9 @@ export function KnowledgePage({
   const [saving, setSaving] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const detailRequestRef = useRef(0);
+  const previousPageOffsetsRef = useRef(new Map<number, number>());
   const editingRef = useRef(editing);
-  editingRef.current = editing;
+  editingRef.current = editing || fullLoading;
   const dirty =
     editing &&
     (!detail
@@ -145,24 +159,25 @@ export function KnowledgePage({
             }),
         ...(topic !== 'all' ? { topic } : {}),
       };
-      const [listResult, statusResult, overviewResult] = await Promise.allSettled([
-        knowledgeApi.list(query, source, offset, controller.signal, filters),
-        knowledgeApi.status(controller.signal),
-        knowledgeApi.overview(controller.signal),
-      ]);
-      if (controller.signal.aborted) return;
-      if (listResult.status === 'fulfilled') {
-        setResult(listResult.value);
+      try {
+        const catalog = await knowledgeApi.catalog(
+          query,
+          source,
+          offset,
+          controller.signal,
+          filters
+        );
+        if (controller.signal.aborted) return;
+        setResult({ entries: catalog.entries, total: catalog.total });
+        setStatus(catalog.status);
+        setOverview(catalog.overview);
         setError(null);
-      } else {
-        setError(errorMessage(listResult.reason));
+      } catch (cause) {
+        if (!controller.signal.aborted) setError(errorMessage(cause));
+      } finally {
+        if (!controller.signal.aborted) setLoading(false);
+        pending = false;
       }
-      if (statusResult.status === 'fulfilled') setStatus(statusResult.value);
-      else if (listResult.status === 'fulfilled')
-        setError('资料已加载，暂时无法获取后台同步状态。');
-      if (overviewResult.status === 'fulfilled') setOverview(overviewResult.value);
-      setLoading(false);
-      pending = false;
     };
     setLoading(true);
     void refresh();
@@ -182,11 +197,13 @@ export function KnowledgePage({
     if (!selectedId) return;
     const controller = new AbortController();
     const requestId = ++detailRequestRef.current;
+    previousPageOffsetsRef.current.clear();
     setDetail(null);
     setDetailLoading(true);
     setDetailError(null);
     setEditing(false);
-    void knowledgeApi.detail(selectedId, controller.signal).then(
+    setFullLoading(false);
+    void knowledgeApi.detail(selectedId, controller.signal, { offset: 0, limit: 40_000 }).then(
       (value) => {
         if (controller.signal.aborted || requestId !== detailRequestRef.current) return;
         setDetail(value);
@@ -218,7 +235,10 @@ export function KnowledgePage({
       if (pending || editingRef.current || document.visibilityState === 'hidden') return;
       pending = true;
       try {
-        const value = await knowledgeApi.detail(generatingId, controller.signal);
+        const value = await knowledgeApi.detail(generatingId, controller.signal, {
+          offset: 0,
+          limit: 40_000,
+        });
         if (controller.signal.aborted || editingRef.current) return;
         setDetail(value);
         setTitle(value.entry.title);
@@ -246,6 +266,7 @@ export function KnowledgePage({
       setSelectedId(null);
       setCreating(false);
       setEditing(false);
+      setFullLoading(false);
       setDetail(null);
       setDetailError(null);
     };
@@ -260,8 +281,59 @@ export function KnowledgePage({
     } else close();
   }, [dirty, modal, saving]);
 
+  const startEditing = async () => {
+    if (!detail || fullLoading || detailLoading) return;
+    const requestId = ++detailRequestRef.current;
+    editingRef.current = true;
+    setFullLoading(true);
+    setDetailError(null);
+    try {
+      const complete = await knowledgeApi.detail(detail.entry.id);
+      if (requestId !== detailRequestRef.current) return;
+      if (complete.page?.hasMore || (complete.page?.offset ?? 0) > 0) {
+        throw new Error('未能加载完整原文，暂时无法编辑。请重试或下载完整原文。');
+      }
+      setDetail(complete);
+      setTitle(complete.entry.title);
+      setMarkdown(complete.markdown);
+      setOrganization(entryOrganization(complete.entry));
+      setEditing(true);
+    } catch (cause) {
+      if (requestId === detailRequestRef.current) setDetailError(errorMessage(cause));
+    } finally {
+      if (requestId === detailRequestRef.current) setFullLoading(false);
+    }
+  };
+
+  const loadDetailPage = async (pageOffset: number) => {
+    if (!detail || detailLoading || fullLoading) return;
+    const requestId = ++detailRequestRef.current;
+    setDetailLoading(true);
+    setDetailError(null);
+    try {
+      const value = await knowledgeApi.detail(detail.entry.id, undefined, {
+        offset: pageOffset,
+        limit: 40_000,
+        contentHash: detail.contentHash,
+      });
+      if (requestId !== detailRequestRef.current) return;
+      if (value.page && value.page.offset > (detail.page?.offset ?? 0)) {
+        previousPageOffsetsRef.current.set(value.page.offset, detail.page?.offset ?? 0);
+      }
+      setDetail(value);
+    } catch (cause) {
+      if (requestId === detailRequestRef.current) setDetailError(errorMessage(cause));
+    } finally {
+      if (requestId === detailRequestRef.current) setDetailLoading(false);
+    }
+  };
+
   const save = async () => {
     if (!title.trim() || saving || (!creating && !detail)) return;
+    if (detail?.page?.hasMore || (detail?.page?.offset ?? 0) > 0) {
+      setDetailError('原文尚未完整加载，无法保存。请重新打开编辑。');
+      return;
+    }
     setSaving(true);
     setDetailError(null);
     try {
@@ -275,7 +347,7 @@ export function KnowledgePage({
             detail!.entry.updatedAt,
             metadata
           );
-      setDetail(saved);
+      setDetail(boundedReadingDetail(saved));
       setTitle(saved.entry.title);
       setMarkdown(saved.markdown);
       setOrganization(entryOrganization(saved.entry));
@@ -336,18 +408,25 @@ export function KnowledgePage({
   };
 
   const confirmReviewed = async () => {
-    if (!detail || saving) return;
+    if (!detail || saving || detailLoading || fullLoading) return;
     setSaving(true);
     setDetailError(null);
     try {
+      const complete = await knowledgeApi.detail(detail.entry.id);
+      if (complete.page?.hasMore || (complete.page?.offset ?? 0) > 0) {
+        throw new Error('未能加载完整原文，暂时无法确认。请重试。');
+      }
+      if (complete.contentHash !== detail.contentHash) {
+        throw new Error('这份资料已有新修改，请重新打开并阅读最新内容后再确认。');
+      }
       const saved = await knowledgeApi.save(
-        detail.entry.id,
-        detail.entry.title,
-        detail.markdown,
-        detail.entry.updatedAt,
-        { ...entryOrganization(detail.entry), state: 'reviewed' }
+        complete.entry.id,
+        complete.entry.title,
+        complete.markdown,
+        complete.entry.updatedAt,
+        { ...entryOrganization(complete.entry), state: 'reviewed' }
       );
-      setDetail(saved);
+      setDetail(boundedReadingDetail(saved));
       setOrganization(entryOrganization(saved.entry));
       setRevision((value) => value + 1);
       void message.success('已确认，由你维护，自动整理不会覆盖');
@@ -476,7 +555,7 @@ export function KnowledgePage({
             原始资料保留出处，摘要提取要点，专题知识沉淀结论。人工修改的笔记始终由你维护。
           </Typography.Paragraph>
           <KnowledgeImportActions onChanged={() => setRevision((value) => value + 1)} />
-          {status && <KnowledgeProgress status={status} />}
+          {status && <KnowledgeProgress status={status} mobile={mobile} />}
           <Segmented
             block={mobile}
             aria-label="知识库视图"
@@ -762,7 +841,10 @@ export function KnowledgePage({
                               </Tag>
                             )}
                             <Tag color={entry.indexStatus === 'error' ? 'error' : undefined}>
-                              {INDEX_LABELS[entry.indexStatus]}
+                              {entry.indexStatus === 'indexed' &&
+                              (entry.parseStatus === 'unsupported' || entry.parseStatus === 'error')
+                                ? '仅文件信息可检索'
+                                : INDEX_LABELS[entry.indexStatus]}
                             </Tag>
                             {entry.parseStatus && entry.parseStatus !== 'parsed' && (
                               <Tag color={entry.parseStatus === 'error' ? 'warning' : undefined}>
@@ -809,9 +891,12 @@ export function KnowledgePage({
         topics={overview?.topics.map((item) => item.topic) ?? []}
         detail={detail}
         detailLoading={detailLoading}
+        fullLoading={fullLoading}
         detailError={detailError}
         closeDetail={closeDetail}
-        setEditing={setEditing}
+        startEditing={startEditing}
+        loadDetailPage={loadDetailPage}
+        previousPageOffset={previousPageOffsetsRef.current.get(detail?.page?.offset ?? 0) ?? 0}
         setTitle={setTitle}
         setMarkdown={setMarkdown}
         setOrganization={setOrganization}

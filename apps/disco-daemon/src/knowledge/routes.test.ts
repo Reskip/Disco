@@ -175,6 +175,51 @@ describe('knowledge routes over authenticated HTTP', () => {
     return (await response.json()) as KnowledgeEntryDetail;
   };
 
+  it('returns consistent catalog facets and lossless reading windows with complete downloads', async () => {
+    const markdown = '# 分段阅读\n' + '资料🙂与来源\n'.repeat(100);
+    const note = await create('分段阅读验证', markdown);
+    const catalog = await (
+      await request('/catalog?query=' + encodeURIComponent('分段阅读验证'))
+    ).json();
+    expect(catalog.entries.map((entry: { id: string }) => entry.id)).toEqual([note.entry.id]);
+    expect(catalog.total).toBe(1);
+    expect(catalog.status.total).toBeGreaterThanOrEqual(1);
+    expect(catalog.overview.counts.knowledge).toBeGreaterThanOrEqual(1);
+    const pieces: string[] = [];
+    let offset = 0;
+    while (true) {
+      const response = await request(
+        `/entries/${note.entry.id}?offset=${offset}&limit=29&contentHash=${note.contentHash}`
+      );
+      expect(response.status).toBe(200);
+      const page = (await response.json()) as KnowledgeEntryDetail;
+      expect(page.page?.totalChars).toBe(markdown.length);
+      expect(page.page?.offset).toBe(offset);
+      expect(page.markdown).not.toMatch(/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/);
+      pieces.push(page.markdown);
+      if (!page.page?.hasMore) break;
+      offset = page.page.nextOffset!;
+    }
+    expect(pieces.join('')).toBe(markdown);
+    const full = (await (
+      await request(`/entries/${note.entry.id}`)
+    ).json()) as KnowledgeEntryDetail;
+    expect(full.markdown).toBe(markdown);
+    expect(full.page).toBeUndefined();
+    const download = await request(`/entries/${note.entry.id}/markdown`);
+    expect(download.headers.get('content-disposition')).toContain('attachment;');
+    expect((await download.text()).replace(/^\uFEFF/, '')).toBe(markdown);
+    expect((await request(`/entries/${note.entry.id}/markdown`, {}, 'beta')).status).toBe(404);
+    await runtime.library.edit(owner, note.entry.id, '# 已更改');
+    expect(
+      (
+        await request(
+          `/entries/${note.entry.id}?offset=29&limit=29&contentHash=${note.contentHash}`
+        )
+      ).status
+    ).toBe(409);
+  });
+
   it('filters organized notes and preserves verified source links through editing', async () => {
     const source = await create('测试来源', '# 原始资料\n实际结论');
     const arranged = await request('/organize', {

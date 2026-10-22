@@ -1,4 +1,5 @@
 import type {
+  KnowledgeCatalogResult,
   KnowledgeEntry,
   KnowledgeEntryDetail,
   KnowledgeLibraryStatus,
@@ -30,7 +31,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   );
   if (!response.ok) {
     if (response.status === 409) {
-      throw new Error('这份资料已有新修改。请先保存好当前草稿，重新打开资料后再合并修改。');
+      throw new Error(
+        init?.method === 'PATCH'
+          ? '这份资料已有新修改。请先保存好当前草稿，重新打开资料后再合并修改。'
+          : '这份资料已有新修改，请重新打开后继续阅读。'
+      );
     }
     const body = await response.json().catch(() => null);
     throw new Error(
@@ -96,6 +101,20 @@ async function exportLibrary(): Promise<void> {
   }
 }
 
+type CatalogFilters = Pick<
+  KnowledgeListOptions,
+  'kind' | 'materialType' | 'level' | 'topic' | 'reviewState' | 'includeHistory'
+>;
+
+function listParams(query: string, source: string, offset: number, filters?: CatalogFilters) {
+  const params = new URLSearchParams({ query, offset: String(offset), limit: '20' });
+  if (source !== 'all') params.set('source', source);
+  for (const [key, value] of Object.entries(filters ?? {})) {
+    if (value) params.set(key, String(value));
+  }
+  return params;
+}
+
 export const knowledgeApi = {
   status: (signal?: AbortSignal) => request<KnowledgeLibraryStatus>('/status', { signal }),
   overview: (signal?: AbortSignal) => request<KnowledgeOverview>('/overview', { signal }),
@@ -104,20 +123,35 @@ export const knowledgeApi = {
     source: string,
     offset: number,
     signal?: AbortSignal,
-    filters?: Pick<
-      KnowledgeListOptions,
-      'kind' | 'materialType' | 'level' | 'topic' | 'reviewState' | 'includeHistory'
-    >
+    filters?: CatalogFilters
+  ) =>
+    request<KnowledgeListResult>(`/entries?${listParams(query, source, offset, filters)}`, {
+      signal,
+    }),
+  catalog: (
+    query: string,
+    source: string,
+    offset: number,
+    signal?: AbortSignal,
+    filters?: CatalogFilters
+  ) =>
+    request<KnowledgeCatalogResult>(`/catalog?${listParams(query, source, offset, filters)}`, {
+      signal,
+    }),
+  detail: (
+    id: string,
+    signal?: AbortSignal,
+    page?: { offset: number; limit: number; contentHash?: string }
   ) => {
-    const params = new URLSearchParams({ query, offset: String(offset), limit: '20' });
-    if (source !== 'all') params.set('source', source);
-    for (const [key, value] of Object.entries(filters ?? {})) {
-      if (value) params.set(key, String(value));
-    }
-    return request<KnowledgeListResult>(`/entries?${params}`, { signal });
+    const params = page
+      ? new URLSearchParams({ offset: String(page.offset), limit: String(page.limit) })
+      : null;
+    if (page?.contentHash) params?.set('contentHash', page.contentHash);
+    return request<KnowledgeEntryDetail>(
+      `/entries/${encodeURIComponent(id)}${params ? `?${params}` : ''}`,
+      { signal }
+    );
   },
-  detail: (id: string, signal?: AbortSignal) =>
-    request<KnowledgeEntryDetail>(`/entries/${encodeURIComponent(id)}`, { signal }),
   create: (title: string, markdown: string, organization?: KnowledgeEntry['organization']) =>
     request<KnowledgeEntryDetail>('/entries', {
       method: 'POST',
@@ -151,6 +185,8 @@ export const knowledgeApi = {
     return request<KnowledgeUploadResult>('/documents', { method: 'POST', body });
   },
   exportLibrary,
+  downloadMarkdown: (entryId: string, title: string) =>
+    download(`/entries/${encodeURIComponent(entryId)}/markdown`, `${title}.md`),
   downloadAttachment: (entryId: string, attachmentId: string, name: string) =>
     download(
       `/entries/${encodeURIComponent(entryId)}/attachments/${encodeURIComponent(attachmentId)}/content`,

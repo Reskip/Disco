@@ -71,6 +71,8 @@ export interface KnowledgeEntry {
   summaryMessage?: string;
   summaryAttempts?: number;
   summaryRetryAt?: string;
+  summaryDisposition?: 'summarized' | 'archive_only';
+  summaryReason?: string;
   /** Superseded import copies remain readable/exportable, outside the normal catalog. */
   historical?: boolean;
   sourceUpdatedAt?: string;
@@ -85,6 +87,8 @@ export interface KnowledgeEntry {
 }
 
 export interface KnowledgeEntryDetail {
+  /** Optional reading window. Omitted when returning the complete editable Markdown. */
+  page?: { offset: number; totalChars: number; nextOffset: number | null; hasMore: boolean };
   entry: KnowledgeEntry;
   markdown: string;
   /** Used to prevent an indexing job from marking a newer edit as indexed. */
@@ -133,6 +137,11 @@ export interface KnowledgeListResult {
   total: number;
 }
 
+export interface KnowledgeCatalogResult extends KnowledgeListResult {
+  status: KnowledgeLibraryStatus;
+  overview: KnowledgeOverview;
+}
+
 export interface KnowledgeOverview {
   topics: Array<{ topic: string; count: number }>;
   counts: Record<KnowledgeOrganization['level'], number>;
@@ -170,6 +179,7 @@ export interface KnowledgeLibraryStatus {
       pending: number;
       completed: number;
       failed: number;
+      archivedOnly?: number;
       active?: string;
       message?: string;
     };

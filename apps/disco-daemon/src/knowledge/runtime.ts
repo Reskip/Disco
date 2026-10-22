@@ -50,6 +50,14 @@ import {
 } from './openviking.js';
 import { canSummarize, organization, retryDate } from './organization.js';
 import {
+  fuseSearchRanks,
+  hasKeywordMatch,
+  KnowledgeKeywordIndex,
+  type KnowledgeMatch,
+  searchExcerpt,
+  verifiedSemanticPosition,
+} from './search.js';
+import {
   compareHostRolloutSource,
   discoConversationSource,
   type HostAttachmentReference,
@@ -82,7 +90,12 @@ export interface KnowledgeRuntimeConfig {
   documents?: { pythonExecutable?: string; scriptPath?: string };
 }
 export interface KnowledgeSearchResult {
-  results: Array<{ entry: KnowledgeEntry; excerpt: string; score?: number }>;
+  results: Array<{
+    entry: KnowledgeEntry;
+    excerpt: string;
+    score?: number;
+    match?: KnowledgeMatch;
+  }>;
   engine: 'openviking' | 'local';
 }
 
@@ -111,6 +124,7 @@ const ownerKey = (owner: KnowledgeOwner) => JSON.stringify([owner.tenantId, owne
 /** One local worker. All database work re-enters a short trusted tenant scope. */
 export class KnowledgeRuntime {
   readonly library: KnowledgeLibrary;
+  private readonly keywordIndex = new KnowledgeKeywordIndex();
   readonly engine?: OpenVikingClient;
   private timer?: ReturnType<typeof setTimeout>;
   private running?: Promise<void>;
@@ -217,14 +231,17 @@ export class KnowledgeRuntime {
     });
   }
 
-  async status(owner: KnowledgeOwner): Promise<KnowledgeLibraryStatus> {
+  async status(
+    owner: KnowledgeOwner,
+    snapshot?: KnowledgeLibraryStatus
+  ): Promise<KnowledgeLibraryStatus> {
     this.observe(owner);
     const sync = this.states.get(ownerKey(owner)) || {
       state: 'idle' as const,
       message: '等待后台同步',
     };
     const failures = this.sourceFailures.get(ownerKey(owner))?.size ?? 0;
-    const status = await this.library.status(owner);
+    const status = snapshot ?? (await this.library.status(owner));
     if (status.processing) {
       status.processing.index.active = this.activeIndex.get(ownerKey(owner));
       status.processing.summary.active = this.activeSummary.get(ownerKey(owner));
@@ -259,67 +276,81 @@ export class KnowledgeRuntime {
     const limit = Math.max(1, Math.min(20, input.limit ?? 8));
     if (!input.query.trim() || (input.entryIds && input.entryIds.length === 0))
       return { results: [], engine: 'local' };
-    if (this.engine) {
+    const allEntries = (await this.library.snapshot(owner)).filter((entry) => !entry.historical);
+    const selected = input.entryIds ? new Set(input.entryIds) : undefined;
+    const entries = allEntries.filter(
+      (entry) =>
+        (!selected || selected.has(entry.id)) && (!input.source || entry.source === input.source)
+    );
+    if (!entries.length) return { results: [], engine: 'local' };
+    const allowed = new Set(entries.map((entry) => entry.id));
+    const keywordWork = this.keywordIndex.search(
+      ownerKey(owner),
+      entries,
+      new Set(allEntries.map((entry) => entry.id)),
+      input.query,
+      (id) => this.library.get(owner, id),
+      40
+    );
+    const semanticWork = (async () => {
+      if (!this.engine) return [];
       try {
         const hits = await this.engine.search(owner, {
           query: input.query,
           limit: 40,
-          documentIds: input.entryIds,
+          // Apply source and explicit ID scopes before vector retrieval, so
+          // out-of-scope chunks cannot crowd out all relevant candidates.
+          documentIds: selected || input.source ? [...allowed] : undefined,
         });
-        const results: KnowledgeSearchResult['results'] = [];
-        for (const hit of hits) {
-          const detail = await this.library.get(owner, hit.id);
-          // Local deletion and latest human edits always outrank stale derived index copies.
-          if (
-            !detail ||
-            detail.entry.historical ||
-            (input.source && detail.entry.source !== input.source)
-          )
-            continue;
-          if (input.entryIds?.length && !input.entryIds.includes(hit.id)) continue;
-          results.push({
-            entry: detail.entry,
-            excerpt: excerpt(detail.markdown, input.query),
-            score: hit.score,
-          });
-          if (results.length >= limit) break;
-        }
         this.engineStates.set(ownerKey(owner), { status: 'ready' });
-        if (results.length) return { results, engine: 'openviking' };
+        return hits.filter((hit) => allowed.has(hit.id));
       } catch {
         this.engineStates.set(ownerKey(owner), {
           status: 'unavailable',
           message: '语义检索暂不可用，已使用本地文字检索',
         });
+        return [];
       }
+    })();
+    const [semantic, keyword] = await Promise.all([semanticWork, keywordWork]);
+    const semanticById = new Map(semantic.map((hit) => [hit.id, hit]));
+    const keywordIds = new Set(keyword.map((hit) => hit.id));
+    const candidates = new Map<string, KnowledgeSearchResult['results'][number]>();
+    const validSemantic = new Set<string>();
+    const validKeyword = new Set<string>();
+    for (const id of new Set([...semanticById.keys(), ...keywordIds])) {
+      const detail = await this.library.get(owner, id);
+      if (
+        !detail ||
+        detail.entry.historical ||
+        (input.source && detail.entry.source !== input.source)
+      )
+        continue;
+      const hit = semanticById.get(id);
+      const position = hit ? verifiedSemanticPosition(detail.markdown, hit.excerpt) : undefined;
+      const lexical = keywordIds.has(id) && hasKeywordMatch(detail, input.query);
+      // Stale or fabricated provider text never becomes a quoted source. A
+      // changed human note can still be returned by current keyword evidence.
+      if (position === undefined && !lexical) continue;
+      if (position !== undefined) validSemantic.add(id);
+      if (lexical) validKeyword.add(id);
+      candidates.set(id, {
+        entry: detail.entry,
+        ...searchExcerpt(
+          detail,
+          input.query,
+          position !== undefined ? (lexical ? 'hybrid' : 'semantic') : 'keyword',
+          position !== undefined ? { position, length: hit!.excerpt.length } : undefined
+        ),
+      });
     }
-    const entries: KnowledgeEntry[] = [];
-    if (input.entryIds) {
-      for (const id of input.entryIds) {
-        const detail = await this.library.get(owner, id);
-        if (
-          detail &&
-          (!input.source || detail.entry.source === input.source) &&
-          `${detail.entry.title}\n${detail.markdown}`
-            .toLocaleLowerCase()
-            .includes(input.query.toLocaleLowerCase())
-        )
-          entries.push(detail.entry);
-        if (entries.length >= limit) break;
-      }
-    } else {
-      entries.push(
-        ...(await this.library.list(owner, { query: input.query, source: input.source, limit }))
-          .entries
-      );
-    }
-    const results = [];
-    for (const entry of entries) {
-      const detail = await this.library.get(owner, entry.id);
-      if (detail)
-        results.push({ entry: detail.entry, excerpt: excerpt(detail.markdown, input.query) });
-    }
-    return { results, engine: 'local' };
+    const results = fuseSearchRanks(
+      semantic.map((hit) => hit.id).filter((id) => validSemantic.has(id)),
+      keyword.map((hit) => hit.id).filter((id) => validKeyword.has(id))
+    )
+      .slice(0, limit)
+      .map(({ id, score }) => ({ ...candidates.get(id)!, score }));
+    return { results, engine: validSemantic.size ? 'openviking' : 'local' };
   }
 
   async remove(owner: KnowledgeOwner, id: string): Promise<boolean> {
@@ -506,13 +537,36 @@ export class KnowledgeRuntime {
   async runSummaryOnce(): Promise<void> {
     if (!this.engine || Date.now() - this.lastSummaryAt < 60_000) return;
     const summaryOwners = [...this.knownOwners.values()];
+    const candidates: Array<{ owner: KnowledgeOwner; index: number; requested: boolean }> = [];
     for (let offset = 0; offset < summaryOwners.length; offset++) {
-      const owner = summaryOwners[(this.summaryOwnerCursor + offset) % summaryOwners.length];
+      const index = (this.summaryOwnerCursor + offset) % summaryOwners.length;
+      const owner = summaryOwners[index];
       if (this.stopped) break;
-      const state = this.states.get(ownerKey(owner));
-      if (state) await this.summarizeOwner(owner).catch(() => undefined);
+      if (!this.states.has(ownerKey(owner))) continue;
+      try {
+        const requested = (await this.library.snapshot(owner)).some(
+          (entry) =>
+            !entry.historical &&
+            !entry.humanEdited &&
+            entry.generation &&
+            entry.generation.state !== 'complete' &&
+            (!entry.generation.retryAt || Date.parse(entry.generation.retryAt) <= Date.now())
+        );
+        candidates.push({ owner, index, requested });
+      } catch {
+        // A temporarily unreadable owner's archive must not stall other queues.
+      }
     }
-    this.summaryOwnerCursor = (this.summaryOwnerCursor + 1) % Math.max(1, summaryOwners.length);
+    candidates.sort((a, b) => Number(b.requested) - Number(a.requested));
+    for (const candidate of candidates) {
+      if (this.stopped) break;
+      const before = this.lastSummaryAt;
+      await this.summarizeOwner(candidate.owner).catch(() => undefined);
+      if (this.lastSummaryAt !== before) {
+        this.summaryOwnerCursor = (candidate.index + 1) % summaryOwners.length;
+        break;
+      }
+    }
   }
 
   private async importDisco(
@@ -878,6 +932,7 @@ export class KnowledgeRuntime {
       .sort(
         (a, b) =>
           Number(b.kind === 'note') - Number(a.kind === 'note') ||
+          Number(canSummarize(b)) - Number(canSummarize(a)) ||
           (a.indexAttempts ?? 0) - (b.indexAttempts ?? 0) ||
           a.sizeBytes - b.sizeBytes
       );
@@ -1064,6 +1119,13 @@ export class KnowledgeRuntime {
         if (!target || target.entry.humanEdited) return;
       }
       const first = inputs[0];
+      if (!target && summary.archiveOnly) {
+        await this.library.markSummarized(owner, first.entry.id, first.contentHash, {
+          disposition: 'archive_only',
+          reason: summary.reason || '原始记录已保留，未发现需要单独提炼的知识。',
+        });
+        return;
+      }
       const title =
         target?.entry.generation?.requestedTitle ||
         summary.title?.trim() ||
@@ -1119,14 +1181,15 @@ export class KnowledgeRuntime {
           state: 'failed',
           message,
           attempts,
-          retryAt: retryDate(attempts),
+          retryAt: retryDate(attempts, error instanceof OpenVikingError ? error.retryAfterMs : 0),
         });
       } else
         await this.library.markSummaryFailed(
           owner,
           inputs[0].entry.id,
           inputs[0].contentHash,
-          message
+          message,
+          error instanceof OpenVikingError ? error.retryAfterMs : 0
         );
     } finally {
       this.activeSummary.delete(ownerKey(owner));

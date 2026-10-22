@@ -38,6 +38,25 @@ function record(value: unknown): RecordValue {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as RecordValue) : {};
 }
 
+/** App-injected context is retained in raw archives, not presented as a user's question. */
+export function hostVisibleMessage(text: string): string {
+  let visible = text.trim();
+  while (true) {
+    const stripped = visible.replace(
+      /^\s*<(environment_context|recommended_plugins|external_codex_apps_open_page|skills_instructions|permissions_instructions|collaboration_mode)>[\s\S]*?<\/\1>\s*/,
+      ''
+    );
+    if (stripped === visible) return visible;
+    visible = stripped.trim();
+  }
+}
+
+export function hostConversationTitle(text: string): string {
+  const visible = hostVisibleMessage(text);
+  const request = /(?:^|\n)## My request:\s*\n([\s\S]*)/.exec(visible)?.[1] ?? visible;
+  return request.replace(/\s+/g, ' ').trim().slice(0, 100);
+}
+
 /** Render human conversation text; the untouched JSONL remains the complete record. */
 export function conversationText(content: unknown): string {
   if (typeof content === 'string') return content;
@@ -46,7 +65,7 @@ export function conversationText(content: unknown): string {
     .map((value) => {
       const block = record(value);
       if (typeof block.text === 'string') return block.text;
-      if (block.type === 'image' || block.type === 'input_image' || block.type === 'local_image') {
+      if (['image', 'input_image', 'local_image', 'localImage'].includes(String(block.type))) {
         return '[图片，原始引用保存在会话记录中]';
       }
       if (block.type === 'tool_use') return `工具调用：${String(block.name ?? '')}`;
@@ -112,9 +131,11 @@ export async function readHostRollout(path: string): Promise<HostRolloutSource |
   if (after.size !== info.size || after.mtimeMs !== info.mtimeMs || after.ctimeMs !== info.ctimeMs)
     return null;
   let id = '';
+  let agentPath: string | undefined;
   const messages: string[] = [];
   const fallback: string[] = [];
   let title = '';
+  let fallbackTitle = '';
   let firstEventAt: string | undefined;
   let lastEventAt: string | undefined;
   let recordCount = 0;
@@ -141,19 +162,27 @@ export async function readHostRollout(path: string): Promise<HostRolloutSource |
       typeof payload.cwd === 'string'
     )
       sessionCwds.add(payload.cwd);
-    if (row.type === 'session_meta' && typeof payload.id === 'string') id = payload.id;
+    // Forked Codex transcripts contain inherited session_meta records after their
+    // own header. The first header owns this file; later headers are provenance.
+    if (!id && row.type === 'session_meta' && typeof payload.id === 'string' && payload.id) {
+      id = payload.id;
+      const threadSpawn = record(record(record(payload.source).subagent).thread_spawn);
+      if (typeof threadSpawn.agent_path === 'string') agentPath = threadSpawn.agent_path;
+    }
     if (row.type === 'response_item' && payload.type === 'message') {
       const role = String(payload.role ?? '');
       if (!['user', 'assistant'].includes(role)) continue;
-      const text = conversationText(payload.content);
+      const text = hostVisibleMessage(conversationText(payload.content));
       if (!text) continue;
-      if (!title && role === 'user') title = text.replace(/\s+/g, ' ').slice(0, 100);
+      if (!title && role === 'user') title = hostConversationTitle(text);
       messages.push(`## ${role} · ${String(row.timestamp ?? '')}\n\n${text}`);
     } else if (
       row.type === 'event_msg' &&
       ['user_message', 'agent_message'].includes(String(payload.type))
     ) {
-      const text = String(payload.message ?? '');
+      const text = hostVisibleMessage(String(payload.message ?? ''));
+      if (!fallbackTitle && payload.type === 'user_message')
+        fallbackTitle = hostConversationTitle(text);
       if (text)
         fallback.push(
           `## ${payload.type === 'user_message' ? 'user' : 'assistant'} · ${String(row.timestamp ?? '')}\n\n${text}`
@@ -161,6 +190,9 @@ export async function readHostRollout(path: string): Promise<HostRolloutSource |
     }
   }
   if (!id) return null;
+  title = agentPath
+    ? `Codex 子任务 · ${agentPath.replace(/^\/root\//, '')}`
+    : title || fallbackTitle;
   return {
     source: 'codex',
     sourceId: id,
@@ -180,6 +212,7 @@ export async function readHostRollout(path: string): Promise<HostRolloutSource |
       lastEventAt,
       complete: malformedRecords === 0,
       malformedRecords,
+      visibleMessages: messages.length || fallback.length,
     },
     sessionCwd: [...sessionCwds][0],
     sessionCwds: [...sessionCwds],
@@ -389,7 +422,10 @@ export function hostAttachmentProvenance(raw: string): HostAttachmentReference[]
           ? [{ text: content }]
           : []) {
         const item = record(block);
-        if (item.type === 'local_image' && typeof item.path === 'string')
+        if (
+          ['local_image', 'localImage'].includes(String(item.type)) &&
+          typeof item.path === 'string'
+        )
           add(item.path, 'local-image');
         if (typeof item.text === 'string') {
           for (const reference of markdownFileLinks(item.text)) add(reference, 'markdown-link');

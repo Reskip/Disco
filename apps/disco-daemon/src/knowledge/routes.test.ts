@@ -175,6 +175,64 @@ describe('knowledge routes over authenticated HTTP', () => {
     return (await response.json()) as KnowledgeEntryDetail;
   };
 
+  it('filters organized notes and preserves verified source links through editing', async () => {
+    const source = await create('测试来源', '# 原始资料\n实际结论');
+    const arranged = await request('/organize', {
+      method: 'POST',
+      body: JSON.stringify({
+        entryIds: [source.entry.id],
+        mode: 'manual',
+        title: '专题归纳',
+        topic: '知识库验收',
+      }),
+    });
+    expect(arranged.status).toBe(201);
+    const note = (await arranged.json()) as KnowledgeEntryDetail;
+    expect(note.entry.humanEdited).toBe(true);
+    expect(note.sources?.[0]).toMatchObject({ id: source.entry.id, available: true });
+    const saved = await request(`/entries/${note.entry.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        title: '人工专题',
+        markdown: '# 结论\n保留实际证据',
+        expectedUpdatedAt: note.entry.updatedAt,
+        organization: {
+          topic: '验收专题',
+          level: 'knowledge',
+          state: 'reviewed',
+          sourceEntryIds: ['kb_' + '0'.repeat(64)],
+        },
+      }),
+    });
+    expect(saved.status).toBe(200);
+    expect((await saved.json()).sources?.[0]).toMatchObject({
+      id: source.entry.id,
+      available: true,
+    });
+    const detail = (await (
+      await request(`/entries/${note.entry.id}`)
+    ).json()) as KnowledgeEntryDetail;
+    expect(detail.sources).toEqual([
+      { id: source.entry.id, title: '测试来源', kind: 'note', available: true },
+    ]);
+    expect(detail.entry.organization?.sourceEntryIds).toEqual([source.entry.id]);
+    const list = await (
+      await request('/entries?level=knowledge&topic=' + encodeURIComponent('验收专题'))
+    ).json();
+    expect(list.total).toBe(1);
+    expect(
+      (
+        await request(
+          '/organize',
+          { method: 'POST', body: JSON.stringify({ entryIds: [source.entry.id], mode: 'manual' }) },
+          'beta'
+        )
+      ).status
+    ).toBe(404);
+    const overview = await (await request('/overview')).json();
+    expect(overview.topics).toContainEqual({ topic: '验收专题', count: 1 });
+  });
+
   it('serves the browser shell but rejects anonymous, forced-password and executor API access', async () => {
     expect(await (await fetch(baseUrl)).text()).toBe('Knowledge browser shell');
     for (const path of ['/status', '/entries', '/export'])

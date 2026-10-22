@@ -1,4 +1,38 @@
-import type { KnowledgeEntry } from '@disco/core/types';
+import type {
+  KnowledgeEntry,
+  KnowledgeGeneration,
+  KnowledgeMaterialType,
+  KnowledgeOrganization,
+} from '@disco/core/types';
+
+export const MATERIAL_LABELS: Record<KnowledgeMaterialType, string> = {
+  conversation: '会话',
+  document: '文档',
+  image: '图片',
+  file: '其它文件',
+  note: '笔记',
+};
+export const LEVEL_LABELS: Record<KnowledgeOrganization['level'], string> = {
+  source: '原始资料',
+  summary: '摘要',
+  knowledge: '专题知识',
+};
+export const GENERATION_LABELS: Record<KnowledgeGeneration['state'], string> = {
+  queued: '等待自动整理',
+  running: '正在自动整理',
+  failed: '整理失败，等待重试',
+  complete: '整理完成',
+};
+export function entryOrganization(entry?: KnowledgeEntry): KnowledgeOrganization {
+  return (
+    entry?.organization ?? {
+      topic: '未分类',
+      level: entry?.kind === 'note' ? (entry.derivedFrom ? 'summary' : 'knowledge') : 'source',
+      state: entry?.humanEdited ? 'reviewed' : 'draft',
+      sourceEntryIds: entry?.derivedFrom ? [entry.derivedFrom.entryId] : undefined,
+    }
+  );
+}
 
 export const SOURCE_LABELS: Record<KnowledgeEntry['source'], string> = {
   disco: 'Disco 会话',

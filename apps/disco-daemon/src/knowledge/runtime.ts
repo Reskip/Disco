@@ -1,6 +1,6 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { mkdir, readFile, realpath, rename, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { resolveDiscoUserWorkspaceDirectory } from '@disco/core';
 import {
@@ -28,6 +28,7 @@ import {
 } from '@disco/core/db';
 import type {
   KnowledgeEntry,
+  KnowledgeEntryDetail,
   KnowledgeLibraryStatus,
   KnowledgeOwner,
   KnowledgeSource,
@@ -42,20 +43,25 @@ import { extractKnowledgeDocument } from './documents.js';
 import { KnowledgeLibrary } from './library.js';
 import {
   OpenVikingClient,
+  OpenVikingError,
   type OpenVikingIdentity,
   type OpenVikingOptions,
   provisionOpenVikingOwner,
 } from './openviking.js';
+import { canSummarize, organization, retryDate } from './organization.js';
 import {
   compareHostRolloutSource,
   discoConversationSource,
+  type HostAttachmentReference,
   type HostAttachmentResolution,
+  type HostRolloutSource,
   hostAttachmentProvenance,
   hostRolloutFiles,
   hostRolloutIdentity,
   readHostRollout,
   resolveHostAttachment,
 } from './sources.js';
+import { exportHostSqliteThread, hostSqliteThreads } from './sources-sqlite-worker-client.js';
 
 export interface KnowledgeRuntimeConfig {
   enabled?: boolean;
@@ -108,7 +114,15 @@ export class KnowledgeRuntime {
   readonly engine?: OpenVikingClient;
   private timer?: ReturnType<typeof setTimeout>;
   private running?: Promise<void>;
+  private indexTimer?: ReturnType<typeof setTimeout>;
+  private summaryTimer?: ReturnType<typeof setTimeout>;
+  private indexing?: Promise<void>;
+  private summarizing?: Promise<void>;
+  private archiveReady = new Set<string>();
+  private activeIndex = new Map<string, string>();
+  private activeSummary = new Map<string, string>();
   private stopped = true;
+  private archiveAbort = new AbortController();
   private states = new Map<string, NonNullable<KnowledgeLibraryStatus['sync']>>();
   private engineStates = new Map<string, NonNullable<KnowledgeLibraryStatus['engine']>>();
   private checkpoints = new Map<string, string>();
@@ -210,8 +224,16 @@ export class KnowledgeRuntime {
       message: '等待后台同步',
     };
     const failures = this.sourceFailures.get(ownerKey(owner))?.size ?? 0;
+    const status = await this.library.status(owner);
+    if (status.processing) {
+      status.processing.index.active = this.activeIndex.get(ownerKey(owner));
+      status.processing.summary.active = this.activeSummary.get(ownerKey(owner));
+      status.processing.summary.message = this.archiveReady.has(ownerKey(owner))
+        ? '已建立索引的资料会分批整理，失败项单独重试'
+        : '首次归档尚未完成，自动整理将在归档完成后开始';
+    }
     return {
-      ...(await this.library.status(owner)),
+      ...status,
       sync: failures
         ? { ...sync, message: `${sync.message}；${failures} 项暂无法读取，将自动重试` }
         : sync,
@@ -248,7 +270,12 @@ export class KnowledgeRuntime {
         for (const hit of hits) {
           const detail = await this.library.get(owner, hit.id);
           // Local deletion and latest human edits always outrank stale derived index copies.
-          if (!detail || (input.source && detail.entry.source !== input.source)) continue;
+          if (
+            !detail ||
+            detail.entry.historical ||
+            (input.source && detail.entry.source !== input.source)
+          )
+            continue;
           if (input.entryIds?.length && !input.entryIds.includes(hit.id)) continue;
           results.push({
             entry: detail.entry,
@@ -322,16 +349,28 @@ export class KnowledgeRuntime {
         return;
       }
     }
+    for (const entry of await this.library.snapshot(owner)) {
+      if (!entry.historical || this.purged.has(`history:${entry.id}`)) continue;
+      try {
+        await this.engine.delete(owner, entry.id);
+        this.purged.add(`history:${entry.id}`);
+      } catch {
+        return;
+      }
+    }
   }
 
   start(): void {
     if (!this.stopped || this.settings.enabled === false) return;
     this.stopped = false;
+    this.archiveAbort = new AbortController();
     this.schedule(3000);
   }
   private schedule(delay: number): void {
     this.timer = setTimeout(() => {
-      this.running = this.runOnce()
+      if (!this.indexTimer) this.scheduleDerived('index', 1000);
+      if (!this.summaryTimer) this.scheduleDerived('summary', 5000);
+      this.running = this.runOnce(false)
         .catch(() => {
           console.warn('[knowledge] 后台同步暂不可用，将自动重试');
         })
@@ -342,13 +381,35 @@ export class KnowledgeRuntime {
     }, delay);
     this.timer.unref();
   }
+  private scheduleDerived(kind: 'index' | 'summary', delay: number): void {
+    const timer = setTimeout(() => {
+      const work = (kind === 'index' ? this.runIndexOnce() : this.runSummaryOnce())
+        .catch(() => console.warn(`[knowledge] ${kind} worker will retry`))
+        .finally(() => {
+          if (kind === 'index') this.indexing = undefined;
+          else this.summarizing = undefined;
+          if (!this.stopped) this.scheduleDerived(kind, kind === 'index' ? 3000 : 15_000);
+        });
+      if (kind === 'index') this.indexing = work;
+      else this.summarizing = work;
+    }, delay);
+    timer.unref();
+    if (kind === 'index') this.indexTimer = timer;
+    else this.summaryTimer = timer;
+  }
   async stop(): Promise<void> {
     this.stopped = true;
+    this.archiveAbort.abort();
     clearTimeout(this.timer);
-    await this.running;
+    clearTimeout(this.indexTimer);
+    clearTimeout(this.summaryTimer);
+    this.indexTimer = undefined;
+    this.summaryTimer = undefined;
+    this.engine?.cancelPending?.();
+    await Promise.allSettled([this.running, this.indexing, this.summarizing]);
   }
 
-  async runOnce(): Promise<void> {
+  async runOnce(includeDerived = true): Promise<void> {
     const tenancy = resolveMultiTenancyConfig(this.config);
     if (tenancy.mode === 'static') {
       const owners = (await runWithTenantDatabaseScope(this.db, tenancy.static_tenant_id, (db) =>
@@ -364,6 +425,8 @@ export class KnowledgeRuntime {
         state: 'running',
         message: '正在同步会话与资料',
         processed: 0,
+        intervalSeconds: 30,
+        lastCompletedAt: this.states.get(ownerKey(owner))?.lastCompletedAt,
       };
       this.states.set(ownerKey(owner), state);
       this.sourceFailures.set(ownerKey(owner), new Set());
@@ -377,7 +440,6 @@ export class KnowledgeRuntime {
         }
         await this.assertWritable(owner);
         await this.library.reconcile(owner);
-        await this.purgeDeleted(owner);
         const existing = new Map(
           (await this.library.snapshot(owner)).map((entry) => [
             `${entry.source}:${entry.sourceId}`,
@@ -388,29 +450,15 @@ export class KnowledgeRuntime {
         if (this.settings.host && ownerKey(this.settings.host) === ownerKey(owner)) {
           await this.importHost(owner, this.settings.host, existing, state);
         }
-        // Durable pending/error status resumes parsing after a process exit,
-        // including host attachments whose transcript itself has not changed.
-        const unparsed = (await this.library.snapshot(owner)).filter(
-          (entry) =>
-            entry.kind === 'document' &&
-            entry.attachments?.some((attachment) => attachment.id) &&
-            (!entry.parseStatus || entry.parseStatus === 'pending' || entry.parseStatus === 'error')
-        );
-        for (const entry of unparsed.slice(0, 10)) {
-          if (this.stopped) break;
-          await extractKnowledgeDocument(
-            this.library,
-            owner,
-            entry.id,
-            this.settings.documents
-          ).catch(() => this.sourceFailures.get(ownerKey(owner))?.add(`parse:${entry.id}`));
-        }
+        this.archiveReady.add(ownerKey(owner));
         if (!this.stopped)
           this.states.set(ownerKey(owner), {
             state: 'idle',
             message: '会话与资料已同步',
             processed: state.processed,
             lastCompletedAt: new Date().toISOString(),
+            intervalSeconds: 30,
+            nextRunAt: new Date(Date.now() + 30_000).toISOString(),
           });
       } catch {
         this.states.set(ownerKey(owner), {
@@ -420,25 +468,49 @@ export class KnowledgeRuntime {
         });
       }
     }
-    // Finish all users' archive pass before doing the slower derived processing.
+    if (includeDerived) {
+      await this.runIndexOnce();
+      await this.runSummaryOnce();
+    }
+  }
+
+  async runIndexOnce(): Promise<void> {
     for (const owner of this.knownOwners.values()) {
       if (this.stopped) break;
       const state = this.states.get(ownerKey(owner));
-      if (!state || state.state === 'error') continue;
-      await this.indexOwner(owner, state, false).catch(() => undefined);
+      if (!state) continue;
+      try {
+        await this.assertWritable(owner);
+        await this.purgeDeleted(owner);
+        // Extraction runs independently of archive polling and model generation.
+        const unparsed = (await this.library.snapshot(owner)).filter(
+          (entry) =>
+            entry.kind === 'document' &&
+            entry.attachments?.some((file) => file.id) &&
+            (!entry.parseStatus || entry.parseStatus === 'pending' || entry.parseStatus === 'error')
+        );
+        for (const entry of unparsed.slice(0, 10)) {
+          if (this.stopped) return;
+          await extractKnowledgeDocument(
+            this.library,
+            owner,
+            entry.id,
+            this.settings.documents
+          ).catch(() => undefined);
+        }
+        await this.indexOwner(owner).catch(() => undefined);
+      } catch {}
     }
-    // Summarization starts only after every discovered owner's archive and index pass is complete.
-    if (!this.engine || [...this.states.values()].some((state) => state.state === 'error')) return;
-    for (const owner of this.knownOwners.values()) {
-      if ((await this.library.snapshot(owner)).some((entry) => entry.indexStatus !== 'indexed'))
-        return;
-    }
+  }
+
+  async runSummaryOnce(): Promise<void> {
+    if (!this.engine || Date.now() - this.lastSummaryAt < 60_000) return;
     const summaryOwners = [...this.knownOwners.values()];
     for (let offset = 0; offset < summaryOwners.length; offset++) {
       const owner = summaryOwners[(this.summaryOwnerCursor + offset) % summaryOwners.length];
       if (this.stopped) break;
       const state = this.states.get(ownerKey(owner));
-      if (state) await this.indexOwner(owner, state, true).catch(() => undefined);
+      if (state) await this.summarizeOwner(owner).catch(() => undefined);
     }
     this.summaryOwnerCursor = (this.summaryOwnerCursor + 1) % Math.max(1, summaryOwners.length);
   }
@@ -523,21 +595,7 @@ export class KnowledgeRuntime {
       if (upload.status !== 'active') continue;
       const previous = existing.get(`disco:upload:${upload.ref}`);
       try {
-        if (previous?.attachments?.some((attachment) => attachment.id)) {
-          if (
-            !previous.parseStatus ||
-            previous.parseStatus === 'pending' ||
-            previous.parseStatus === 'error'
-          ) {
-            await extractKnowledgeDocument(
-              this.library,
-              owner,
-              previous.id,
-              this.settings.documents
-            );
-          }
-          continue;
-        }
+        if (previous?.attachments?.some((attachment) => attachment.id)) continue;
         await this.importUpload(owner, upload);
         state.processed = (state.processed ?? 0) + 1;
       } catch {
@@ -572,7 +630,6 @@ export class KnowledgeRuntime {
       mimeType: upload.mimeType,
       sourceUrl: `/uploads/${upload.ref}/content`,
     });
-    await extractKnowledgeDocument(this.library, owner, detail.entry.id, this.settings.documents);
   }
 
   private async importHost(
@@ -582,7 +639,78 @@ export class KnowledgeRuntime {
     state: NonNullable<KnowledgeLibraryStatus['sync']>
   ): Promise<void> {
     state.message = '正在归档宿主机 Codex 历史';
-    const roots = host.attachmentRoots ?? [join(host.codexHome, 'attachments')];
+    const sqliteThreads = await hostSqliteThreads(host.codexHome, {
+      signal: this.archiveAbort.signal,
+    });
+    const sqliteIds = new Set(sqliteThreads.map((thread) => thread.id));
+    for (const thread of sqliteThreads) {
+      if (this.stopped) return;
+      const previous = existing.get(`codex:${thread.id}`);
+      const checkpoint = `sqlite:${thread.id}`;
+      if (
+        previous?.sourceVersion?.signature === thread.signature &&
+        (this.checkpoints.get(checkpoint) === thread.signature ||
+          (await this.library.hasRawSource(owner, previous.id, previous.sourceVersion.sha256)))
+      ) {
+        if (Date.now() - (this.hostAttachmentCheckpoints.get(checkpoint) ?? 0) >= 600_000) {
+          const references = await this.library.hostReferences(owner, previous.id);
+          const detail = references ? await this.library.get(owner, previous.id) : null;
+          if (references && detail) {
+            const source: HostRolloutSource = {
+              ...previous,
+              markdown: detail.markdown,
+              sessionCwd: thread.cwd,
+              sessionCwds: [thread.cwd],
+            };
+            const attachments = await this.resolveHostReferences(owner, host, source, references);
+            await this.importHostAttachments(owner, source, detail, attachments, existing);
+            this.hostAttachmentCheckpoints.set(checkpoint, Date.now());
+            continue;
+          }
+        } else continue;
+      }
+      const stage = join(dirname(knowledgeConfigPath()), 'staging');
+      await mkdir(stage, { recursive: true });
+      const archivePath = join(stage, `${randomUUID()}.jsonl`);
+      try {
+        const exported = await exportHostSqliteThread(host.codexHome, thread.id, archivePath, {
+          signal: this.archiveAbort.signal,
+        });
+        if (!exported) continue;
+        if (previous?.sourceVersion?.kind === 'codex-rollout')
+          await this.library.preserveRawRevision(owner, previous.id);
+        const detail = await this.archiveHostSource(
+          owner,
+          host,
+          exported.source,
+          exported.references,
+          existing
+        );
+        if (detail) {
+          const stream = createReadStream(exported.rawArchive.path);
+          try {
+            await this.library.putRawSource(owner, detail.entry.id, {
+              stream,
+              sha256: exported.rawArchive.sha256,
+            });
+          } finally {
+            stream.destroy();
+          }
+          this.checkpoints.set(checkpoint, exported.source.sourceVersion!.signature!);
+          this.hostAttachmentCheckpoints.set(checkpoint, Date.now());
+          state.processed = (state.processed ?? 0) + 1;
+        }
+      } catch {
+        this.sourceFailures.get(ownerKey(owner))?.add(`sqlite:${thread.id}`);
+      } finally {
+        await unlink(archivePath).catch(() => undefined);
+      }
+    }
+    for (const entry of existing.values()) {
+      if (entry.source !== 'codex' || !entry.sourceId.includes(':variant:') || entry.humanEdited)
+        continue;
+      await this.library.markHistorical(owner, entry.id);
+    }
     for await (const path of hostRolloutFiles(host.codexHome)) {
       if (this.stopped) return;
       try {
@@ -594,6 +722,19 @@ export class KnowledgeRuntime {
         )
           continue;
         const id = await hostRolloutIdentity(path);
+        if (id && sqliteIds.has(id)) {
+          const entry = existing.get(`codex:${id}`);
+          if (entry && !this.checkpoints.has(`preserved:${path}`)) {
+            const stream = createReadStream(path);
+            try {
+              await this.library.preserveExternalRawRevision(owner, entry.id, stream);
+            } finally {
+              stream.destroy();
+            }
+            this.checkpoints.set(`preserved:${path}`, signature);
+          }
+          continue;
+        }
         const old = id ? existing.get(`codex:${id}`) : undefined;
         const source = await readHostRollout(path);
         if (!source) continue;
@@ -607,87 +748,104 @@ export class KnowledgeRuntime {
           source.sourceId = `${source.sourceId}:variant:${source.sourceVersion!.sha256}`;
           source.title = `${source.title}（保留的历史副本）`;
         }
-        const references = hostAttachmentProvenance(source.rawContent ?? '');
-        const attachments: HostAttachmentResolution[] = [];
-        for (const reference of references) {
-          const cwd = await approvedTranscriptCwd(
-            reference.cwd ?? source.sessionCwd,
-            owner,
-            host.codexHome
-          );
-          const resolution = await resolveHostAttachment(
-            reference,
-            cwd ? [...roots, cwd] : roots,
-            cwd
-          );
-          if (
-            !attachments.some(
-              (item) => item.reference === resolution.reference && item.cwd === resolution.cwd
-            )
-          )
-            attachments.push(resolution);
-        }
-        const unavailable = attachments.filter((attachment) => attachment.status !== 'available');
-        if (unavailable.length)
-          source.markdown += `\n\n## 附件归档说明\n\n${unavailable.map((item) => `- ${item.reference}：${item.reason}`).join('\n')}\n`;
-        const detail = await this.library.upsertSource(owner, source);
-        if (detail) {
-          existing.set(`codex:${source.sourceId}`, detail.entry);
-          for (const attachment of attachments) {
-            if (!attachment.path || attachment.status !== 'available') continue;
-            const sourceId = `attachment:${source.sourceId}:${createHash('sha256').update(attachment.path).digest('hex')}`;
-            const fileInfo = await stat(attachment.path);
-            const sourceUpdatedAt = fileInfo.mtime.toISOString();
-            const previous = existing.get(`codex:${sourceId}`);
-            if (
-              previous?.sourceUpdatedAt === sourceUpdatedAt &&
-              previous.attachments?.some((file) => file.id && file.sizeBytes === fileInfo.size)
-            ) {
-              if (
-                !previous.parseStatus ||
-                previous.parseStatus === 'pending' ||
-                previous.parseStatus === 'error'
-              )
-                await extractKnowledgeDocument(
-                  this.library,
-                  owner,
-                  previous.id,
-                  this.settings.documents
-                );
-              continue;
-            }
-            const document = await this.library.upsertSource(owner, {
-              source: 'codex',
-              sourceId,
-              kind: 'document',
-              title: basename(attachment.path),
-              sourceUpdatedAt,
-              sourceUrl: source.sourceUrl,
-              markdown: `# ${basename(attachment.path)}\n\n来源：[${source.title}](/knowledge?entry=${detail.entry.id})。\n\n原件：${attachment.reference}`,
-              rawContent: `${JSON.stringify({ ...attachment, sessionId: source.sourceId })}\n`,
-            });
-            if (!document) continue;
-            await this.library.putAttachment(owner, document.entry.id, {
-              name: basename(attachment.path),
-              stream: createReadStream(attachment.path),
-              sourceUrl: attachment.reference,
-            });
-            await extractKnowledgeDocument(
-              this.library,
-              owner,
-              document.entry.id,
-              this.settings.documents
-            );
-            const current = await this.library.get(owner, document.entry.id);
-            if (current) existing.set(`codex:${sourceId}`, current.entry);
-          }
-        }
+        await this.archiveHostSource(
+          owner,
+          host,
+          source,
+          hostAttachmentProvenance(source.rawContent ?? ''),
+          existing
+        );
         this.checkpoints.set(path, signature);
         this.hostAttachmentCheckpoints.set(path, Date.now());
         state.processed = (state.processed ?? 0) + 1;
       } catch {
         this.sourceFailures.get(ownerKey(owner))?.add(`host:${path}`);
       }
+    }
+  }
+
+  private async archiveHostSource(
+    owner: KnowledgeOwner,
+    host: NonNullable<KnowledgeRuntimeConfig['host']>,
+    source: HostRolloutSource,
+    references: HostAttachmentReference[],
+    existing: Map<string, KnowledgeEntry>
+  ): Promise<KnowledgeEntryDetail | null> {
+    const attachments = await this.resolveHostReferences(owner, host, source, references);
+    const unavailable = attachments.filter((attachment) => attachment.status !== 'available');
+    if (unavailable.length)
+      source.markdown += `\n\n## 附件归档说明\n\n${unavailable.map((item) => `- ${item.reference}：${item.reason}`).join('\n')}\n`;
+    const detail = await this.library.upsertSource(owner, source);
+    if (detail) {
+      existing.set(`codex:${source.sourceId}`, detail.entry);
+      await this.importHostAttachments(owner, source, detail, attachments, existing);
+      await this.library.hostReferences(owner, detail.entry.id, references);
+    }
+    return detail;
+  }
+
+  private async resolveHostReferences(
+    owner: KnowledgeOwner,
+    host: NonNullable<KnowledgeRuntimeConfig['host']>,
+    source: HostRolloutSource,
+    references: HostAttachmentReference[]
+  ): Promise<HostAttachmentResolution[]> {
+    const roots = host.attachmentRoots ?? [join(host.codexHome, 'attachments')];
+    const attachments: HostAttachmentResolution[] = [];
+    for (const reference of references) {
+      const cwd = await approvedTranscriptCwd(
+        reference.cwd ?? source.sessionCwd,
+        owner,
+        host.codexHome
+      );
+      const resolution = await resolveHostAttachment(reference, cwd ? [...roots, cwd] : roots, cwd);
+      if (
+        !attachments.some(
+          (item) => item.reference === resolution.reference && item.cwd === resolution.cwd
+        )
+      )
+        attachments.push(resolution);
+    }
+    return attachments;
+  }
+
+  private async importHostAttachments(
+    owner: KnowledgeOwner,
+    source: HostRolloutSource,
+    detail: KnowledgeEntryDetail,
+    attachments: HostAttachmentResolution[],
+    existing: Map<string, KnowledgeEntry>
+  ): Promise<void> {
+    for (const attachment of attachments) {
+      if (!attachment.path || attachment.status !== 'available') continue;
+      const sourceId = `attachment:${source.sourceId}:${createHash('sha256').update(attachment.path).digest('hex')}`;
+      const fileInfo = await stat(attachment.path);
+      const sourceUpdatedAt = fileInfo.mtime.toISOString();
+      const previous = existing.get(`codex:${sourceId}`);
+      if (
+        previous?.sourceUpdatedAt === sourceUpdatedAt &&
+        previous.attachments?.some((file) => file.id && file.sizeBytes === fileInfo.size)
+      ) {
+        continue;
+      }
+      const document = await this.library.upsertSource(owner, {
+        source: 'codex',
+        sourceId,
+        kind: 'document',
+        title: basename(attachment.path),
+        sourceUpdatedAt,
+        sourceUrl: source.sourceUrl,
+        markdown: `# ${basename(attachment.path)}\n\n来源：[${source.title}](/knowledge?entry=${detail.entry.id})。\n\n原件：${attachment.reference}`,
+        rawContent: `${JSON.stringify({ ...attachment, sessionId: source.sourceId })}\n`,
+      });
+      if (!document) continue;
+      await this.library.putAttachment(owner, document.entry.id, {
+        name: basename(attachment.path),
+        stream: createReadStream(attachment.path),
+        sourceUrl: attachment.reference,
+      });
+      const current = await this.library.get(owner, document.entry.id);
+      if (current) existing.set(`codex:${sourceId}`, current.entry);
     }
   }
 
@@ -707,74 +865,271 @@ export class KnowledgeRuntime {
     return marked;
   }
 
-  private async indexOwner(
-    owner: KnowledgeOwner,
-    state: NonNullable<KnowledgeLibraryStatus['sync']>,
-    allowSummary: boolean
-  ): Promise<void> {
+  private async indexOwner(owner: KnowledgeOwner): Promise<void> {
     if (!this.engine) return;
     const entries = await this.library.snapshot(owner);
-    const pending = entries.filter((entry) => entry.indexStatus !== 'indexed');
-    state.state = 'running';
-    state.message = `正在建立本地语义索引，剩余 ${pending.length} 条`;
-    // Small scheduling batches keep new archives and other owners moving during backfill.
+    const pending = entries
+      .filter(
+        (entry) =>
+          !entry.historical &&
+          entry.indexStatus !== 'indexed' &&
+          (!entry.indexRetryAt || Date.parse(entry.indexRetryAt) <= Date.now())
+      )
+      .sort(
+        (a, b) =>
+          Number(b.kind === 'note') - Number(a.kind === 'note') ||
+          (a.indexAttempts ?? 0) - (b.indexAttempts ?? 0) ||
+          a.sizeBytes - b.sizeBytes
+      );
     for (const entry of pending.slice(0, 20)) {
       if (this.stopped) return;
       const detail = await this.library.get(owner, entry.id);
       if (!detail) continue;
+      this.activeIndex.set(ownerKey(owner), entry.title);
       try {
         await this.engine.index(owner, { id: entry.id, content: detail.markdown });
         if (!(await this.finishIndexAttempt(owner, entry.id, detail.contentHash))) continue;
         this.engineStates.set(ownerKey(owner), { status: 'ready' });
-      } catch {
-        await this.finishIndexAttempt(owner, entry.id, detail.contentHash, '语义索引待重试');
-        this.engineStates.set(ownerKey(owner), {
-          status: 'unavailable',
-          message: '语义索引待重试，资料已完整归档',
-        });
-        return; // Back off an unavailable provider; do not hammer it for every historical entry.
+      } catch (error) {
+        const message =
+          error instanceof OpenVikingError ? error.message : '此资料索引失败，将自动重试';
+        await this.finishIndexAttempt(owner, entry.id, detail.contentHash, message);
+        if (
+          error instanceof OpenVikingError &&
+          ['UNAVAILABLE', 'UNAUTHORIZED', 'FORBIDDEN'].includes(error.code)
+        )
+          this.engineStates.set(ownerKey(owner), { status: 'unavailable', message });
+        // One broken document must not starve the rest. A down service backs off the worker.
+        if (error instanceof OpenVikingError && error.code === 'UNAVAILABLE') return;
+      } finally {
+        this.activeIndex.delete(ownerKey(owner));
       }
     }
-    if (pending.length) return;
-    state.state = 'idle';
-    state.message = '归档与索引已同步';
-    if (!allowSummary) return;
-    if (Date.now() - this.lastSummaryAt < 60_000) return;
-    const unfinished = entries.filter((entry) => !entry.derivedFrom && entry.kind !== 'note');
-    for (const entry of unfinished) {
-      if (this.stopped) return;
-      const detail = await this.library.get(owner, entry.id);
-      if (
-        detail?.entry.indexStatus !== 'indexed' ||
-        entry.summaryContentHash === detail.contentHash
+  }
+
+  async organize(
+    owner: KnowledgeOwner,
+    input: { entryIds: string[]; title?: string; topic?: string; mode: 'manual' | 'automatic' }
+  ): Promise<KnowledgeEntryDetail> {
+    await this.assertWritable(owner);
+    const entries: KnowledgeEntryDetail[] = [];
+    for (const id of [...new Set(input.entryIds)]) {
+      const detail = await this.library.get(owner, id);
+      if (!detail) throw Object.assign(new Error('所选资料不存在或已删除'), { status: 404 });
+      entries.push(detail);
+    }
+    if (!entries.length) throw Object.assign(new Error('请先选择要整理的资料'), { status: 400 });
+    if (input.mode === 'automatic' && !this.engine)
+      throw Object.assign(new Error('自动整理尚未配置，仍可人工整理'), { status: 503 });
+    if (
+      input.mode === 'automatic' &&
+      entries.some(
+        (item) =>
+          item.entry.kind === 'document' &&
+          (item.entry.attachments?.length || item.entry.parseStatus) &&
+          item.entry.parseStatus !== 'parsed'
       )
-        continue;
-      this.lastSummaryAt = Date.now();
-      state.state = 'running';
-      state.message = '正在低速整理知识摘要';
-      try {
-        const summary = await this.engine.summarize(owner, entry.id);
-        const current = await this.library.get(owner, entry.id);
-        if (!current || current.contentHash !== detail.contentHash) return;
-        await this.library.upsertSource(owner, {
-          source: entry.source,
-          sourceId: `summary:${entry.id}`,
-          kind: 'note',
-          title: `摘要 · ${entry.title}`,
-          derivedFrom: { entryId: entry.id, contentHash: detail.contentHash },
-          sourceUrl: `/knowledge?entry=${entry.id}`,
-          sourceUpdatedAt: entry.updatedAt,
-          markdown: `# ${entry.title}\n\n> 自动整理，需结合原文核实。来源：[${entry.title}](/knowledge?entry=${entry.id})；资料版本：${detail.contentHash}。\n\n${summary.abstract}\n\n${summary.overview}`,
-          rawContent: `${JSON.stringify({ sourceEntry: entry.id, sourceHash: detail.contentHash, generatedAt: new Date().toISOString(), ...summary })}\n`,
-        });
-        await this.library.markSummarized(owner, entry.id, detail.contentHash);
-        state.state = 'idle';
-        state.message = '已整理一条摘要，后台将继续处理';
-      } catch {
-        state.state = 'idle';
-        state.message = '摘要暂未完成，归档与检索可用，稍后自动重试';
+    )
+      throw Object.assign(
+        new Error('部分资料尚无可读取正文，请等待解析或选择人工整理；图片和压缩包可保留为来源附件'),
+        { status: 400 }
+      );
+    const title =
+      input.title?.trim() ||
+      (entries.length === 1 ? entries[0].entry.title : `${input.topic?.trim() || '专题'}整理`);
+    const automatic = input.mode === 'automatic';
+    const detail = await this.library.upsertSource(owner, {
+      source: 'manual',
+      sourceId: randomUUID(),
+      kind: 'note',
+      title,
+      automated: automatic,
+      organization: {
+        topic: input.topic?.trim() || '未分类',
+        level: 'knowledge',
+        state: 'draft',
+        sourceEntryIds: entries.map((item) => item.entry.id),
+      },
+      generation: automatic
+        ? {
+            state: 'queued',
+            requestedTitle: input.title?.trim() || undefined,
+            message: '已加入后台整理队列，可继续浏览资料',
+          }
+        : undefined,
+      markdown: `# ${title}\n\n${automatic ? '> 已加入自动整理队列，完成后会显示草稿。现在手工编辑保存将接管这篇笔记。' : '## 结论与知识\n\n在这里归纳结论、适用条件和操作方法。\n\n## 待确认\n\n记录冲突或仍需核实的问题。'}\n\n## 来源\n\n${entries.map((item) => `- [${item.entry.title}](/knowledge?entry=${item.entry.id})`).join('\n')}\n`,
+    });
+    if (!detail) throw new Error('无法建立整理笔记');
+    return (await this.library.get(owner, detail.entry.id))!;
+  }
+
+  private async summarizeOwner(owner: KnowledgeOwner): Promise<void> {
+    if (!this.engine || this.stopped || Date.now() - this.lastSummaryAt < 60_000) return;
+    await this.assertWritable(owner);
+    const entries = await this.library.snapshot(owner);
+    // Explicit requests work even during initial backfill and survive a process restart.
+    const requested = entries.find(
+      (entry) =>
+        !entry.historical &&
+        !entry.humanEdited &&
+        entry.generation &&
+        entry.generation.state !== 'complete' &&
+        (!entry.generation.retryAt || Date.parse(entry.generation.retryAt) <= Date.now())
+    );
+    let target = requested ? await this.library.get(owner, requested.id) : null;
+    const inputs: KnowledgeEntryDetail[] = [];
+    if (target) {
+      for (const id of organization(target.entry).sourceEntryIds ?? []) {
+        const source = await this.library.get(owner, id);
+        if (!source) {
+          await this.library.markGeneration(owner, target.entry.id, {
+            ...target.entry.generation,
+            state: 'failed',
+            message: '所选资料中有来源已删除，无法完整整理；可编辑笔记或重新选择资料',
+            retryAt: new Date(Date.now() + 86400_000).toISOString(),
+          });
+          return;
+        }
+        inputs.push(source);
       }
-      return;
+      if (!inputs.length) {
+        await this.library.markGeneration(owner, target.entry.id, {
+          state: 'failed',
+          message: '原始资料已删除，无法继续自动整理',
+          retryAt: new Date(Date.now() + 86400_000).toISOString(),
+        });
+        return;
+      }
+    } else {
+      if (!this.archiveReady.has(ownerKey(owner))) return;
+      // Independent owner/source readiness avoids a permanent all-users/all-files barrier.
+      const eligible = entries
+        .filter(
+          (entry) =>
+            !entry.historical &&
+            canSummarize(entry) &&
+            entry.indexStatus === 'indexed' &&
+            (!entry.summaryRetryAt || Date.parse(entry.summaryRetryAt) <= Date.now())
+        )
+        .sort(
+          (a, b) =>
+            Number(b.kind === 'conversation') - Number(a.kind === 'conversation') ||
+            (a.summaryAttempts ?? 0) - (b.summaryAttempts ?? 0) ||
+            a.sizeBytes - b.sizeBytes
+        );
+      for (const entry of eligible) {
+        const source = await this.library.get(owner, entry.id);
+        if (source && source.entry.summaryContentHash !== source.contentHash) {
+          inputs.push(source);
+          break;
+        }
+      }
+      if (!inputs.length) return;
+    }
+    this.lastSummaryAt = Date.now();
+    this.activeSummary.set(ownerKey(owner), target?.entry.title ?? inputs[0].entry.title);
+    if (target)
+      await this.library.markGeneration(owner, target.entry.id, {
+        ...target.entry.generation,
+        state: 'running',
+        message: '正在提炼主题、结论和来源',
+      });
+    try {
+      const summary = await this.engine.summarizeContent(owner, {
+        id: target?.entry.id ?? inputs[0].entry.id,
+        content: inputs
+          .map(
+            (item) =>
+              `# 来源 ${item.entry.id}：${item.entry.title}\n\n来源：[${item.entry.title}](/knowledge?entry=${item.entry.id})\n\n${item.markdown}`
+          )
+          .join('\n\n---\n\n'),
+        instructions: target
+          ? `整理为跨资料的专题知识，归并重复内容，分别保留事实、结论、适用条件和未决问题。用户指定主题：${organization(target.entry).topic}。`
+          : undefined,
+      });
+      for (const source of inputs) {
+        const current = await this.library.get(owner, source.entry.id);
+        if (!current || current.contentHash !== source.contentHash) {
+          if (target)
+            await this.library.markGeneration(owner, target.entry.id, {
+              ...target.entry.generation,
+              state: 'queued',
+              message: '原始资料已更新，将按新版本重新整理',
+            });
+          return;
+        }
+      }
+      if (target) {
+        target = await this.library.get(owner, target.entry.id);
+        if (!target || target.entry.humanEdited) return;
+      }
+      const first = inputs[0];
+      const title =
+        target?.entry.generation?.requestedTitle ||
+        summary.title?.trim() ||
+        target?.entry.title ||
+        first.entry.title;
+      const topic =
+        (target && organization(target.entry).topic !== '未分类'
+          ? organization(target.entry).topic
+          : summary.topic?.trim()) || '未分类';
+      const references = inputs
+        .map((item) => `- [${item.entry.title}](/knowledge?entry=${item.entry.id})`)
+        .join('\n');
+      await this.library.upsertSource(owner, {
+        source: target?.entry.source ?? first.entry.source,
+        sourceId: target?.entry.sourceId ?? `summary:${first.entry.id}`,
+        kind: 'note',
+        title,
+        automated: true,
+        derivedFrom: target
+          ? undefined
+          : { entryId: first.entry.id, contentHash: first.contentHash },
+        organization: {
+          topic,
+          level: target ? 'knowledge' : 'summary',
+          state: 'draft',
+          summary: summary.abstract,
+          tags: summary.tags,
+          sourceEntryIds: inputs.map((item) => item.entry.id),
+        },
+        generation: { state: 'complete' },
+        sourceUrl: `/knowledge?entry=${first.entry.id}`,
+        sourceUpdatedAt: first.entry.updatedAt,
+        markdown: `# ${title}\n\n> 根据所列原始资料整理。\n\n${summary.abstract}\n\n${summary.overview}\n\n## 来源\n\n${references}\n`,
+        rawContent: `${JSON.stringify({ sources: inputs.map((item) => ({ id: item.entry.id, hash: item.contentHash })), generatedAt: new Date().toISOString(), ...summary })}\n`,
+      });
+      if (!target) {
+        await this.library.markSummarized(owner, first.entry.id, first.contentHash);
+        await this.library.categorizeSource(owner, first.entry.id, first.contentHash, {
+          topic,
+          level: 'source',
+          state: 'draft',
+          summary: summary.abstract,
+          tags: summary.tags,
+        });
+      }
+    } catch (error) {
+      const message =
+        error instanceof OpenVikingError ? error.message : '摘要生成未完成，将自动重试';
+      if (target) {
+        const attempts = (target.entry.generation?.attempts ?? 0) + 1;
+        await this.library.markGeneration(owner, target.entry.id, {
+          ...target.entry.generation,
+          state: 'failed',
+          message,
+          attempts,
+          retryAt: retryDate(attempts),
+        });
+      } else
+        await this.library.markSummaryFailed(
+          owner,
+          inputs[0].entry.id,
+          inputs[0].contentHash,
+          message
+        );
+    } finally {
+      this.activeSummary.delete(ownerKey(owner));
     }
   }
 }

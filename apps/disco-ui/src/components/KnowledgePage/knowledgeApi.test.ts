@@ -76,6 +76,35 @@ describe('knowledge HTTP client', () => {
     expect(blob).not.toHaveBeenCalled();
   });
 
+  it('sends organization filters and explicit selected source IDs without an owner override', async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValue(new Response('{}', { status: 200 }));
+    await knowledgeApi.list('轨道', 'all', 40, undefined, {
+      level: 'source',
+      materialType: 'document',
+      topic: '铁路',
+      includeHistory: true,
+    });
+    const url = new URL(vi.mocked(authenticatedFetch).mock.calls[0][0] as string);
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      query: '轨道',
+      offset: '40',
+      limit: '20',
+      level: 'source',
+      materialType: 'document',
+      topic: '铁路',
+      includeHistory: 'true',
+    });
+    vi.mocked(authenticatedFetch).mockResolvedValue(new Response('{}', { status: 200 }));
+    await knowledgeApi.organize({ entryIds: ['a', 'b'], mode: 'automatic', topic: '铁路' });
+    const [requestUrl, init] = vi.mocked(authenticatedFetch).mock.calls[1];
+    expect(requestUrl).toBe('https://disco.example/knowledge/organize');
+    expect(JSON.parse(init?.body as string)).toEqual({
+      entryIds: ['a', 'b'],
+      mode: 'automatic',
+      topic: '铁路',
+    });
+  });
+
   it('does not request an export when the save dialog is cancelled', async () => {
     vi.stubGlobal(
       'showSaveFilePicker',

@@ -17,13 +17,18 @@ import type {
   KnowledgeAttachment,
   KnowledgeEntry,
   KnowledgeEntryDetail,
+  KnowledgeGeneration,
   KnowledgeLibraryStatus,
   KnowledgeListOptions,
   KnowledgeListResult,
+  KnowledgeOrganization,
+  KnowledgeOverview,
   KnowledgeOwner,
   KnowledgeParseStatus,
   KnowledgeSourceInput,
 } from '@disco/core/types';
+import { canSummarize, materialType, organization, retryDate } from './organization.js';
+import type { HostAttachmentReference } from './sources.js';
 
 interface StoredEntry extends KnowledgeEntry {
   schemaVersion: 1;
@@ -94,7 +99,12 @@ const publicEntry = (entry: StoredEntry): KnowledgeEntry => {
     diskSize: _diskSize,
     ...result
   } = entry;
-  return result;
+  return {
+    ...result,
+    materialType: materialType(result),
+    organization: organization(result),
+    indexMessage: result.indexMessage ?? _error,
+  };
 };
 
 /**
@@ -502,6 +512,8 @@ export class KnowledgeLibrary {
       `sources/${id}.jsonl`,
       `.library/entries/${id}.json`,
       `.library/pending/${id}.json`,
+      `.library/references/${id}.json`,
+      `.library/rollouts/${id}.json`,
       ...(await this.files(base, `revisions/${id}`)),
       ...(await this.files(base, `assets/${id}`)),
     ])
@@ -534,6 +546,14 @@ export class KnowledgeLibrary {
       entry.updatedAt = nowAfter(entry.updatedAt);
       entry.sizeBytes = Buffer.byteLength(markdown);
       entry.indexStatus = 'pending';
+      entry.indexRetryAt = undefined;
+      entry.indexMessage = undefined;
+      entry.indexError = undefined;
+      entry.indexAttempts = undefined;
+      entry.organization = { ...organization(entry), summary: undefined, state: 'reviewed' };
+      if (entry.generation) entry.generation = { state: 'complete', message: '已由用户接管编辑' };
+      const heading = markdown.match(/^#\s+(.+)$/m)?.[1]?.trim();
+      if (heading) entry.title = heading;
       await this.archiveRevision(base, entry, markdown);
     }
     if (
@@ -605,6 +625,9 @@ export class KnowledgeLibrary {
           ? entry.derivedFrom
           : (input.derivedFrom ?? entry?.derivedFrom);
       const sourceVersion = input.sourceVersion ?? entry?.sourceVersion;
+      const grouping = entry?.humanEdited
+        ? entry.organization
+        : (input.organization ?? entry?.organization);
       const attachments = [...(entry?.attachments ?? [])];
       for (const candidate of input.attachments ?? []) {
         const previous = attachments.find(
@@ -619,11 +642,13 @@ export class KnowledgeLibrary {
         entry &&
         entry.sourceHash === contentHash &&
         entry.rawHash === rawHash &&
-        entry.title === input.title &&
+        (entry.humanEdited || entry.title === input.title) &&
         entry.sourceUpdatedAt === input.sourceUpdatedAt &&
         entry.sourceUrl === input.sourceUrl &&
         JSON.stringify(entry.derivedFrom) === JSON.stringify(derivedFrom) &&
         JSON.stringify(entry.sourceVersion) === JSON.stringify(sourceVersion) &&
+        JSON.stringify(entry.organization) === JSON.stringify(grouping) &&
+        JSON.stringify(entry.generation) === JSON.stringify(input.generation ?? entry.generation) &&
         JSON.stringify(attachments) === JSON.stringify(entry.attachments ?? [])
       )
         return current;
@@ -636,13 +661,14 @@ export class KnowledgeLibrary {
         current?.markdown ?? (existing ? markdownText(existing.toString('utf8')) : null);
       const humanEdited =
         entry?.humanEdited ??
-        ((input.source === 'manual' && input.kind === 'note' && !derivedFrom) || existing !== null);
+        ((input.source === 'manual' && input.kind === 'note' && !derivedFrom && !input.automated) ||
+          existing !== null);
       const body = humanEdited && preserved !== null ? preserved : markdown;
       const now = nowAfter(entry?.updatedAt);
       entry = {
         schemaVersion: 1,
         id,
-        title: input.title.trim() || '未命名资料',
+        title: entry?.humanEdited ? entry.title : input.title.trim() || '未命名资料',
         kind: input.kind,
         source: input.source,
         sourceId: input.sourceId,
@@ -663,6 +689,15 @@ export class KnowledgeLibrary {
         sourceVersion,
         parseStatus: entry?.parseStatus,
         parseMessage: entry?.parseMessage,
+        organization: grouping,
+        generation: entry?.humanEdited ? entry.generation : (input.generation ?? entry?.generation),
+        indexMessage: entry?.contentHash === digest(body) ? entry.indexMessage : undefined,
+        indexAttempts: entry?.contentHash === digest(body) ? entry.indexAttempts : undefined,
+        indexRetryAt: entry?.contentHash === digest(body) ? entry.indexRetryAt : undefined,
+        summaryMessage: entry?.contentHash === digest(body) ? entry?.summaryMessage : undefined,
+        summaryAttempts: entry?.contentHash === digest(body) ? entry?.summaryAttempts : undefined,
+        summaryRetryAt: entry?.contentHash === digest(body) ? entry?.summaryRetryAt : undefined,
+        historical: entry?.historical,
       };
       if (input.rawContent !== undefined)
         await this.atomicWrite(base, `sources/${id}.jsonl`, input.rawContent);
@@ -680,7 +715,21 @@ export class KnowledgeLibrary {
     return this.exclusive(owner, async (base) => {
       if ((await this.deletedEntries(base)).some((item) => item.id === id)) return null;
       const entry = await this.metadata(base, id);
-      return entry ? this.refreshEntry(base, entry) : null;
+      const detail = entry ? await this.refreshEntry(base, entry) : null;
+      if (!detail) return null;
+      const ids = organization(detail.entry).sourceEntryIds ?? [];
+      detail.sources = [];
+      const deleted = new Set((await this.deletedEntries(base)).map((item) => item.id));
+      for (const sourceId of ids) {
+        const source = deleted.has(sourceId) ? null : await this.metadata(base, sourceId);
+        detail.sources.push({
+          id: sourceId,
+          title: source?.title ?? '原始资料已删除',
+          kind: source?.kind,
+          available: Boolean(source),
+        });
+      }
+      return detail;
     });
   }
 
@@ -689,7 +738,8 @@ export class KnowledgeLibrary {
     id: string,
     markdown: string,
     expectedUpdatedAt?: string,
-    title?: string
+    title?: string,
+    grouping?: KnowledgeOrganization
   ): Promise<KnowledgeEntryDetail | null> {
     if (title !== undefined && !title.trim()) throw new Error('资料标题不能为空。');
     return this.exclusive(owner, async (base) => {
@@ -707,7 +757,13 @@ export class KnowledgeLibrary {
       entry.sizeBytes = Buffer.byteLength(body);
       entry.humanEdited = true;
       if (title !== undefined) entry.title = title.trim();
+      entry.organization = grouping ?? { ...organization(entry), state: 'reviewed' };
+      if (body !== current.markdown) entry.organization.summary = undefined;
+      if (entry.generation) entry.generation = { state: 'complete', message: '已由用户接管编辑' };
       entry.indexStatus = 'pending';
+      entry.indexRetryAt = undefined;
+      entry.indexAttempts = undefined;
+      entry.indexMessage = undefined;
       await this.writeMarkdown(base, entry, body, current.contentHash);
       await this.archiveRevision(base, entry, body);
       return { entry: publicEntry(entry), markdown: body, contentHash: entry.contentHash };
@@ -731,9 +787,14 @@ export class KnowledgeLibrary {
       const query = options.query?.trim().toLocaleLowerCase();
       const results: KnowledgeEntry[] = [];
       for (const entry of (await this.state(base)).entries) {
+        if (entry.historical && !options.includeHistory) continue;
         if (
           (options.kind && entry.kind !== options.kind) ||
-          (options.source && entry.source !== options.source)
+          (options.source && entry.source !== options.source) ||
+          (options.materialType && materialType(entry) !== options.materialType) ||
+          (options.level && organization(entry).level !== options.level) ||
+          (options.topic && organization(entry).topic !== options.topic) ||
+          (options.reviewState && organization(entry).state !== options.reviewState)
         )
           continue;
         // Lists load only metadata. Full Markdown is read for explicit search/open or background reconciliation.
@@ -743,7 +804,13 @@ export class KnowledgeLibrary {
           if (!detail) continue;
           result = detail.entry;
           const match = detail.markdown.toLocaleLowerCase().indexOf(query);
-          if (match < 0 && !entry.title.toLocaleLowerCase().includes(query)) continue;
+          if (
+            match < 0 &&
+            !`${entry.title} ${organization(entry).topic} ${organization(entry).summary ?? ''} ${(organization(entry).tags ?? []).join(' ')}`
+              .toLocaleLowerCase()
+              .includes(query)
+          )
+            continue;
           result.snippet = detail.markdown.slice(
             Math.max(0, match - 60),
             Math.max(0, match - 60) + 280
@@ -759,6 +826,7 @@ export class KnowledgeLibrary {
   }
 
   private summarize(state: OwnerState): KnowledgeLibraryStatus {
+    state = { ...state, entries: state.entries.filter((entry) => !entry.historical) };
     return {
       total: state.entries.length,
       conversations: state.entries.filter((entry) => entry.kind === 'conversation').length,
@@ -766,6 +834,31 @@ export class KnowledgeLibrary {
       notes: state.entries.filter((entry) => entry.kind === 'note').length,
       humanEdited: state.entries.filter((entry) => entry.humanEdited).length,
       pendingIndex: state.entries.filter((entry) => entry.indexStatus !== 'indexed').length,
+      processing: {
+        index: {
+          pending: state.entries.filter((entry) => entry.indexStatus === 'pending').length,
+          indexed: state.entries.filter((entry) => entry.indexStatus === 'indexed').length,
+          failed: state.entries.filter((entry) => entry.indexStatus === 'error').length,
+          unsupported: state.entries.filter((entry) => entry.parseStatus === 'unsupported').length,
+        },
+        summary: {
+          pending: state.entries.filter(
+            (entry) =>
+              (canSummarize(entry) &&
+                entry.summaryContentHash !== entry.contentHash &&
+                !entry.summaryMessage) ||
+              (entry.generation && ['queued', 'running'].includes(entry.generation.state))
+          ).length,
+          completed: state.entries.filter(
+            (entry) =>
+              (canSummarize(entry) && entry.summaryContentHash === entry.contentHash) ||
+              (!entry.derivedFrom && entry.generation?.state === 'complete')
+          ).length,
+          failed: state.entries.filter(
+            (entry) => entry.summaryMessage || entry.generation?.state === 'failed'
+          ).length,
+        },
+      },
       deleted: state.tombstones.length,
       totalBytes: state.entries.reduce(
         (total, entry) =>
@@ -790,6 +883,221 @@ export class KnowledgeLibrary {
     return this.exclusive(owner, async (base) => (await this.state(base)).entries.map(publicEntry));
   }
 
+  async overview(owner: KnowledgeOwner): Promise<KnowledgeOverview> {
+    const result: KnowledgeOverview = {
+      topics: [],
+      counts: { source: 0, summary: 0, knowledge: 0 },
+      materials: { conversation: 0, document: 0, image: 0, file: 0, note: 0 },
+    };
+    const topics = new Map<string, number>();
+    for (const entry of await this.snapshot(owner)) {
+      if (entry.historical) continue;
+      const group = organization(entry);
+      result.counts[group.level]++;
+      result.materials[materialType(entry)]++;
+      topics.set(group.topic, (topics.get(group.topic) ?? 0) + 1);
+    }
+    result.topics = [...topics]
+      .map(([topic, count]) => ({ topic, count }))
+      .sort((a, b) => b.count - a.count || a.topic.localeCompare(b.topic));
+    return result;
+  }
+
+  async markGeneration(
+    owner: KnowledgeOwner,
+    id: string,
+    generation: KnowledgeGeneration
+  ): Promise<boolean> {
+    return this.exclusive(owner, async (base) => {
+      const entry = await this.metadata(base, id);
+      if (!entry || !(await this.refreshEntry(base, entry)) || entry.humanEdited) return false;
+      entry.generation = generation;
+      await this.save(base, entry);
+      return true;
+    });
+  }
+
+  /** Preserve pre-migration raw history using a same-volume link, without loading it into memory. */
+  async preserveRawRevision(owner: KnowledgeOwner, id: string): Promise<void> {
+    await this.exclusive(owner, async (base) => {
+      const entry = await this.metadata(base, id);
+      if (!entry?.rawHash) return;
+      const source = this.safePath(base, `sources/${id}.jsonl`);
+      const target = this.safePath(base, `revisions/${id}/${entry.rawHash}.jsonl`);
+      await this.assertSafe(source);
+      await this.ensureDir(dirname(target));
+      await this.assertSafe(target);
+      try {
+        await link(source, target);
+      } catch (error) {
+        if (!exists(error) && !absent(error)) throw error;
+      }
+      const current = await this.refreshEntry(base, entry);
+      if (current) await this.archiveRevision(base, entry, current.markdown);
+    });
+  }
+
+  async hasRawSource(owner: KnowledgeOwner, id: string, sha256: string): Promise<boolean> {
+    return this.exclusive(owner, async (base) => {
+      const entry = await this.metadata(base, id);
+      if (!entry || entry.rawHash !== sha256) return false;
+      const path = this.safePath(base, `sources/${id}.jsonl`);
+      await this.assertSafe(path);
+      const info = await lstat(path).catch(() => null);
+      return Boolean(
+        info?.isFile() && (!entry.sourceVersion || info.size === entry.sourceVersion.byteLength)
+      );
+    });
+  }
+
+  async hostReferences(
+    owner: KnowledgeOwner,
+    id: string,
+    references?: HostAttachmentReference[]
+  ): Promise<HostAttachmentReference[] | null> {
+    return this.exclusive(owner, async (base) => {
+      if (!idPattern.test(id) || !(await this.metadata(base, id))) return null;
+      const file = `.library/references/${id}.json`;
+      if (references) await this.atomicWrite(base, file, JSON.stringify(references));
+      const bytes = await this.read(base, file);
+      if (!bytes) return null;
+      const value: unknown = JSON.parse(bytes.toString('utf8'));
+      if (!Array.isArray(value) || value.some((ref) => !ref || typeof ref.reference !== 'string'))
+        return null;
+      return value as HostAttachmentReference[];
+    });
+  }
+
+  /** Preserve the original rollout once when migrating to the SQLite projection. */
+  async preserveExternalRawRevision(
+    owner: KnowledgeOwner,
+    id: string,
+    stream: AsyncIterable<Uint8Array>
+  ): Promise<void> {
+    await this.exclusive(owner, async (base) => {
+      if (!idPattern.test(id) || !(await this.metadata(base, id))) return;
+      if (await this.read(base, `.library/rollouts/${id}.json`)) return;
+      const temporary = `revisions/${id}/${randomUUID()}.partial`;
+      await this.ensureDir(dirname(this.safePath(base, temporary)));
+      const handle = await open(this.safePath(base, temporary), 'wx', 0o600);
+      const hash = createHash('sha256');
+      let size = 0;
+      try {
+        for await (const chunk of stream) {
+          hash.update(chunk);
+          size += chunk.length;
+          await handle.writeFile(chunk);
+        }
+        const sha256 = hash.digest('hex');
+        await handle.sync();
+        await handle.close();
+        const target = `revisions/${id}/${sha256}.jsonl`;
+        await this.assertSafe(this.safePath(base, target));
+        if (
+          await this.readStream(base, target).then((file) => {
+            file?.body.destroy();
+            return Boolean(file);
+          })
+        )
+          await this.removeFile(base, temporary);
+        else await rename(this.safePath(base, temporary), this.safePath(base, target));
+        await this.atomicWrite(
+          base,
+          `.library/rollouts/${id}.json`,
+          JSON.stringify({ sha256, size })
+        );
+      } catch (error) {
+        await handle.close().catch(() => undefined);
+        await this.removeFile(base, temporary);
+        throw error;
+      }
+    });
+  }
+
+  async markHistorical(owner: KnowledgeOwner, id: string): Promise<void> {
+    await this.exclusive(owner, async (base) => {
+      const entry = await this.metadata(base, id);
+      if (!entry || !(await this.refreshEntry(base, entry)) || entry.humanEdited) return;
+      entry.historical = true;
+      await this.save(base, entry);
+    });
+  }
+
+  /** Raw archives can exceed V8's string limit. Stream, verify, then atomically publish. */
+  async putRawSource(
+    owner: KnowledgeOwner,
+    id: string,
+    input: { stream: AsyncIterable<Uint8Array>; sha256: string }
+  ): Promise<void> {
+    await this.exclusive(owner, async (base) => {
+      const entry = await this.metadata(base, id);
+      if (!entry || !(await this.refreshEntry(base, entry))) return;
+      const temporary = `sources/${id}.${randomUUID()}.partial`;
+      const target = `sources/${id}.jsonl`;
+      await this.ensureDir(dirname(this.safePath(base, target)));
+      const handle = await open(this.safePath(base, temporary), 'wx', 0o600);
+      const hash = createHash('sha256');
+      try {
+        for await (const chunk of input.stream) {
+          hash.update(chunk);
+          await handle.writeFile(chunk);
+        }
+        if (hash.digest('hex') !== input.sha256) throw new Error('原始归档校验失败');
+        await handle.sync();
+        await handle.close();
+        await this.assertSafe(this.safePath(base, target));
+        await rename(this.safePath(base, temporary), this.safePath(base, target));
+        entry.rawHash = input.sha256;
+        await this.save(base, entry);
+      } catch (error) {
+        await handle.close().catch(() => undefined);
+        await this.removeFile(base, temporary);
+        throw error;
+      }
+    });
+  }
+
+  async markSummaryFailed(
+    owner: KnowledgeOwner,
+    id: string,
+    hash: string,
+    message: string
+  ): Promise<void> {
+    await this.exclusive(owner, async (base) => {
+      const entry = await this.metadata(base, id);
+      if (!entry || !(await this.refreshEntry(base, entry)) || entry.contentHash !== hash) return;
+      entry.summaryMessage = message;
+      entry.summaryAttempts = (entry.summaryAttempts ?? 0) + 1;
+      entry.summaryRetryAt = retryDate(entry.summaryAttempts);
+      await this.save(base, entry);
+    });
+  }
+
+  async categorizeSource(
+    owner: KnowledgeOwner,
+    id: string,
+    hash: string,
+    grouping: KnowledgeOrganization
+  ): Promise<void> {
+    await this.exclusive(owner, async (base) => {
+      const entry = await this.metadata(base, id);
+      if (
+        !entry ||
+        !(await this.refreshEntry(base, entry)) ||
+        entry.humanEdited ||
+        entry.contentHash !== hash
+      )
+        return;
+      entry.organization = {
+        ...grouping,
+        level: 'source',
+        state: 'draft',
+        sourceEntryIds: undefined,
+      };
+      await this.save(base, entry);
+    });
+  }
+
   async listDeletedIds(owner: KnowledgeOwner): Promise<string[]> {
     return this.exclusive(owner, async (base) =>
       (await this.deletedEntries(base)).map((entry) => entry.id)
@@ -803,6 +1111,9 @@ export class KnowledgeLibrary {
       if (!entry || !(await this.refreshEntry(base, entry)) || entry.contentHash !== contentHash)
         return false;
       entry.summaryContentHash = contentHash;
+      entry.summaryMessage = undefined;
+      entry.summaryRetryAt = undefined;
+      entry.summaryAttempts = undefined;
       await this.save(base, entry);
       return true;
     });
@@ -909,6 +1220,9 @@ export class KnowledgeLibrary {
         return false;
       entry.indexStatus = error ? 'error' : 'indexed';
       entry.indexError = error;
+      entry.indexMessage = error;
+      entry.indexAttempts = error ? (entry.indexAttempts ?? 0) + 1 : undefined;
+      entry.indexRetryAt = error ? retryDate(entry.indexAttempts!) : undefined;
       await this.save(base, entry);
       return true;
     });

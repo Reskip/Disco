@@ -1,7 +1,10 @@
 import type {
+  KnowledgeEntry,
   KnowledgeEntryDetail,
   KnowledgeLibraryStatus,
+  KnowledgeListOptions,
   KnowledgeListResult,
+  KnowledgeOverview,
   KnowledgeUploadResult,
 } from '@disco/core/types';
 import { getDaemonUrl } from '../../config/daemon';
@@ -95,22 +98,51 @@ async function exportLibrary(): Promise<void> {
 
 export const knowledgeApi = {
   status: (signal?: AbortSignal) => request<KnowledgeLibraryStatus>('/status', { signal }),
-  list: (query: string, source: string, offset: number, signal?: AbortSignal) => {
+  overview: (signal?: AbortSignal) => request<KnowledgeOverview>('/overview', { signal }),
+  list: (
+    query: string,
+    source: string,
+    offset: number,
+    signal?: AbortSignal,
+    filters?: Pick<
+      KnowledgeListOptions,
+      'kind' | 'materialType' | 'level' | 'topic' | 'reviewState' | 'includeHistory'
+    >
+  ) => {
     const params = new URLSearchParams({ query, offset: String(offset), limit: '20' });
     if (source !== 'all') params.set('source', source);
+    for (const [key, value] of Object.entries(filters ?? {})) {
+      if (value) params.set(key, String(value));
+    }
     return request<KnowledgeListResult>(`/entries?${params}`, { signal });
   },
   detail: (id: string, signal?: AbortSignal) =>
     request<KnowledgeEntryDetail>(`/entries/${encodeURIComponent(id)}`, { signal }),
-  create: (title: string, markdown: string) =>
+  create: (title: string, markdown: string, organization?: KnowledgeEntry['organization']) =>
     request<KnowledgeEntryDetail>('/entries', {
       method: 'POST',
-      body: JSON.stringify({ title, markdown }),
+      body: JSON.stringify({ title, markdown, organization }),
     }),
-  save: (id: string, title: string, markdown: string, expectedUpdatedAt: string) =>
+  save: (
+    id: string,
+    title: string,
+    markdown: string,
+    expectedUpdatedAt: string,
+    organization?: KnowledgeEntry['organization']
+  ) =>
     request<KnowledgeEntryDetail>(`/entries/${encodeURIComponent(id)}`, {
       method: 'PATCH',
-      body: JSON.stringify({ title, markdown, expectedUpdatedAt }),
+      body: JSON.stringify({ title, markdown, expectedUpdatedAt, organization }),
+    }),
+  organize: (input: {
+    entryIds: string[];
+    title?: string;
+    topic?: string;
+    mode: 'manual' | 'automatic';
+  }) =>
+    request<KnowledgeEntryDetail>('/organize', {
+      method: 'POST',
+      body: JSON.stringify(input),
     }),
   remove: (id: string) => request<void>(`/entries/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   uploadDocument: (file: File) => {

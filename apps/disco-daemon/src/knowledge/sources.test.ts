@@ -143,6 +143,84 @@ describe('knowledge source archives', () => {
     expect(paths.sort()).toEqual([active, archived].sort());
   });
 
+  it('keeps a forked thread identity instead of overwriting its parent on inherited session headers', async () => {
+    const path = join(root, 'child.jsonl');
+    const raw = [
+      {
+        type: 'session_meta',
+        payload: {
+          id: 'child',
+          source: {
+            subagent: {
+              thread_spawn: { parent_thread_id: 'parent', agent_path: '/root/archive_audit' },
+            },
+          },
+        },
+      },
+      { type: 'session_meta', payload: { id: 'parent' } },
+      {
+        type: 'response_item',
+        payload: { type: 'message', role: 'user', content: '继承的父请求' },
+      },
+      {
+        type: 'response_item',
+        payload: { type: 'message', role: 'assistant', content: '子任务的结果' },
+      },
+    ]
+      .map((row) => JSON.stringify(row))
+      .join('\n');
+    await writeFile(path, raw);
+    const source = (await readHostRollout(path))!;
+    expect(source.sourceId).toBe(await hostRolloutIdentity(path));
+    expect(source.sourceId).toBe('child');
+    expect(source.title).toBe('Codex 子任务 · archive_audit');
+    expect(source.sourceUrl).toBe('codex://threads/child');
+    expect(source.rawContent).toBe(raw);
+    expect(source.markdown).toContain('子任务的结果');
+  });
+
+  it('omits known injected context only from the readable projection and derives titles from the request', async () => {
+    const path = join(root, 'injected.jsonl');
+    const raw = [
+      { type: 'session_meta', payload: { id: 'real-user' } },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: '<recommended_plugins>very long plugin list</recommended_plugins>',
+        },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content:
+            '<environment_context>private working directory</environment_context>\n<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>',
+        },
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content:
+            '# Files mentioned by the user:\n\n## sample.pdf: E:/attachments/sample.pdf\n\n## My request:\n整理这份文档\n保留来源。',
+        },
+      },
+    ]
+      .map((row) => JSON.stringify(row))
+      .join('\n');
+    await writeFile(path, raw);
+    const source = (await readHostRollout(path))!;
+    expect(source.title).toBe('整理这份文档 保留来源。');
+    expect(source.markdown).not.toContain('very long plugin list');
+    expect(source.markdown).not.toContain('private working directory');
+    expect(source.markdown).toContain('整理这份文档\n保留来源。');
+    expect(source.rawContent).toBe(raw);
+  });
+
   it('allows only canonical attachments under explicitly configured roots and rejects junction escapes', async () => {
     const attachments = join(root, 'attachments');
     const sibling = join(root, 'attachments-other');

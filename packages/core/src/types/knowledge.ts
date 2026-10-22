@@ -8,9 +8,25 @@ export type KnowledgeSource = 'disco' | 'codex' | 'manual';
 export type KnowledgeKind = 'conversation' | 'document' | 'note';
 export type KnowledgeIndexStatus = 'pending' | 'indexed' | 'error';
 export type KnowledgeParseStatus = 'pending' | 'parsed' | 'unsupported' | 'error';
+export type KnowledgeMaterialType = 'conversation' | 'image' | 'document' | 'file' | 'note';
+export interface KnowledgeOrganization {
+  topic: string;
+  summary?: string;
+  level: 'source' | 'summary' | 'knowledge';
+  state: 'draft' | 'reviewed';
+  tags?: string[];
+  sourceEntryIds?: string[];
+}
+export interface KnowledgeGeneration {
+  state: 'queued' | 'running' | 'failed' | 'complete';
+  message?: string;
+  attempts?: number;
+  retryAt?: string;
+  requestedTitle?: string;
+}
 
 export interface KnowledgeSourceVersion {
-  kind: 'codex-rollout';
+  kind: 'codex-rollout' | 'codex-sqlite';
   sha256: string;
   byteLength: number;
   recordCount: number;
@@ -18,6 +34,10 @@ export interface KnowledgeSourceVersion {
   lastEventAt?: string;
   complete: boolean;
   malformedRecords: number;
+  /** Stable per-thread SQLite projection watermark, not the whole database mtime. */
+  signature?: string;
+  /** Nonempty user/assistant messages after filtering injected app context. */
+  visibleMessages?: number;
 }
 
 export interface KnowledgeAttachment {
@@ -42,6 +62,17 @@ export interface KnowledgeEntry {
   relativePath: string;
   sizeBytes: number;
   indexStatus: KnowledgeIndexStatus;
+  materialType?: KnowledgeMaterialType;
+  organization?: KnowledgeOrganization;
+  generation?: KnowledgeGeneration;
+  indexMessage?: string;
+  indexAttempts?: number;
+  indexRetryAt?: string;
+  summaryMessage?: string;
+  summaryAttempts?: number;
+  summaryRetryAt?: string;
+  /** Superseded import copies remain readable/exportable, outside the normal catalog. */
+  historical?: boolean;
   sourceUpdatedAt?: string;
   sourceUrl?: string;
   attachments?: KnowledgeAttachment[];
@@ -58,6 +89,7 @@ export interface KnowledgeEntryDetail {
   markdown: string;
   /** Used to prevent an indexing job from marking a newer edit as indexed. */
   contentHash: string;
+  sources?: Array<{ id: string; title: string; kind?: KnowledgeKind; available: boolean }>;
 }
 
 export interface KnowledgeUploadResult extends KnowledgeEntryDetail {
@@ -77,12 +109,21 @@ export interface KnowledgeSourceInput {
   attachments?: KnowledgeAttachment[];
   derivedFrom?: { entryId: string; contentHash: string };
   sourceVersion?: KnowledgeSourceVersion;
+  organization?: KnowledgeOrganization;
+  generation?: KnowledgeGeneration;
+  /** Server-only: automatic drafts remain writable until a human edits them. */
+  automated?: boolean;
 }
 
 export interface KnowledgeListOptions {
   query?: string;
   kind?: KnowledgeKind;
   source?: KnowledgeSource;
+  materialType?: KnowledgeMaterialType;
+  level?: KnowledgeOrganization['level'];
+  topic?: string;
+  reviewState?: KnowledgeOrganization['state'];
+  includeHistory?: boolean;
   offset?: number;
   limit?: number;
 }
@@ -90,6 +131,12 @@ export interface KnowledgeListOptions {
 export interface KnowledgeListResult {
   entries: KnowledgeEntry[];
   total: number;
+}
+
+export interface KnowledgeOverview {
+  topics: Array<{ topic: string; count: number }>;
+  counts: Record<KnowledgeOrganization['level'], number>;
+  materials: Record<KnowledgeMaterialType, number>;
 }
 
 export interface KnowledgeLibraryStatus {
@@ -107,6 +154,25 @@ export interface KnowledgeLibraryStatus {
     message?: string;
     lastCompletedAt?: string;
     processed?: number;
+    intervalSeconds?: number;
+    nextRunAt?: string;
+  };
+  processing?: {
+    index: {
+      pending: number;
+      indexed: number;
+      failed: number;
+      unsupported: number;
+      active?: string;
+      message?: string;
+    };
+    summary: {
+      pending: number;
+      completed: number;
+      failed: number;
+      active?: string;
+      message?: string;
+    };
   };
   engine?: { status: 'ready' | 'unavailable' | 'disabled'; message?: string };
 }

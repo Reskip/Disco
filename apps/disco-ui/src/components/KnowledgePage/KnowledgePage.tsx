@@ -1,6 +1,5 @@
 import {
   ArrowLeftOutlined,
-  BookOutlined,
   DeleteOutlined,
   FileTextOutlined,
   PlusOutlined,
@@ -10,18 +9,24 @@ import type {
   KnowledgeEntry,
   KnowledgeEntryDetail,
   KnowledgeLibraryStatus,
+  KnowledgeListOptions,
   KnowledgeListResult,
+  KnowledgeOrganization,
+  KnowledgeOverview,
 } from '@disco/core/types';
 import {
   Alert,
   App as AntApp,
   Button,
   Card,
+  Checkbox,
   Empty,
   Flex,
   Input,
   List,
+  Modal,
   Pagination,
+  Segmented,
   Select,
   Skeleton,
   Space,
@@ -32,12 +37,16 @@ import {
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { KnowledgeEntryDrawer } from './KnowledgeEntryDrawer';
 import { KnowledgeImportActions } from './KnowledgeImportActions';
+import { KnowledgeProgress } from './KnowledgeProgress';
 import { knowledgeApi } from './knowledgeApi';
 import {
+  entryOrganization,
   errorMessage,
   formatDate,
+  GENERATION_LABELS,
   INDEX_LABELS,
-  KIND_LABELS,
+  LEVEL_LABELS,
+  MATERIAL_LABELS,
   PARSE_LABELS,
   SOURCE_LABELS,
 } from './knowledgePresentation';
@@ -56,6 +65,20 @@ export function KnowledgePage({
   const [search, setSearch] = useState('');
   const [query, setQuery] = useState('');
   const [source, setSource] = useState('all');
+  const [view, setView] = useState<'notes' | 'sources'>('notes');
+  const [level, setLevel] = useState<'all' | 'summary' | 'knowledge'>('all');
+  const [material, setMaterial] = useState<'all' | 'conversation' | 'document' | 'image' | 'file'>(
+    'all'
+  );
+  const [reviewState, setReviewState] = useState<'all' | 'draft' | 'reviewed'>('all');
+  const [topic, setTopic] = useState('all');
+  const [includeHistory, setIncludeHistory] = useState(false);
+  const [overview, setOverview] = useState<KnowledgeOverview | null>(null);
+  const [selection, setSelection] = useState<Map<string, string>>(new Map());
+  const [organizeMode, setOrganizeMode] = useState<'manual' | 'automatic' | null>(null);
+  const [organizeTitle, setOrganizeTitle] = useState('');
+  const [organizeTopic, setOrganizeTopic] = useState('');
+  const [organizing, setOrganizing] = useState(false);
   const [offset, setOffset] = useState(0);
   const [result, setResult] = useState<KnowledgeListResult | null>(null);
   const [status, setStatus] = useState<KnowledgeLibraryStatus | null>(null);
@@ -70,14 +93,23 @@ export function KnowledgePage({
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState('');
   const [markdown, setMarkdown] = useState('');
+  const [organization, setOrganization] = useState<KnowledgeOrganization>({
+    topic: '未分类',
+    level: 'knowledge',
+    state: 'reviewed',
+  });
   const [saving, setSaving] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const detailRequestRef = useRef(0);
+  const editingRef = useRef(editing);
+  editingRef.current = editing;
   const dirty =
     editing &&
     (!detail
       ? Boolean(title || markdown)
-      : title !== detail?.entry.title || markdown !== detail?.markdown);
+      : title !== detail.entry.title ||
+        markdown !== detail.markdown ||
+        JSON.stringify(organization) !== JSON.stringify(entryOrganization(detail.entry)));
 
   useEffect(() => {
     setSelectedId(entryId || null);
@@ -99,9 +131,24 @@ export function KnowledgePage({
     const refresh = async () => {
       if (pending || document.visibilityState === 'hidden') return;
       pending = true;
-      const [listResult, statusResult] = await Promise.allSettled([
-        knowledgeApi.list(query, source, offset, controller.signal),
+      const filters: KnowledgeListOptions = {
+        ...(view === 'notes'
+          ? {
+              kind: 'note',
+              ...(level !== 'all' ? { level } : {}),
+              ...(reviewState !== 'all' ? { reviewState } : {}),
+            }
+          : {
+              level: 'source',
+              ...(material !== 'all' ? { materialType: material } : {}),
+              includeHistory,
+            }),
+        ...(topic !== 'all' ? { topic } : {}),
+      };
+      const [listResult, statusResult, overviewResult] = await Promise.allSettled([
+        knowledgeApi.list(query, source, offset, controller.signal, filters),
         knowledgeApi.status(controller.signal),
+        knowledgeApi.overview(controller.signal),
       ]);
       if (controller.signal.aborted) return;
       if (listResult.status === 'fulfilled') {
@@ -113,6 +160,7 @@ export function KnowledgePage({
       if (statusResult.status === 'fulfilled') setStatus(statusResult.value);
       else if (listResult.status === 'fulfilled')
         setError('资料已加载，暂时无法获取后台同步状态。');
+      if (overviewResult.status === 'fulfilled') setOverview(overviewResult.value);
       setLoading(false);
       pending = false;
     };
@@ -128,7 +176,7 @@ export function KnowledgePage({
       document.removeEventListener('visibilitychange', onVisible);
       window.removeEventListener('focus', onVisible);
     };
-  }, [query, source, offset, revision]);
+  }, [query, source, offset, revision, view, level, material, reviewState, topic, includeHistory]);
 
   useEffect(() => {
     if (!selectedId) return;
@@ -144,6 +192,7 @@ export function KnowledgePage({
         setDetail(value);
         setTitle(value.entry.title);
         setMarkdown(value.markdown);
+        setOrganization(entryOrganization(value.entry));
         setDetailLoading(false);
       },
       (cause: unknown) => {
@@ -154,6 +203,41 @@ export function KnowledgePage({
     );
     return () => controller.abort();
   }, [selectedId]);
+
+  const generatingId =
+    !editing &&
+    detail?.entry.generation &&
+    ['queued', 'running', 'failed'].includes(detail.entry.generation.state)
+      ? detail.entry.id
+      : null;
+  useEffect(() => {
+    if (!generatingId) return;
+    const controller = new AbortController();
+    let pending = false;
+    const refresh = async () => {
+      if (pending || editingRef.current || document.visibilityState === 'hidden') return;
+      pending = true;
+      try {
+        const value = await knowledgeApi.detail(generatingId, controller.signal);
+        if (controller.signal.aborted || editingRef.current) return;
+        setDetail(value);
+        setTitle(value.entry.title);
+        setMarkdown(value.markdown);
+        setOrganization(entryOrganization(value.entry));
+      } catch {
+        /* Retain the last readable draft if the connection drops. */
+      } finally {
+        pending = false;
+      }
+    };
+    const interval = window.setInterval(() => void refresh(), 5_000);
+    document.addEventListener('visibilitychange', refresh);
+    return () => {
+      controller.abort();
+      window.clearInterval(interval);
+      document.removeEventListener('visibilitychange', refresh);
+    };
+  }, [generatingId]);
 
   const closeDetail = useCallback(() => {
     if (saving) return;
@@ -181,21 +265,24 @@ export function KnowledgePage({
     setSaving(true);
     setDetailError(null);
     try {
+      const metadata = { ...organization, topic: organization.topic.trim() || '未分类' };
       const saved = !detail
-        ? await knowledgeApi.create(title.trim(), markdown)
+        ? await knowledgeApi.create(title.trim(), markdown, metadata)
         : await knowledgeApi.save(
             detail!.entry.id,
             title.trim(),
             markdown,
-            detail!.entry.updatedAt
+            detail!.entry.updatedAt,
+            metadata
           );
       setDetail(saved);
       setTitle(saved.entry.title);
       setMarkdown(saved.markdown);
+      setOrganization(entryOrganization(saved.entry));
       setEditing(false);
       setRevision((value) => value + 1);
       // Keep a newly created note in this drawer without a second detail request.
-      void message.success('已保存，检索索引将在后台更新');
+      void message.success('已保存，人工修改不会被自动总结覆盖');
     } catch (cause) {
       setDetailError(errorMessage(cause));
     } finally {
@@ -224,6 +311,11 @@ export function KnowledgePage({
         setDeletingId(entry.id);
         try {
           await knowledgeApi.remove(entry.id);
+          setSelection((previous) => {
+            const next = new Map(previous);
+            next.delete(entry.id);
+            return next;
+          });
           if (detail?.entry.id === entry.id) {
             setSelectedId(null);
             setCreating(false);
@@ -241,6 +333,93 @@ export function KnowledgePage({
         }
       },
     });
+  };
+
+  const confirmReviewed = async () => {
+    if (!detail || saving) return;
+    setSaving(true);
+    setDetailError(null);
+    try {
+      const saved = await knowledgeApi.save(
+        detail.entry.id,
+        detail.entry.title,
+        detail.markdown,
+        detail.entry.updatedAt,
+        { ...entryOrganization(detail.entry), state: 'reviewed' }
+      );
+      setDetail(saved);
+      setOrganization(entryOrganization(saved.entry));
+      setRevision((value) => value + 1);
+      void message.success('已确认，由你维护，自动整理不会覆盖');
+    } catch (cause) {
+      setDetailError(errorMessage(cause));
+    } finally {
+      setSaving(false);
+    }
+  };
+  const changeView = (value: 'notes' | 'sources') => {
+    setView(value);
+    setOffset(0);
+    setResult(null);
+  };
+  const openEntry = (id: string) => {
+    setCreating(false);
+    setSelectedId(id);
+  };
+  const startOrganizing = (mode: 'manual' | 'automatic') => {
+    setOrganizeTitle('');
+    setOrganizeTopic(topic === 'all' ? '' : topic);
+    setOrganizeMode(mode);
+  };
+  const organize = async () => {
+    if (!organizeMode || !selection.size || organizing) return;
+    setOrganizing(true);
+    try {
+      const mode = organizeMode;
+      const saved = await knowledgeApi.organize({
+        entryIds: [...selection.keys()],
+        title: organizeTitle.trim() || undefined,
+        topic: organizeTopic.trim() || undefined,
+        mode,
+      });
+      setOrganizeMode(null);
+      setSelection(new Map());
+      setView('notes');
+      setOffset(0);
+      setResult(null);
+      setSource('all');
+      setTopic('all');
+      setLevel('all');
+      setReviewState('all');
+      setSearch('');
+      setQuery('');
+      setRevision((value) => value + 1);
+      if (mode === 'manual') {
+        setSelectedId(null);
+        setCreating(true);
+        setDetailLoading(false);
+        setDetailError(null);
+        setDetail(saved);
+        setTitle(saved.entry.title);
+        setMarkdown(saved.markdown);
+        setOrganization(entryOrganization(saved.entry));
+        setEditing(true);
+      } else {
+        openEntry(saved.entry.id);
+        void message.success('已加入后台整理队列，完成后可在知识笔记中审阅');
+      }
+    } catch (cause) {
+      void message.error(errorMessage(cause));
+    } finally {
+      setOrganizing(false);
+    }
+  };
+  const visibleEntries = result?.entries ?? [];
+  const selectedVisibleCount = visibleEntries.filter((entry) => selection.has(entry.id)).length;
+  const filterStyle = {
+    minWidth: 130,
+    flex: mobile ? '1 1 140px' : undefined,
+    fontSize: mobile ? 16 : undefined,
   };
 
   return (
@@ -281,6 +460,11 @@ export function KnowledgePage({
               setDetailLoading(false);
               setTitle('');
               setMarkdown('');
+              setOrganization({
+                topic: topic === 'all' ? '未分类' : topic,
+                level: 'knowledge',
+                state: 'reviewed',
+              });
               setEditing(true);
             }}
           >
@@ -289,47 +473,26 @@ export function KnowledgePage({
         </Flex>
         <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
           <Typography.Paragraph type="secondary" style={{ margin: 0 }}>
-            会话归档与资料独立保留。直接编辑 Markdown 后自动同步，人工修改不会被自动总结覆盖。
+            原始资料保留出处，摘要提取要点，专题知识沉淀结论。人工修改的笔记始终由你维护。
           </Typography.Paragraph>
           <KnowledgeImportActions onChanged={() => setRevision((value) => value + 1)} />
-          {status && (
-            <Card size="small">
-              <Flex wrap justify="space-between" gap={token.marginSM}>
-                <Space wrap size="middle">
-                  <Typography.Text>
-                    <BookOutlined /> {status.total} 份资料
-                  </Typography.Text>
-                  <Typography.Text type="secondary">{status.conversations} 段会话</Typography.Text>
-                  <Typography.Text type="secondary">{status.documents} 份文档</Typography.Text>
-                  <Typography.Text type="secondary">{status.notes} 篇笔记</Typography.Text>
-                  <Typography.Text type="secondary">{status.pendingIndex} 份待索引</Typography.Text>
-                </Space>
-                <Typography.Text
-                  role="status"
-                  aria-live="polite"
-                  type={status.sync?.state === 'error' ? 'danger' : 'secondary'}
-                >
-                  {status.sync?.message ||
-                    (status.sync?.state === 'running'
-                      ? '正在导入历史资料…'
-                      : status.sync?.lastCompletedAt
-                        ? `最近同步 ${formatDate(status.sync.lastCompletedAt)}`
-                        : '后台自动同步')}
-                  {status.sync?.state === 'running' &&
-                    Boolean(status.sync.processed) &&
-                    ` · 已处理 ${status.sync.processed} 份`}
-                </Typography.Text>
-              </Flex>
-              {status.engine && status.engine.status !== 'ready' && (
-                <Typography.Paragraph
-                  type="secondary"
-                  style={{ marginTop: token.marginSM, marginBottom: 0 }}
-                >
-                  {status.engine.message || '语义检索暂不可用，资料归档与关键词查找仍可使用。'}
-                </Typography.Paragraph>
-              )}
-            </Card>
-          )}
+          {status && <KnowledgeProgress status={status} />}
+          <Segmented
+            block={mobile}
+            aria-label="知识库视图"
+            value={view}
+            onChange={changeView}
+            options={[
+              {
+                value: 'notes',
+                label: `知识笔记${overview ? ` ${overview.counts.summary + overview.counts.knowledge}` : ''}`,
+              },
+              {
+                value: 'sources',
+                label: `原始资料${overview ? ` ${overview.counts.source}` : ''}`,
+              },
+            ]}
+          />
           <Flex wrap gap={token.marginSM}>
             <Input
               value={search}
@@ -341,23 +504,147 @@ export function KnowledgePage({
               style={{ flex: '1 1 240px', fontSize: mobile ? 16 : undefined }}
             />
             <Select
+              aria-label="知识主题"
+              value={topic}
+              onChange={(value) => {
+                setTopic(value);
+                setOffset(0);
+              }}
+              style={filterStyle}
+              showSearch
+              optionFilterProp="label"
+              options={[
+                { value: 'all', label: '全部主题' },
+                ...(overview?.topics ?? []).map((item) => ({
+                  value: item.topic,
+                  label: `${item.topic} (${item.count})`,
+                })),
+              ]}
+            />
+            <Select
               aria-label="资料来源"
               value={source}
               onChange={(value) => {
                 setSource(value);
                 setOffset(0);
               }}
-              style={{ minWidth: 160, fontSize: mobile ? 16 : undefined }}
+              style={filterStyle}
               options={[
                 { value: 'all', label: '全部来源' },
                 ...Object.entries(SOURCE_LABELS).map(([value, label]) => ({ value, label })),
               ]}
             />
+            {view === 'notes' ? (
+              <>
+                <Select
+                  aria-label="知识层级"
+                  value={level}
+                  onChange={(value) => {
+                    setLevel(value);
+                    setOffset(0);
+                  }}
+                  style={filterStyle}
+                  options={[
+                    { value: 'all', label: '全部笔记' },
+                    { value: 'summary', label: '摘要' },
+                    { value: 'knowledge', label: '专题知识' },
+                  ]}
+                />
+                <Select
+                  aria-label="审阅状态"
+                  value={reviewState}
+                  onChange={(value) => {
+                    setReviewState(value);
+                    setOffset(0);
+                  }}
+                  style={filterStyle}
+                  options={[
+                    { value: 'all', label: '全部状态' },
+                    { value: 'draft', label: '待审阅' },
+                    { value: 'reviewed', label: '已确认' },
+                  ]}
+                />
+              </>
+            ) : (
+              <Select
+                aria-label="资料类型"
+                value={material}
+                onChange={(value) => {
+                  setMaterial(value);
+                  setOffset(0);
+                }}
+                style={filterStyle}
+                options={[
+                  { value: 'all', label: '全部类型' },
+                  ...(['conversation', 'document', 'image', 'file'] as const).map((value) => ({
+                    value,
+                    label: MATERIAL_LABELS[value],
+                  })),
+                ]}
+              />
+            )}
           </Flex>
           {error && (
             <Alert type="warning" showIcon title={error} description="连接恢复后会自动重试。" />
           )}
-          <Card styles={{ body: { padding: `0 ${token.paddingLG}px` } }}>
+          {view === 'sources' && (
+            <Checkbox
+              checked={includeHistory}
+              onChange={(event) => {
+                setIncludeHistory(event.target.checked);
+                setOffset(0);
+              }}
+            >
+              包含修复前的历史副本
+            </Checkbox>
+          )}
+          <Card styles={{ body: { padding: `0 ${mobile ? token.padding : token.paddingLG}px` } }}>
+            <Flex
+              wrap
+              justify="space-between"
+              align="center"
+              gap={token.marginSM}
+              style={{ paddingBlock: token.paddingSM }}
+            >
+              <Space>
+                <Checkbox
+                  aria-label="选择本页资料"
+                  disabled={!visibleEntries.length}
+                  checked={
+                    Boolean(visibleEntries.length) && selectedVisibleCount === visibleEntries.length
+                  }
+                  indeterminate={
+                    selectedVisibleCount > 0 && selectedVisibleCount < visibleEntries.length
+                  }
+                  onChange={(event) =>
+                    setSelection((previous) => {
+                      const next = new Map(previous);
+                      for (const entry of visibleEntries) {
+                        if (event.target.checked) next.set(entry.id, entry.title);
+                        else next.delete(entry.id);
+                      }
+                      return next;
+                    })
+                  }
+                />
+                <Typography.Text type="secondary">
+                  {selection.size ? `已选 ${selection.size} 份` : `共 ${result?.total ?? 0} 份`}
+                </Typography.Text>
+                {!!selection.size && (
+                  <Button type="link" onClick={() => setSelection(new Map())}>
+                    清空选择
+                  </Button>
+                )}
+              </Space>
+              <Space wrap>
+                <Button disabled={!selection.size} onClick={() => startOrganizing('manual')}>
+                  人工整理
+                </Button>
+                <Button disabled={!selection.size} onClick={() => startOrganizing('automatic')}>
+                  自动整理所选
+                </Button>
+              </Space>
+            </Flex>
             {loading && !result ? (
               <Skeleton active paragraph={{ rows: 6 }} style={{ paddingBlock: token.paddingLG }} />
             ) : (
@@ -370,83 +657,132 @@ export function KnowledgePage({
                   ) : (
                     <Empty
                       description={
-                        query || source !== 'all'
+                        query ||
+                        source !== 'all' ||
+                        topic !== 'all' ||
+                        (view === 'notes'
+                          ? level !== 'all' || reviewState !== 'all'
+                          : material !== 'all')
                           ? '没有找到匹配的资料'
-                          : '还没有资料，历史会话将在后台导入，也可以先写一篇笔记。'
+                          : view === 'notes'
+                            ? '还没有整理笔记。可从原始资料中选择内容，人工整理或生成草稿。'
+                            : '历史会话将在后台同步，也可以增加本地资料。'
                       }
-                    />
+                    >
+                      {view === 'notes' && (
+                        <Button onClick={() => changeView('sources')}>查看原始资料</Button>
+                      )}
+                    </Empty>
                   ),
                 }}
-                renderItem={(entry) => (
-                  <List.Item>
-                    <Flex
-                      style={{ width: '100%', minWidth: 0 }}
-                      gap={token.marginSM}
-                      align="center"
-                    >
-                      <FileTextOutlined
-                        style={{ color: token.colorTextSecondary, fontSize: token.fontSizeLG }}
-                      />
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <Button
-                          type="link"
-                          onClick={() => {
-                            setCreating(false);
-                            setSelectedId(entry.id);
-                          }}
-                          style={{
-                            padding: 0,
-                            maxWidth: '100%',
-                            height: 'auto',
-                            whiteSpace: 'normal',
-                            textAlign: 'left',
-                          }}
-                        >
-                          {entry.title || '未命名资料'}
-                        </Button>
-                        {entry.snippet && (
-                          <Typography.Paragraph
-                            type="secondary"
-                            ellipsis={{ rows: 2 }}
-                            style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}
-                          >
-                            {entry.snippet}
-                          </Typography.Paragraph>
-                        )}
-                        <Flex
-                          wrap
-                          align="center"
-                          gap={token.marginXS}
+                renderItem={(entry) => {
+                  const metadata = entryOrganization(entry);
+                  return (
+                    <List.Item>
+                      <Flex
+                        style={{ width: '100%', minWidth: 0 }}
+                        gap={token.marginSM}
+                        align="flex-start"
+                      >
+                        <Checkbox
+                          aria-label={`选择 ${entry.title}`}
+                          checked={selection.has(entry.id)}
                           style={{ marginTop: token.marginXS }}
-                        >
-                          <Typography.Text type="secondary">
-                            {SOURCE_LABELS[entry.source]} · {KIND_LABELS[entry.kind]}
-                          </Typography.Text>
-                          <Typography.Text type="secondary">
-                            {formatDate(entry.updatedAt)}
-                          </Typography.Text>
-                          {entry.humanEdited && <Tag>人工编辑</Tag>}
-                          <Tag color={entry.indexStatus === 'error' ? 'error' : undefined}>
-                            {INDEX_LABELS[entry.indexStatus]}
-                          </Tag>
-                          {entry.parseStatus && entry.parseStatus !== 'parsed' && (
-                            <Tag color={entry.parseStatus === 'error' ? 'warning' : undefined}>
-                              {PARSE_LABELS[entry.parseStatus]}
-                            </Tag>
+                          onChange={(event) =>
+                            setSelection((previous) => {
+                              const next = new Map(previous);
+                              if (event.target.checked) next.set(entry.id, entry.title);
+                              else next.delete(entry.id);
+                              return next;
+                            })
+                          }
+                        />
+                        {!mobile && (
+                          <FileTextOutlined
+                            style={{ color: token.colorTextSecondary, fontSize: token.fontSizeLG }}
+                          />
+                        )}
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <Button
+                            type="link"
+                            onClick={() => {
+                              setCreating(false);
+                              setSelectedId(entry.id);
+                            }}
+                            style={{
+                              padding: 0,
+                              maxWidth: '100%',
+                              height: 'auto',
+                              whiteSpace: 'normal',
+                              textAlign: 'left',
+                              overflowWrap: 'anywhere',
+                            }}
+                          >
+                            {entry.title || '未命名资料'}
+                          </Button>
+                          {(metadata.summary || entry.snippet) && (
+                            <Typography.Paragraph
+                              type="secondary"
+                              ellipsis={{ rows: 2 }}
+                              style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}
+                            >
+                              {metadata.summary || entry.snippet}
+                            </Typography.Paragraph>
                           )}
-                        </Flex>
-                      </div>
-                      <Button
-                        type="text"
-                        danger
-                        icon={<DeleteOutlined />}
-                        aria-label={`删除 ${entry.title}`}
-                        loading={deletingId === entry.id}
-                        onClick={() => removeEntry(entry)}
-                      />
-                    </Flex>
-                  </List.Item>
-                )}
+                          <Flex
+                            wrap
+                            align="center"
+                            gap={token.marginXS}
+                            style={{ marginTop: token.marginXS }}
+                          >
+                            <Tag>{metadata.topic}</Tag>
+                            <Typography.Text type="secondary">
+                              {entry.kind === 'note'
+                                ? LEVEL_LABELS[metadata.level]
+                                : MATERIAL_LABELS[entry.materialType ?? entry.kind]}
+                            </Typography.Text>
+                            <Typography.Text type="secondary">
+                              {SOURCE_LABELS[entry.source]}
+                            </Typography.Text>
+                            <Typography.Text type="secondary">
+                              {formatDate(entry.updatedAt)}
+                            </Typography.Text>
+                            {entry.kind === 'note' && (
+                              <Tag>{metadata.state === 'reviewed' ? '已确认' : '待审阅'}</Tag>
+                            )}
+                            {entry.humanEdited && <Tag>人工维护</Tag>}
+                            {entry.historical && <Tag>历史副本</Tag>}
+                            {entry.generation && entry.generation.state !== 'complete' && (
+                              <Tag
+                                color={
+                                  entry.generation.state === 'failed' ? 'warning' : 'processing'
+                                }
+                              >
+                                {GENERATION_LABELS[entry.generation.state]}
+                              </Tag>
+                            )}
+                            <Tag color={entry.indexStatus === 'error' ? 'error' : undefined}>
+                              {INDEX_LABELS[entry.indexStatus]}
+                            </Tag>
+                            {entry.parseStatus && entry.parseStatus !== 'parsed' && (
+                              <Tag color={entry.parseStatus === 'error' ? 'warning' : undefined}>
+                                {PARSE_LABELS[entry.parseStatus]}
+                              </Tag>
+                            )}
+                          </Flex>
+                        </div>
+                        <Button
+                          type="text"
+                          danger
+                          icon={<DeleteOutlined />}
+                          aria-label={`删除 ${entry.title}`}
+                          loading={deletingId === entry.id}
+                          onClick={() => removeEntry(entry)}
+                        />
+                      </Flex>
+                    </List.Item>
+                  );
+                }}
               />
             )}
           </Card>
@@ -469,6 +805,8 @@ export function KnowledgePage({
         saving={saving}
         title={title}
         markdown={markdown}
+        organization={organization}
+        topics={overview?.topics.map((item) => item.topic) ?? []}
         detail={detail}
         detailLoading={detailLoading}
         detailError={detailError}
@@ -476,9 +814,52 @@ export function KnowledgePage({
         setEditing={setEditing}
         setTitle={setTitle}
         setMarkdown={setMarkdown}
+        setOrganization={setOrganization}
         save={save}
+        confirmReviewed={confirmReviewed}
+        openEntry={openEntry}
         removeEntry={removeEntry}
       />
+      <Modal
+        open={Boolean(organizeMode)}
+        title={organizeMode === 'manual' ? '创建人工整理笔记' : '自动整理所选资料'}
+        onCancel={() => {
+          if (!organizing) setOrganizeMode(null);
+        }}
+        onOk={() => void organize()}
+        confirmLoading={organizing}
+        okText={organizeMode === 'manual' ? '创建并编辑' : '加入整理队列'}
+        cancelText="取消"
+        maskClosable={!organizing}
+      >
+        <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
+          <Typography.Paragraph style={{ margin: 0 }}>
+            {organizeMode === 'manual'
+              ? '根据所选资料建立带来源引用的笔记，接下来由你填写要点和结论。'
+              : '后台提取共识、结论和未解决事项，生成待审阅草稿。原始资料保持完整，人工维护的笔记不会被覆盖。'}
+          </Typography.Paragraph>
+          <Typography.Text type="secondary">
+            已选 {selection.size} 份：{[...selection.values()].slice(0, 3).join('、')}
+            {selection.size > 3 ? '…' : ''}
+          </Typography.Text>
+          <Input
+            aria-label="整理笔记标题"
+            placeholder="笔记标题（可选）"
+            value={organizeTitle}
+            onChange={(event) => setOrganizeTitle(event.target.value)}
+            disabled={organizing}
+            style={{ fontSize: mobile ? 16 : undefined }}
+          />
+          <Input
+            aria-label="整理笔记主题"
+            placeholder="归入主题，例如产品设计（可选）"
+            value={organizeTopic}
+            onChange={(event) => setOrganizeTopic(event.target.value)}
+            disabled={organizing}
+            style={{ fontSize: mobile ? 16 : undefined }}
+          />
+        </Space>
+      </Modal>
     </div>
   );
 }

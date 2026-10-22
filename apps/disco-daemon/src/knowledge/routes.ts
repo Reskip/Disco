@@ -9,7 +9,15 @@ import {
   users,
 } from '@disco/core/db';
 import type { Application } from '@disco/core/feathers';
-import type { AuthenticatedParams, KnowledgeOwner, KnowledgeSource, User } from '@disco/core/types';
+import type {
+  AuthenticatedParams,
+  KnowledgeKind,
+  KnowledgeMaterialType,
+  KnowledgeOrganization,
+  KnowledgeOwner,
+  KnowledgeSource,
+  User,
+} from '@disco/core/types';
 import archiver from 'archiver';
 import {
   type NextFunction,
@@ -78,6 +86,35 @@ function numberField(value: unknown, fallback: number, max: number): number {
 }
 const missing = () => Object.assign(new Error('资料不存在或已删除'), { status: 404 });
 
+function choice<T extends string>(
+  value: unknown,
+  allowed: readonly T[],
+  label: string
+): T | undefined {
+  if (value === undefined || value === '') return undefined;
+  if (typeof value === 'string' && allowed.includes(value as T)) return value as T;
+  throw Object.assign(new Error(`${label}无效`), { status: 400 });
+}
+
+function grouping(value: unknown): KnowledgeOrganization | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw Object.assign(new Error('分类无效'), { status: 400 });
+  const data = value as Record<string, unknown>;
+  const topic = textField(data.topic, '主题').trim();
+  const level = choice(data.level, ['source', 'summary', 'knowledge'] as const, '层级');
+  const state = choice(data.state, ['draft', 'reviewed'] as const, '确认状态');
+  if (
+    !topic ||
+    !level ||
+    !state ||
+    (data.tags !== undefined &&
+      (!Array.isArray(data.tags) || data.tags.some((tag) => typeof tag !== 'string')))
+  )
+    throw Object.assign(new Error('请填写完整分类'), { status: 400 });
+  return { topic, level, state, tags: data.tags as string[] | undefined };
+}
+
 export async function registerKnowledgeRoutes(input: {
   app: Application;
   db: TenantScopeAwareDatabase;
@@ -126,11 +163,28 @@ export async function registerKnowledgeRoutes(input: {
   });
 
   router.get('/status', async (req, res) => res.json(await runtime.status(ownerOf(req))));
+  router.get('/overview', async (req, res) =>
+    res.json(await runtime.library.overview(ownerOf(req)))
+  );
   router.get('/entries', async (req, res) => {
     res.json(
       await runtime.library.list(ownerOf(req), {
         query: scalar(req.query.query),
         source: sourceFilter(req.query.source),
+        kind: choice<KnowledgeKind>(
+          req.query.kind,
+          ['conversation', 'document', 'note'],
+          '资料类型'
+        ),
+        materialType: choice<KnowledgeMaterialType>(
+          req.query.materialType,
+          ['conversation', 'image', 'document', 'file', 'note'],
+          '文件类型'
+        ),
+        level: choice(req.query.level, ['source', 'summary', 'knowledge'] as const, '知识层级'),
+        topic: scalar(req.query.topic),
+        reviewState: choice(req.query.reviewState, ['draft', 'reviewed'] as const, '确认状态'),
+        includeHistory: req.query.includeHistory === 'true',
         offset: numberField(req.query.offset, 0, Number.MAX_SAFE_INTEGER),
         limit: Math.max(1, numberField(req.query.limit, 40, 100)),
       })
@@ -168,19 +222,49 @@ export async function registerKnowledgeRoutes(input: {
         kind: 'note',
         title,
         markdown: textField(req.body?.markdown, '正文'),
+        organization: grouping(req.body?.organization) ?? {
+          topic: '未分类',
+          level: 'knowledge',
+          state: 'reviewed',
+        },
       })
     );
   });
   router.patch('/entries/:id', async (req, res) => {
+    const current = await runtime.library.get(ownerOf(req), String(req.params.id));
+    if (!current) throw missing();
+    const group = grouping(req.body?.organization);
     const detail = await runtime.library.edit(
       ownerOf(req),
       String(req.params.id),
       textField(req.body?.markdown, '正文'),
       scalar(req.body?.expectedUpdatedAt),
-      scalar(req.body?.title)
+      scalar(req.body?.title),
+      group
+        ? {
+            ...current.entry.organization,
+            ...group,
+            sourceEntryIds: current.entry.organization?.sourceEntryIds,
+          }
+        : undefined
     );
     if (!detail) throw missing();
-    res.json(detail);
+    res.json(await runtime.library.get(ownerOf(req), detail.entry.id));
+  });
+  router.post('/organize', async (req, res) => {
+    const ids = req.body?.entryIds;
+    if (!Array.isArray(ids) || ids.some((id) => typeof id !== 'string'))
+      throw Object.assign(new Error('请选择要整理的资料'), { status: 400 });
+    const mode = choice(req.body?.mode, ['manual', 'automatic'] as const, '整理方式');
+    if (!mode) throw Object.assign(new Error('请选择整理方式'), { status: 400 });
+    res.status(201).json(
+      await runtime.organize(ownerOf(req), {
+        entryIds: ids,
+        title: scalar(req.body?.title),
+        topic: scalar(req.body?.topic),
+        mode,
+      })
+    );
   });
   router.delete('/entries/:id', async (req, res) => {
     if (!(await runtime.remove(ownerOf(req), String(req.params.id)))) throw missing();

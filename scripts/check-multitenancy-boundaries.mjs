@@ -134,6 +134,10 @@ const checks = [
     baseline: {
       // Test-only async flush helpers / event loop flushes.
       'apps/disco-daemon/src/utils/tenant-db-scope.test.ts': 1,
+      // The read-only Codex SQLite snapshot test yields until its private temp
+      // export starts, then appends through a separate WAL writer to verify a
+      // consistent snapshot. It schedules no daemon, tenant DB, or realtime work.
+      'apps/disco-daemon/src/knowledge/sources-sqlite.test.ts': 1,
       // The two tenant-aware deferral helpers deliberately leave the current
       // ALS store before scheduling and then re-enter identity or DB scope.
       'apps/disco-daemon/src/utils/tenant-db-scope.ts': 2,

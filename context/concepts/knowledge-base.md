@@ -12,11 +12,34 @@ stream an export to a user-selected local file; other browsers use a Blob fallba
 The operator-only `DISCO_KNOWLEDGE_CONFIG` JSON maps the host Codex home to a
 specific Disco tenant/user. Only that user shares the host archive and MCP
 connector. Credentials are not stored in the source checkout or export.
-The local worker scans active and archived host transcripts plus all owned Disco
-sessions and active uploads. It first archives originals, then builds local
-semantic indexes, then processes at most one summary per minute across owners
-in rotating order. It does not overwrite user-edited Markdown. Summaries are
-separate, versioned notes with links to their sources.
+Three independent background workers handle archival, extraction/indexing, and
+knowledge organization. A slow embedding request or model completion cannot
+hold up the next archive scan. The archive worker starts three seconds after
+startup, then schedules its next scan thirty seconds after the current scan
+finishes. This is a polling interval, not a promise that a large first import
+finishes within thirty seconds. Index work resumes three seconds after its pass;
+the summary scheduler checks every fifteen seconds and starts jobs at least one
+minute apart, rotating owners. Shutdown cancels owned index/model operations.
+
+For current host Codex versions, the archive reader uses the explicitly selected
+home's `state_N.sqlite` and `thread_history_N.sqlite` in read-only/query-only mode.
+It includes active, archived, and history-only deleted threads. A separate fixed
+Node child process performs catalog scans and full row export so synchronous
+SQLite and large JSON decoding cannot block chat HTTP/realtime. Complete raw
+rows, tool data, metadata, and provenance stream into a SHA-256-verified JSONL
+archive; readable Markdown projects the conversation. Legacy JSONL sessions are
+still imported, and pre-migration copies are retained as revisions. No host
+authentication/configuration data is imported. Owned Disco sessions and retained
+uploads continue to import under their respective authenticated users.
+
+Automatic summaries start after that owner's first archive pass and only for
+eligible indexed sources. A failed file or another user's backlog does not block
+all summaries indefinitely. Manual synthesis requests can run before semantic
+indexing and are persisted as queued draft notes. Failed index and summary jobs
+store a clear message, attempt count and retry time; exponential backoff starts
+at thirty seconds and caps at thirty minutes. Other entries remain eligible.
+Notes have index priority, and unsupported originals remain downloadable with an
+explicit parsing status rather than being presented as parsed text.
 
 Transcript file times alone do not determine which copy is newer: a raw SHA-256
 prefix proves an append, while divergent copies are preserved separately.
@@ -33,6 +56,25 @@ session deletion leaves the independent archive intact. Explicit library deletio
 also removes unedited derived notes and the search copy, and creates a tombstone
 that survives re-import and export. Human-edited derived notes remain independent.
 
+## Organization and human editing
+
+The library distinguishes source archives, summary drafts, and reusable knowledge
+notes. Format filters distinguish conversations, text documents, images, files,
+and notes independently of processing success. Topic, tags, provenance and
+draft/reviewed state accompany each entry. Generated titles are short subject
+names. Automatic topic classification uses a small stable set: 软件与系统、工作与项目、
+学习与研究、硬件与设备、健康与运动、旅行与生活、创作与设计、财务与消费、其他.
+Project names and narrower terms belong in tags; users may choose their own topic.
+
+Users can select sources and either create a manual synthesis template or queue
+automatic synthesis, then edit the resulting Markdown and classification. Notes
+link back to the selected sources, and source availability is checked in the same
+owner library. Editing a queued/generated note takes ownership away from the
+worker. Saving uses optimistic revision checks; background results and later
+source changes must never overwrite the human title, Markdown or classification.
+Old divergent archive versions are retained but excluded from ordinary lists,
+automatic organization and current progress counts.
+
 `disco_knowledge_search/read/save/delete` are available to both standalone and
 agent conversations. The host bridge additionally exposes list/update. Retrieval
 instructions use knowledge only for relevant history/material questions and
@@ -41,7 +83,8 @@ respect explicit scopes; archive contents never grant tool authorization.
 The local worker is enabled in standalone mode. Auth-derived multitenancy learns
 owners from authenticated requests; a distributed/cloud installation needs its
 own scheduler and storage composition. Provider errors fall back to scoped local
-text search. The page displays pending indexes, parsing status and sync progress;
+text search. The page displays separate archive, index and organization progress,
+last sync time, current work, parsing status and per-entry retry diagnostics;
 queued or failed provider work is not reported as completed.
 
 ## Executor trust boundary

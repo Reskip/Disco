@@ -42,6 +42,89 @@ describe('portable knowledge library', () => {
     await rm(root, { recursive: true, force: true });
   });
 
+  it('classifies file formats and separates archived history from the catalog', async () => {
+    const image = (await library.upsertSource(owner, {
+      ...source,
+      sourceId: 'image',
+      kind: 'document',
+      title: '旅行.jpg',
+    }))!;
+    await library.upsertSource(owner, {
+      ...source,
+      sourceId: 'doc',
+      kind: 'document',
+      title: '说明.pdf',
+    });
+    await library.upsertSource(owner, {
+      ...source,
+      sourceId: 'file',
+      kind: 'document',
+      title: '项目.zip',
+    });
+    expect(
+      (await library.list(owner, { materialType: 'image' })).entries.map((item) => item.id)
+    ).toEqual([image.entry.id]);
+    await library.markHistorical(owner, image.entry.id);
+    expect((await library.list(owner)).total).toBe(2);
+    expect((await library.list(owner, { includeHistory: true })).total).toBe(3);
+    expect(await library.get(owner, image.entry.id)).not.toBeNull();
+  });
+
+  it('streams and validates raw archives without losing the old revision', async () => {
+    const entry = (await library.upsertSource(owner, source))!;
+    await library.preserveRawRevision(owner, entry.entry.id);
+    const bytes = Buffer.from('完整的新原始归档\n'.repeat(1000));
+    const hash = createHash('sha256').update(bytes).digest('hex');
+    async function* chunks() {
+      yield bytes.subarray(0, 321);
+      yield bytes.subarray(321);
+    }
+    await library.putRawSource(owner, entry.entry.id, { stream: chunks(), sha256: hash });
+    expect(await library.hasRawSource(owner, entry.entry.id, hash)).toBe(true);
+    expect(
+      await readFile(join(library.ownerPath(owner), `sources/${entry.entry.id}.jsonl`))
+    ).toEqual(bytes);
+    await expect(
+      library.putRawSource(owner, entry.entry.id, { stream: chunks(), sha256: 'wrong' })
+    ).rejects.toThrow('校验失败');
+    expect(await library.hasRawSource(owner, entry.entry.id, hash)).toBe(true);
+    const revisions = await readdir(join(library.ownerPath(owner), 'revisions', entry.entry.id));
+    expect(revisions.some((file) => file.endsWith('.jsonl'))).toBe(true);
+  });
+
+  it('protects a directly edited draft title, category, and generation state', async () => {
+    const draft = (await library.upsertSource(owner, {
+      ...source,
+      source: 'manual',
+      sourceId: 'draft',
+      kind: 'note',
+      automated: true,
+      generation: { state: 'queued' },
+    }))!;
+    await library.markIndexed(owner, draft.entry.id, draft.contentHash, '失败');
+    await writeFile(
+      join(library.ownerPath(owner), draft.entry.relativePath),
+      '# 人工新标题\n我的结论'
+    );
+    const updated = await library.get(owner, draft.entry.id);
+    expect(updated?.entry).toMatchObject({
+      title: '人工新标题',
+      humanEdited: true,
+      generation: { state: 'complete' },
+    });
+    expect(updated?.entry.indexRetryAt).toBeUndefined();
+    await library.upsertSource(owner, {
+      ...source,
+      source: 'manual',
+      sourceId: 'draft',
+      kind: 'note',
+      title: '自动旧标题',
+      markdown: '自动旧结果',
+      automated: true,
+    });
+    expect((await library.get(owner, draft.entry.id))?.entry.title).toBe('人工新标题');
+  });
+
   it('preserves full raw records and readable Markdown with deterministic, per-owner IDs', async () => {
     const rawContent = `${JSON.stringify({ content: '原文'.repeat(600_000) })}\n`;
     const first = (await library.upsertSource(owner, { ...source, rawContent }))!;

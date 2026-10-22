@@ -231,6 +231,142 @@ describe('knowledge background synchronization', () => {
     }
   );
 
+  it('archives new messages while a separate indexing job is waiting', async () => {
+    const session = await createSession(primary, '独立后台任务');
+    await append(session, 0, '初始内容');
+    await runtime.runOnce(false);
+    let release!: () => void;
+    let began!: () => void;
+    const started = new Promise<void>((resolve) => {
+      began = resolve;
+    });
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    Object.defineProperty(runtime, 'engine', {
+      value: {
+        index: vi.fn(async () => {
+          began();
+          await barrier;
+        }),
+        delete: vi.fn(),
+      },
+    });
+    const indexing = runtime.runIndexOnce();
+    await started;
+    try {
+      await append(session, 1, '索引期间新增消息');
+      await runtime.runOnce(false);
+      const source = (await runtime.library.list(owner)).entries[0];
+      expect((await runtime.library.get(owner, source.id))?.markdown).toContain('索引期间新增消息');
+    } finally {
+      release();
+      await indexing;
+    }
+  });
+
+  it('creates categorized summaries without waiting for another failed document', async () => {
+    const session = await createSession(primary, '原始较长的会话标题');
+    await append(session, 0, '确定用本地模型建立索引，原件长期保留。');
+    await runtime.runOnce(false);
+    const source = (await runtime.library.list(owner)).entries[0];
+    await runtime.library.markIndexed(owner, source.id);
+    await runtime.library.upsertSource(otherOwner, {
+      source: 'manual',
+      sourceId: 'failed',
+      kind: 'document',
+      title: '待索引',
+      markdown: '其它用户尚未索引',
+    });
+    Object.defineProperty(runtime, 'engine', {
+      value: {
+        summarizeContent: vi.fn().mockResolvedValue({
+          title: '本地知识库保留规则',
+          topic: '软件与系统',
+          tags: ['知识库'],
+          abstract: '使用本地索引，原件保留。',
+          overview: '## 结论\n原件长期保存。',
+        }),
+      },
+    });
+    await runtime.runSummaryOnce();
+    const summaries = await runtime.library.list(owner, { level: 'summary' });
+    expect(summaries.total).toBe(1);
+    expect(summaries.entries[0]).toMatchObject({
+      title: '本地知识库保留规则',
+      humanEdited: false,
+      organization: { topic: '软件与系统', state: 'draft' },
+    });
+    expect((await runtime.library.get(owner, summaries.entries[0].id))?.sources?.[0].id).toBe(
+      source.id
+    );
+    expect((await runtime.library.get(owner, source.id))?.entry.organization?.topic).toBe(
+      '软件与系统'
+    );
+  });
+
+  it('keeps manual takeover when a queued automatic draft finishes late', async () => {
+    const source = (await runtime.library.upsertSource(owner, {
+      source: 'manual',
+      sourceId: 'source',
+      kind: 'document',
+      title: '来源',
+      markdown: '可用原文',
+    }))!;
+    let finish!: () => void;
+    let began!: () => void;
+    const started = new Promise<void>((resolve) => {
+      began = resolve;
+    });
+    Object.defineProperty(runtime, 'engine', {
+      value: {
+        summarizeContent: vi.fn(async () => {
+          began();
+          await new Promise<void>((resolve) => {
+            finish = resolve;
+          });
+          return { abstract: '自动结果', overview: '不能覆盖人工结果' };
+        }),
+      },
+    });
+    const draft = await runtime.organize(owner, {
+      entryIds: [source.entry.id],
+      mode: 'automatic',
+      title: '我的专题',
+    });
+    runtime.observe(owner);
+    const work = (
+      runtime as unknown as { summarizeOwner(owner: KnowledgeOwner): Promise<void> }
+    ).summarizeOwner(owner);
+    await started;
+    await runtime.library.edit(
+      owner,
+      draft.entry.id,
+      '# 我的人工总结\n保留我的分析',
+      draft.entry.updatedAt,
+      '我的标题'
+    );
+    finish();
+    await work;
+    const result = await runtime.library.get(owner, draft.entry.id);
+    expect(result?.markdown).toContain('保留我的分析');
+    expect(result?.entry.title).toBe('我的标题');
+    expect(result?.entry.generation?.state).toBe('complete');
+  });
+
+  it('rejects cross-user source selection for manual synthesis', async () => {
+    const privateSource = (await runtime.library.upsertSource(otherOwner, {
+      source: 'manual',
+      sourceId: 'secret',
+      kind: 'note',
+      title: '乙的资料',
+      markdown: '秘密',
+    }))!;
+    await expect(
+      runtime.organize(owner, { entryIds: [privateSource.entry.id], mode: 'manual' })
+    ).rejects.toThrow('不存在');
+  });
+
   it('treats an explicitly empty search scope as empty instead of broadening to the entire library', async () => {
     await runtime.library.upsertSource(owner, {
       source: 'manual',

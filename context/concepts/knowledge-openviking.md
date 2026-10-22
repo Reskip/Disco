@@ -29,15 +29,21 @@ key in the data-client identity list.
 1. Save complete archives and originals into the portable library.
 2. Split a derived Markdown copy into ordered chunks of at most 3000 UTF-8 bytes,
    then index every chunk through `content/batch-write` with `processing_mode:
-"vectors_only"`. Concatenation exactly reconstructs the source, including
+"vectors_only"`, at most sixteen chunks per transaction. Concatenation exactly reconstructs the source, including
    whitespace and Unicode. This bounds each local embedding input without
    silently losing the tail of a long conversation. This phase does not ask the
    VLM for summaries.
-3. Run explicitly tracked, low-concurrency summarization jobs after archival and
-   indexing. Derived summaries must be stored separately with source versions;
+3. Run explicitly tracked, low-concurrency summarization jobs after the owner's
+   archive pass and each eligible source's indexing. Explicit manual synthesis
+   does not depend on semantic indexing. Derived summaries are separate drafts
+   with source versions and topic/tag classification;
    human-edited Markdown is never a summarization target.
 
-The index call requires `vector_status: "complete"` or the provider's idempotent
+Each small write uses `wait: false`; the client polls its accepted task and waits
+for completion before submitting the next batch. It retains accepted task IDs
+across transient polling failures so a retry does not duplicate the same write.
+Path-lock conflicts receive bounded retries, and persistent failures return to
+the durable per-entry retry queue. The index call requires `vector_status: "complete"` or the provider's idempotent
 `"skipped"` result when its index planner finds every vector current. A content
 write, queued maintenance, timeout or partial result is not a completed index.
 Retrying the same final content with `replace` is idempotent. The caller owns the
@@ -51,15 +57,26 @@ inactive using `vectors_only`; OpenViking's DELETE would otherwise invoke a
 semantic refresh. Search requires `disco_index=active`, maps chunks to the entry
 ID, and reads current matching content instead of a potentially stale summary.
 
-The separate `scripts/knowledge-summarize.py` process concatenates the full
-archive and calls OpenViking's supported Codex subscription provider once. It
-does not invoke OpenViking's per-file semantic queue, does not truncate input,
-does not expose tools to the summarizer and does not write any source. Documents
-exceeding the selected model's context fail as pending work instead of silently
-losing their tails. Source version checks protect acceptance of the result.
-The caller must schedule these jobs only after archival/indexing, one at a time,
-at most once a minute across users. The default timeout is ten minutes.
-Asynchronous file deletion is polled to completion before reporting deletion.
+The separate `scripts/knowledge-summarize.py` process calls the configured Codex
+subscription provider without tools. Small sources use one completion; large
+sources are split losslessly into at most 64,000 UTF-8 bytes per map input, then
+their summaries are recursively merged into bounded groups. Calls run in order
+with a two-second pause between new completions. Source context follows chunks
+that begin midway through a document, preserving source IDs and links. Prompts
+extract conclusions, decisions, reusable methods and unresolved conflicts instead
+of rewriting the transcript in chronological order. Input is never truncated,
+and original library files are never written by the helper.
+
+Intermediate results are resumable under the protected operator configuration
+directory's `summary-work/<owner-account-hash>/<entry-id>/`, keyed by content,
+instructions, model and prompt version. A ten-minute job timeout therefore does
+not repeat already completed cloud calls on retry. Explicit entry deletion
+cancels only that entry's helper, writes a deletion marker to prevent late cache
+resurrection, and removes its derived cache. Cache filesystem failure is logged
+without undoing a successful original/vector deletion. No new automatic expiry
+policy is introduced by this cache. Source hash and human-edit checks protect
+acceptance of the final result. Jobs are serialized and start at least one minute
+apart across owners. Asynchronous vector deletion is polled to completion.
 
 Disco currently extracts PDF/Office text locally before this adapter, preserving
 original bytes in the portable library. OpenViking also has a separate
@@ -139,7 +156,7 @@ belong under the deployed source directory; runtime credentials remain outside
 it. The helper reads archives only from stdin and returns only validated summary
 JSON. Provider exceptions and stderr are not exposed to users. OpenViking 0.5.1.1's
 Codex client cleanup lacks `close()` on its shim; that specific cleanup exception
-is suppressed in this one-request process so it does not discard valid output.
+is suppressed in this isolated helper so it does not discard valid output.
 
 ## Host MCP
 

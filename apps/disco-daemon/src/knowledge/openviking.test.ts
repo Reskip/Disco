@@ -1,7 +1,11 @@
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve, sep } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
   OpenVikingClient,
   OpenVikingError,
+  type OpenVikingOptions,
   openVikingAccountId,
   provisionOpenVikingOwner,
   splitOpenVikingContent,
@@ -9,6 +13,11 @@ import {
 
 const owner = { tenantId: 'tenant-a', userId: 'user-a' };
 const secondOwner = { tenantId: 'tenant-a', userId: 'user-b' };
+async function removeFixture(base: string): Promise<void> {
+  if (!resolve(base).startsWith(resolve(tmpdir()) + sep))
+    throw new Error('Unexpected fixture root');
+  await rm(base, { recursive: true, force: true });
+}
 function identity(value = owner) {
   return {
     owner: value,
@@ -21,7 +30,10 @@ function identity(value = owner) {
 function ok(result: unknown) {
   return new Response(JSON.stringify({ status: 'ok', result }), { status: 200 });
 }
-function setup(response: unknown = { vector_status: 'complete' }) {
+function setup(
+  response: unknown = { vector_status: 'complete' },
+  summary?: OpenVikingOptions['summary']
+) {
   const responder = vi.fn<() => Response>().mockImplementation(() => ok(response));
   const fetcher = vi.fn<typeof fetch>().mockImplementation(async (url, init) => {
     const target = new URL(String(url));
@@ -52,6 +64,7 @@ function setup(response: unknown = { vector_status: 'complete' }) {
     baseUrl: 'http://127.0.0.1:1933',
     resolveIdentity: identity,
     fetch: fetcher,
+    summary,
   });
   return { client, fetcher, responder };
 }
@@ -77,7 +90,7 @@ describe('OpenViking derived index isolation', () => {
     expect(JSON.parse(first.body as string)).toMatchObject({
       operations: [{ content: '# 原件\n完整内容', mode: 'replace' }],
       processing_mode: 'vectors_only',
-      wait: true,
+      wait: false,
     });
     expect(JSON.parse(first.body as string).operations[0].uri).not.toBe(
       JSON.parse(second.body as string).operations[0].uri
@@ -311,19 +324,202 @@ describe('OpenViking derived index isolation', () => {
   });
 
   it('indexes every character of long multilingual archives in bounded chunks', async () => {
-    const source = `# 完整会话\n\n${'中文 English 🙂\n'.repeat(1600)}\nTAIL_ONLY_9281`;
+    const source = `# 完整会话\n\n${'中文 English 🙂\n'.repeat(4000)}\nTAIL_ONLY_9281`;
     const chunks = splitOpenVikingContent(source);
     expect(chunks.length).toBeGreaterThan(10);
     expect(chunks.every((chunk) => Buffer.byteLength(chunk, 'utf8') <= 3000)).toBe(true);
     expect(chunks.join('')).toBe(source);
     const { client, fetcher } = setup();
     await client.index(owner, { id: 'long', content: source });
-    const call = fetcher.mock.calls.find(
+    const calls = fetcher.mock.calls.filter(
       ([url]) => new URL(String(url)).pathname === '/api/v1/content/batch-write'
     );
-    const writes = JSON.parse(call![1]!.body as string).operations;
+    expect(calls.length).toBeGreaterThan(1);
+    const batches = calls.map((call) => JSON.parse(call[1]!.body as string));
+    expect(batches.every((batch) => batch.operations.length <= 16 && batch.wait === false)).toBe(
+      true
+    );
+    const writes = batches.flatMap((batch) => batch.operations);
     expect(writes.map((part: { content: string }) => part.content).join('')).toBe(source);
     expect(writes.at(-1).content).toContain('TAIL_ONLY_9281');
+  });
+
+  it('waits for each accepted vector task before committing the next batch', async () => {
+    const { client, fetcher } = setup();
+    const original = fetcher.getMockImplementation()!;
+    let writes = 0;
+    let completed = 0;
+    fetcher.mockImplementation(async (url, init) => {
+      const path = new URL(String(url)).pathname;
+      if (path === '/api/v1/content/batch-write') {
+        expect(writes).toBe(completed);
+        writes += 1;
+        return ok({ task_id: `task-${writes}`, vector_status: 'queued' });
+      }
+      if (path.startsWith('/api/v1/tasks/')) {
+        completed += 1;
+        return ok({ status: 'completed', result: { vector_status: 'complete' } });
+      }
+      return original(url, init);
+    });
+    await client.index(owner, { id: 'long', content: 'abc'.repeat(25000) });
+    expect(writes).toBe(2);
+    expect(completed).toBe(2);
+  });
+
+  it('resumes an accepted batch after a poll failure without resubmitting its contents', async () => {
+    const { client, fetcher } = setup();
+    const original = fetcher.getMockImplementation()!;
+    let writes = 0;
+    let polls = 0;
+    fetcher.mockImplementation(async (url, init) => {
+      const path = new URL(String(url)).pathname;
+      if (path === '/api/v1/content/batch-write') {
+        writes += 1;
+        return ok({ task_id: 'accepted-task', vector_status: 'queued' });
+      }
+      if (path === '/api/v1/tasks/accepted-task') {
+        polls += 1;
+        if (polls === 1) throw new Error('private connection diagnostic');
+        return ok({ status: 'completed', result: { vector_status: 'complete' } });
+      }
+      return original(url, init);
+    });
+    await expect(client.index(owner, { id: 'doc', content: '原文' })).rejects.toMatchObject({
+      code: 'UNAVAILABLE',
+    });
+    await expect(client.index(owner, { id: 'doc', content: '原文' })).resolves.toHaveProperty(
+      'uri'
+    );
+    expect(writes).toBe(1);
+  });
+
+  it('reports a failed asynchronous embedding even when the file write was accepted', async () => {
+    const { client, fetcher } = setup();
+    const original = fetcher.getMockImplementation()!;
+    fetcher.mockImplementation(async (url, init) => {
+      const path = new URL(String(url)).pathname;
+      if (path === '/api/v1/content/batch-write') return ok({ task_id: 'failed-task' });
+      if (path === '/api/v1/tasks/failed-task')
+        return ok({ status: 'failed', error: 'private diagnostic' });
+      return original(url, init);
+    });
+    await expect(client.index(owner, { id: 'doc', content: '原文' })).rejects.toMatchObject({
+      code: 'TASK_FAILED',
+      message: '语义索引计算失败，将自动重试',
+    });
+  });
+
+  it('allows direct summary requests without an index read', async () => {
+    const { client, fetcher } = setup();
+    await expect(
+      client.summarizeContent(owner, { id: 'manual', content: '来源正文' })
+    ).rejects.toMatchObject({ code: 'NOT_CONFIGURED' });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('deletes only the selected derived summary cache and prevents its recreation', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'disco-kb-provider-'));
+    try {
+      const parent = join(base, 'summary-work', openVikingAccountId(owner));
+      await mkdir(join(parent, 'doc'), { recursive: true });
+      await mkdir(join(parent, 'keep'), { recursive: true });
+      await writeFile(join(parent, 'doc', 'summary.json'), 'synthetic derived cache');
+      await writeFile(join(parent, 'keep', 'summary.json'), 'other entry');
+      const { client } = setup(undefined, {
+        pythonExecutable: process.execPath,
+        scriptPath: join(base, 'helper.mjs'),
+        configPath: join(base, 'ov.conf'),
+      });
+      await client.delete(owner, 'doc');
+      await expect(access(join(parent, 'doc'))).rejects.toMatchObject({ code: 'ENOENT' });
+      await expect(access(join(parent, '.deleted', 'doc'))).resolves.toBeUndefined();
+      await expect(readFile(join(parent, 'keep', 'summary.json'), 'utf8')).resolves.toBe(
+        'other entry'
+      );
+    } finally {
+      await removeFixture(base);
+    }
+  });
+
+  it('does not let a bad derived cache hide provider failure or make successful deletion fail', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'disco-kb-provider-'));
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const parent = join(base, 'summary-work', openVikingAccountId(owner));
+      await mkdir(parent, { recursive: true });
+      // An unexpected file where a cache directory belongs is preserved safely.
+      await writeFile(join(parent, 'doc'), 'unexpected file');
+      const { client, responder } = setup(undefined, {
+        pythonExecutable: process.execPath,
+        scriptPath: join(base, 'helper.mjs'),
+        configPath: join(base, 'ov.conf'),
+      });
+      responder.mockReturnValueOnce(
+        new Response(JSON.stringify({ status: 'error', error: { code: 'UNAVAILABLE' } }), {
+          status: 503,
+        })
+      );
+      await expect(client.delete(owner, 'doc')).rejects.toMatchObject({ code: 'UNAVAILABLE' });
+      await expect(client.delete(owner, 'doc')).resolves.toBeUndefined();
+      await expect(readFile(join(parent, 'doc'), 'utf8')).resolves.toBe('unexpected file');
+      expect(warning).toHaveBeenCalledWith('[knowledge] 已删除资料的摘要临时缓存尚未清理');
+    } finally {
+      warning.mockRestore();
+      await removeFixture(base);
+    }
+  });
+
+  it('cancels an in-flight request promptly without poisoning later worker passes', async () => {
+    const { client, fetcher } = setup();
+    const original = fetcher.getMockImplementation()!;
+    let started!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    fetcher.mockImplementationOnce(
+      (_url, init) =>
+        new Promise((_resolve, reject) => {
+          init!.signal!.addEventListener('abort', () =>
+            reject(new DOMException('aborted', 'AbortError'))
+          );
+          started();
+        })
+    );
+    const pending = client.index(owner, { id: 'doc', content: '原文' });
+    const check = expect(pending).rejects.toMatchObject({ code: 'CANCELLED' });
+    await ready;
+    client.cancelPending();
+    await check;
+    fetcher.mockImplementation(original);
+    await expect(client.index(owner, { id: 'doc', content: '原文' })).resolves.toHaveProperty(
+      'uri'
+    );
+  });
+
+  it('retries provider path lock conflicts without leaking its diagnostic', async () => {
+    const { client, fetcher } = setup();
+    const original = fetcher.getMockImplementation()!;
+    let writes = 0;
+    fetcher.mockImplementation(async (url, init) => {
+      if (new URL(String(url)).pathname === '/api/v1/content/batch-write' && writes++ === 0)
+        return new Response(
+          JSON.stringify({
+            status: 'error',
+            error: {
+              code: 'CONFLICT',
+              message: 'private diagnostic',
+              details: { conflict_type: 'path_busy', retryable: true },
+            },
+          }),
+          { status: 409 }
+        );
+      return original(url, init);
+    });
+    await expect(client.index(owner, { id: 'doc', content: '原文' })).resolves.toHaveProperty(
+      'uri'
+    );
+    expect(writes).toBe(2);
   });
 
   it('reads all paginated parts in order and accepts a selected entry tail hit', async () => {

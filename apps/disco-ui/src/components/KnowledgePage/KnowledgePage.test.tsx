@@ -1,5 +1,5 @@
 import type { KnowledgeEntryDetail, KnowledgeLibraryStatus } from '@disco/core/types';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { ButtonProps } from 'antd';
 import { App as AntApp, ConfigProvider, theme } from 'antd';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -43,6 +43,8 @@ vi.mock('./knowledgeApi', () => ({
   knowledgeApi: {
     list: vi.fn(),
     status: vi.fn(),
+    overview: vi.fn(),
+    organize: vi.fn(),
     detail: vi.fn(),
     create: vi.fn(),
     save: vi.fn(),
@@ -100,6 +102,11 @@ describe('knowledge library management', () => {
     vi.clearAllMocks();
     vi.mocked(knowledgeApi.list).mockResolvedValue({ entries: [DETAIL.entry], total: 1 });
     vi.mocked(knowledgeApi.status).mockResolvedValue(STATUS);
+    vi.mocked(knowledgeApi.overview).mockResolvedValue({
+      counts: { source: 1, summary: 0, knowledge: 0 },
+      materials: { conversation: 1, document: 0, image: 0, file: 0, note: 0 },
+      topics: [{ topic: '产品设计', count: 1 }],
+    });
     vi.mocked(knowledgeApi.detail).mockResolvedValue(DETAIL);
     vi.mocked(knowledgeApi.remove).mockResolvedValue(undefined);
   });
@@ -195,7 +202,8 @@ describe('knowledge library management', () => {
       'entry-a',
       '产品讨论',
       '我的人工修改',
-      DETAIL.entry.updatedAt
+      DETAIL.entry.updatedAt,
+      expect.objectContaining({ level: 'source' })
     );
     fireEvent.focus(window);
     await waitFor(() => expect(knowledgeApi.list).toHaveBeenCalledTimes(2));
@@ -250,9 +258,242 @@ describe('knowledge library management', () => {
         'note-a',
         '新笔记',
         '补充正文',
-        note.entry.updatedAt
+        note.entry.updatedAt,
+        expect.objectContaining({ level: 'knowledge' })
       )
     );
     expect(knowledgeApi.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens in knowledge notes and keeps original material type filters separate from note levels', async () => {
+    vi.mocked(knowledgeApi.list).mockResolvedValue({ entries: [], total: 0 });
+    renderPage();
+    await waitFor(() =>
+      expect(knowledgeApi.list).toHaveBeenLastCalledWith('', 'all', 0, expect.any(AbortSignal), {
+        kind: 'note',
+      })
+    );
+    expect(screen.getByRole('combobox', { name: '知识层级' })).toBeInTheDocument();
+    expect(screen.queryByRole('combobox', { name: '资料类型' })).not.toBeInTheDocument();
+    fireEvent.click(await screen.findByRole('button', { name: '查看原始资料' }));
+    await waitFor(() =>
+      expect(knowledgeApi.list).toHaveBeenLastCalledWith('', 'all', 0, expect.any(AbortSignal), {
+        level: 'source',
+        includeHistory: false,
+      })
+    );
+    expect(screen.queryByRole('combobox', { name: '知识层级' })).not.toBeInTheDocument();
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: '资料类型' }));
+    fireEvent.click(
+      await screen.findByText('图片', { selector: '.ant-select-item-option-content' })
+    );
+    await waitFor(() =>
+      expect(knowledgeApi.list).toHaveBeenLastCalledWith('', 'all', 0, expect.any(AbortSignal), {
+        level: 'source',
+        materialType: 'image',
+        includeHistory: false,
+      })
+    );
+    fireEvent.click(screen.getByRole('checkbox', { name: '包含修复前的历史副本' }));
+    await waitFor(() =>
+      expect(knowledgeApi.list).toHaveBeenLastCalledWith('', 'all', 0, expect.any(AbortSignal), {
+        level: 'source',
+        materialType: 'image',
+        includeHistory: true,
+      })
+    );
+    expect(knowledgeApi.detail).not.toHaveBeenCalled();
+  });
+
+  it('keeps selection across pages and creates a source-linked manual note for editing', async () => {
+    const second = { ...DETAIL.entry, id: 'entry-b', title: '技术决策' };
+    const manual: KnowledgeEntryDetail = {
+      ...DETAIL,
+      entry: {
+        ...DETAIL.entry,
+        id: 'note-manual',
+        title: '产品结论',
+        kind: 'note',
+        source: 'manual',
+        humanEdited: true,
+        organization: {
+          topic: '产品设计',
+          level: 'knowledge',
+          state: 'draft',
+          sourceEntryIds: ['entry-a', 'entry-b'],
+        },
+      },
+      markdown: '# 产品结论\n\n## 我的总结\n',
+      sources: [
+        { id: 'entry-a', title: '产品讨论', available: true },
+        { id: 'entry-b', title: '技术决策', available: true },
+      ],
+    };
+    vi.mocked(knowledgeApi.list).mockImplementation(async (_query, _source, offset) => ({
+      entries: [offset ? second : DETAIL.entry],
+      total: 21,
+    }));
+    vi.mocked(knowledgeApi.organize).mockResolvedValue(manual);
+    renderPage();
+    fireEvent.click(await screen.findByRole('checkbox', { name: '选择 产品讨论' }));
+    fireEvent.click(screen.getByTitle('2'));
+    fireEvent.click(await screen.findByRole('checkbox', { name: '选择 技术决策' }));
+    expect(screen.getByText('已选 2 份')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '人工整理' }));
+    fireEvent.change(screen.getByRole('textbox', { name: '整理笔记标题' }), {
+      target: { value: '产品结论' },
+    });
+    fireEvent.change(screen.getByRole('textbox', { name: '整理笔记主题' }), {
+      target: { value: '产品设计' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '创建并编辑' }));
+    expect(await screen.findByRole('textbox', { name: 'Markdown 正文' })).toHaveValue(
+      manual.markdown
+    );
+    expect(knowledgeApi.organize).toHaveBeenCalledWith({
+      entryIds: ['entry-a', 'entry-b'],
+      title: '产品结论',
+      topic: '产品设计',
+      mode: 'manual',
+    });
+    expect(screen.getByRole('link', { name: '技术决策' })).toHaveAttribute(
+      'href',
+      '/knowledge?entry=entry-b'
+    );
+    expect(screen.getByText('来源在新页面打开，当前编辑内容会保留。')).toBeInTheDocument();
+    expect(knowledgeApi.detail).not.toHaveBeenCalled();
+    expect(knowledgeApi.downloadAttachment).not.toHaveBeenCalled();
+  });
+
+  it('never replaces a human draft with a late automatic-generation response', async () => {
+    const queued: KnowledgeEntryDetail = {
+      ...DETAIL,
+      entry: {
+        ...DETAIL.entry,
+        id: 'note-auto',
+        title: '自动整理草稿',
+        kind: 'note',
+        generation: { state: 'queued' },
+        organization: { topic: '产品设计', level: 'knowledge', state: 'draft' },
+      },
+      markdown: '等待整理',
+    };
+    let resolvePending: ((value: KnowledgeEntryDetail) => void) | undefined;
+    vi.mocked(knowledgeApi.detail)
+      .mockResolvedValueOnce(queued)
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolvePending = resolve;
+          })
+      );
+    renderPage('note-auto');
+    expect(await screen.findByText('等待整理')).toBeInTheDocument();
+    fireEvent(document, new Event('visibilitychange'));
+    await waitFor(() => expect(knowledgeApi.detail).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole('button', { name: '编辑' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Markdown 正文' }), {
+      target: { value: '我正在写的结论' },
+    });
+    await act(async () =>
+      resolvePending?.({
+        ...queued,
+        markdown: '后台生成的结论',
+        entry: { ...queued.entry, generation: { state: 'complete' } },
+      })
+    );
+    expect(screen.getByRole('textbox', { name: 'Markdown 正文' })).toHaveValue('我正在写的结论');
+    fireEvent(document, new Event('visibilitychange'));
+    expect(knowledgeApi.detail).toHaveBeenCalledTimes(2);
+  });
+
+  it('queues automatic organization and shows the generated note without a manual refresh', async () => {
+    const queued: KnowledgeEntryDetail = {
+      ...DETAIL,
+      entry: {
+        ...DETAIL.entry,
+        id: 'automatic-note',
+        title: '设计结论',
+        kind: 'note',
+        generation: { state: 'queued' },
+        organization: { topic: '产品设计', level: 'knowledge', state: 'draft' },
+      },
+      markdown: '后台正在整理这份资料',
+    };
+    const completed: KnowledgeEntryDetail = {
+      ...queued,
+      entry: { ...queued.entry, generation: { state: 'complete' } },
+      markdown: '## 已确认的设计方向\n\n- 移动端不额外增加高度\n- 保留原始资料出处',
+    };
+    vi.mocked(knowledgeApi.organize).mockResolvedValue(queued);
+    vi.mocked(knowledgeApi.detail).mockResolvedValueOnce(queued).mockResolvedValue(completed);
+    renderPage();
+    fireEvent.click(await screen.findByRole('checkbox', { name: '选择 产品讨论' }));
+    fireEvent.click(screen.getByRole('button', { name: '自动整理所选' }));
+    fireEvent.click(screen.getByRole('button', { name: '加入整理队列' }));
+    expect(await screen.findByText('后台正在整理这份资料')).toBeInTheDocument();
+    expect(knowledgeApi.organize).toHaveBeenCalledWith({
+      entryIds: ['entry-a'],
+      mode: 'automatic',
+      title: undefined,
+      topic: undefined,
+    });
+    expect(screen.queryByRole('button', { name: '确认并人工维护' })).not.toBeInTheDocument();
+    fireEvent(document, new Event('visibilitychange'));
+    expect(await screen.findByRole('heading', { name: '已确认的设计方向' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '确认并人工维护' })).toBeInTheDocument();
+    expect(screen.queryByRole('textbox', { name: 'Markdown 正文' })).not.toBeInTheDocument();
+  });
+
+  it('shows independent failures and confirms a generated note without changing its source links', async () => {
+    const generated: KnowledgeEntryDetail = {
+      ...DETAIL,
+      entry: {
+        ...DETAIL.entry,
+        kind: 'note',
+        generation: { state: 'complete' },
+        organization: {
+          topic: '产品设计',
+          level: 'summary',
+          state: 'draft',
+          sourceEntryIds: ['source-a'],
+        },
+        indexStatus: 'error',
+        indexMessage: '嵌入服务暂不可用',
+      },
+      sources: [{ id: 'source-a', title: '原会话', available: true }],
+    };
+    vi.mocked(knowledgeApi.detail).mockResolvedValue(generated);
+    vi.mocked(knowledgeApi.save).mockResolvedValue({
+      ...generated,
+      entry: {
+        ...generated.entry,
+        humanEdited: true,
+        organization: { ...generated.entry.organization!, state: 'reviewed' },
+      },
+    });
+    vi.mocked(knowledgeApi.status).mockResolvedValue({
+      ...STATUS,
+      sync: { state: 'running', intervalSeconds: 30 },
+      processing: {
+        index: { pending: 5, indexed: 10, failed: 2, unsupported: 3 },
+        summary: { pending: 4, completed: 2, failed: 1 },
+      },
+    });
+    renderPage('entry-a');
+    expect(await screen.findByText('嵌入服务暂不可用')).toBeInTheDocument();
+    expect(screen.getByText('检索索引 · 10 / 17')).toBeInTheDocument();
+    expect(screen.getByText(/2 份失败，后台重试/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '确认并人工维护' }));
+    await waitFor(() =>
+      expect(knowledgeApi.save).toHaveBeenCalledWith(
+        'entry-a',
+        generated.entry.title,
+        generated.markdown,
+        generated.entry.updatedAt,
+        { topic: '产品设计', level: 'summary', state: 'reviewed', sourceEntryIds: ['source-a'] }
+      )
+    );
+    expect(await screen.findByText('已确认，由你维护，自动整理不会覆盖')).toBeInTheDocument();
   });
 });

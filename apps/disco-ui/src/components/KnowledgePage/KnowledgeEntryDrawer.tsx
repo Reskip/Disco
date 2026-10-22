@@ -1,24 +1,41 @@
-import { DeleteOutlined, DownloadOutlined, EditOutlined, LinkOutlined } from '@ant-design/icons';
-import type { KnowledgeEntry, KnowledgeEntryDetail } from '@disco/core/types';
+import {
+  CheckOutlined,
+  DeleteOutlined,
+  DownloadOutlined,
+  EditOutlined,
+  LinkOutlined,
+} from '@ant-design/icons';
+import type {
+  KnowledgeEntry,
+  KnowledgeEntryDetail,
+  KnowledgeOrganization,
+} from '@disco/core/types';
 import {
   Alert,
   App as AntApp,
+  AutoComplete,
   Button,
   Card,
   Drawer,
   Flex,
   Input,
   List,
+  Select,
   Skeleton,
   Space,
+  Tag,
   Typography,
   theme,
 } from 'antd';
 import { useState } from 'react';
+import { KnowledgeNoteContent } from './KnowledgeNoteContent';
 import { knowledgeApi } from './knowledgeApi';
 import {
+  entryOrganization,
   errorMessage,
   formatDate,
+  GENERATION_LABELS,
+  LEVEL_LABELS,
   PARSE_LABELS,
   SOURCE_LABELS,
   safeSourceUrl,
@@ -31,6 +48,8 @@ export function KnowledgeEntryDrawer({
   saving,
   title,
   markdown,
+  organization,
+  topics,
   detail,
   detailLoading,
   detailError,
@@ -38,7 +57,10 @@ export function KnowledgeEntryDrawer({
   setEditing,
   setTitle,
   setMarkdown,
+  setOrganization,
   save,
+  confirmReviewed,
+  openEntry,
   removeEntry,
 }: {
   open: boolean;
@@ -47,6 +69,8 @@ export function KnowledgeEntryDrawer({
   saving: boolean;
   title: string;
   markdown: string;
+  organization: KnowledgeOrganization;
+  topics: string[];
   detail: KnowledgeEntryDetail | null;
   detailLoading: boolean;
   detailError: string | null;
@@ -54,12 +78,50 @@ export function KnowledgeEntryDrawer({
   setEditing: (value: boolean) => void;
   setTitle: (value: string) => void;
   setMarkdown: (value: string) => void;
+  setOrganization: (value: KnowledgeOrganization) => void;
   save: () => Promise<void>;
+  confirmReviewed: () => Promise<void>;
+  openEntry: (id: string) => void;
   removeEntry: (entry: KnowledgeEntry) => void;
 }) {
   const { token } = theme.useToken();
   const { message } = AntApp.useApp();
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const metadata = entryOrganization(detail?.entry);
+  const generation = detail?.entry.generation;
+  const sources = detail?.sources;
+  const sourcesCard = sources?.length ? (
+    <Card size="small" title="整理来源">
+      <Space orientation="vertical" size="small" style={{ width: '100%' }}>
+        {sources.map((source) =>
+          source.available ? (
+            <Button
+              key={source.id}
+              type="link"
+              icon={<LinkOutlined />}
+              {...(editing
+                ? {
+                    href: `/knowledge?entry=${encodeURIComponent(source.id)}`,
+                    target: '_blank',
+                    rel: 'noreferrer',
+                  }
+                : { onClick: () => openEntry(source.id) })}
+              style={{ paddingInline: 0, height: 'auto', whiteSpace: 'normal', textAlign: 'left' }}
+            >
+              {source.title}
+            </Button>
+          ) : (
+            <Typography.Text key={source.id} type="secondary">
+              {source.title}（原始归档已删除）
+            </Typography.Text>
+          )
+        )}
+        {editing && (
+          <Typography.Text type="secondary">来源在新页面打开，当前编辑内容会保留。</Typography.Text>
+        )}
+      </Space>
+    </Card>
+  ) : null;
   const downloadAttachment = async (id: string, name: string) => {
     if (!detail) return;
     setDownloadingId(id);
@@ -122,6 +184,61 @@ export function KnowledgeEntryDrawer({
           <Typography.Text type="secondary">
             保存后标记为人工编辑，自动总结不会覆盖这份内容。
           </Typography.Text>
+          {generation && ['queued', 'running'].includes(generation.state) && (
+            <Alert
+              type="info"
+              showIcon
+              title="保存人工修改后，将保留你的内容，后台生成结果不会覆盖。"
+            />
+          )}
+          <Flex gap={token.marginSM} wrap>
+            <AutoComplete
+              aria-label="笔记主题"
+              value={organization.topic}
+              options={topics.map((value) => ({ value }))}
+              onChange={(value) => setOrganization({ ...organization, topic: value })}
+              filterOption={(input, option) =>
+                String(option?.value ?? '')
+                  .toLowerCase()
+                  .includes(input.toLowerCase())
+              }
+              disabled={saving}
+              style={{ flex: '1 1 180px', fontSize: mobile ? 16 : undefined }}
+            >
+              <Input
+                aria-label="笔记主题"
+                placeholder="主题"
+                style={{ fontSize: mobile ? 16 : undefined }}
+              />
+            </AutoComplete>
+            {(!detail || detail.entry.kind === 'note') && (
+              <>
+                <Select
+                  aria-label="笔记层级"
+                  value={organization.level}
+                  onChange={(level) => setOrganization({ ...organization, level })}
+                  disabled={saving}
+                  style={{ flex: '1 1 120px', fontSize: mobile ? 16 : undefined }}
+                  options={[
+                    { value: 'summary', label: '摘要' },
+                    { value: 'knowledge', label: '专题知识' },
+                  ]}
+                />
+                <Select
+                  aria-label="笔记审阅状态"
+                  value={organization.state}
+                  onChange={(state) => setOrganization({ ...organization, state })}
+                  disabled={saving}
+                  style={{ flex: '1 1 120px', fontSize: mobile ? 16 : undefined }}
+                  options={[
+                    { value: 'draft', label: '待审阅' },
+                    { value: 'reviewed', label: '已确认' },
+                  ]}
+                />
+              </>
+            )}
+          </Flex>
+          {sourcesCard}
           <Input.TextArea
             aria-label="Markdown 正文"
             placeholder="用 Markdown 记录知识、经验或结论…"
@@ -137,6 +254,13 @@ export function KnowledgeEntryDrawer({
           <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
             <Card size="small">
               <Space orientation="vertical" size="small" style={{ width: '100%' }}>
+                <Space wrap>
+                  <Tag>{metadata.topic}</Tag>
+                  <Tag>{LEVEL_LABELS[metadata.level]}</Tag>
+                  {detail.entry.kind === 'note' && (
+                    <Tag>{metadata.state === 'reviewed' ? '已确认' : '待审阅'}</Tag>
+                  )}
+                </Space>
                 <Typography.Text type="secondary">
                   来源：{SOURCE_LABELS[detail.entry.source]} · {formatDate(detail.entry.createdAt)}
                 </Typography.Text>
@@ -160,6 +284,50 @@ export function KnowledgeEntryDrawer({
                 )}
               </Space>
             </Card>
+            {generation && generation.state !== 'complete' && (
+              <Alert
+                type={generation.state === 'failed' ? 'warning' : 'info'}
+                showIcon
+                title={GENERATION_LABELS[generation.state]}
+                description={
+                  generation.message ||
+                  (generation.retryAt
+                    ? `下次重试 ${formatDate(generation.retryAt)}`
+                    : '无需保持页面打开，后台会继续处理。')
+                }
+              />
+            )}
+            {detail.entry.indexStatus === 'error' && (
+              <Alert
+                type="warning"
+                showIcon
+                title="检索索引尚未构建成功"
+                description={
+                  <Space orientation="vertical">
+                    <Typography.Text>
+                      {detail.entry.indexMessage || '后台将自动重试，原始内容仍可读取。'}
+                    </Typography.Text>
+                    {detail.entry.indexRetryAt && (
+                      <Typography.Text>
+                        下次重试 {formatDate(detail.entry.indexRetryAt)}
+                      </Typography.Text>
+                    )}
+                  </Space>
+                }
+              />
+            )}
+            {detail.entry.kind === 'note' &&
+              metadata.state === 'draft' &&
+              (!generation || generation.state === 'complete') && (
+                <Button
+                  icon={<CheckOutlined />}
+                  onClick={() => void confirmReviewed()}
+                  loading={saving}
+                >
+                  确认并人工维护
+                </Button>
+              )}
+            {sourcesCard}
             {detail.entry.parseStatus && detail.entry.parseStatus !== 'parsed' && (
               <Alert
                 type={detail.entry.parseStatus === 'pending' ? 'info' : 'warning'}
@@ -168,12 +336,15 @@ export function KnowledgeEntryDrawer({
                 description={detail.entry.parseMessage}
               />
             )}
-            {/* Plain text keeps imported HTML inert and never requests embedded images or files. */}
-            <Typography.Paragraph
-              style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: 0 }}
-            >
-              {detail.markdown || '（正文为空）'}
-            </Typography.Paragraph>
+            {detail.entry.kind === 'note' ? (
+              <KnowledgeNoteContent markdown={detail.markdown} />
+            ) : (
+              <Typography.Paragraph
+                style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: 0 }}
+              >
+                {detail.markdown || '（正文为空）'}
+              </Typography.Paragraph>
+            )}
             {!!detail.entry.attachments?.length && (
               <Card size="small" title="关联附件">
                 <List

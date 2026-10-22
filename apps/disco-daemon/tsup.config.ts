@@ -15,6 +15,8 @@ const entries = Object.fromEntries(
 export default defineConfig({
   entry: entries,
   format: ['esm'],
+  // Prefix-only builtins such as node:sqlite cannot be resolved as packages.
+  removeNodeProtocol: false,
   dts: false,
   clean: true,
   splitting: false,

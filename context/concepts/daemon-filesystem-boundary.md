@@ -51,4 +51,25 @@ there are no `unix.sync-*` handlers or daemon host-identity operations.
 
 The checker still cannot see semantic path authority. In particular, daemon services resolve tenant layout strings and carry branch/repo cwd values from tenant-owned database records into typed executor payloads. That is intentional routing data, not daemon I/O: local executor processes launch from the executor package directory, and only executor commands consume workspace cwd. Review payload schemas and executor command handlers when changing this contract, because a string passed into an unmanifested dependency or remote launcher can become filesystem authority without a syntactic daemon capability.
 
-Executor-owned SDK session persistence and per-user home persistence are a separate architecture concern. This boundary does not claim that executor runtimes are filesystem-free; it claims the daemon runtime is free of tenant repo/branch/user/session filesystem readers, writers, cwd use, and permission-command arguments.
+Executor-owned SDK session persistence and per-user home persistence are a separate architecture concern. This boundary does not claim that executor runtimes are filesystem-free. Tenant repository/Git and permission mutations remain outside the daemon service layer; the explicitly registered account-owned knowledge storage and operator-bound host-history archival port are intentional additional responsibilities, not ambient permission to traverse user homes.
+
+## Knowledge archival and organization (2026-10-23)
+
+KnowledgeLibrary operations are class A storage capabilities: their trusted owner
+resolver, owner marker, safe relative paths and symlink checks enforce one
+account's portable library. Full JSONL streaming and revision preservation use
+those same checks. Operator-bound host Codex history uses read-only/query-only
+SQLite handles and fixed database names; it cannot accept a browser-selected
+Codex home. Catalog/export runs in a fixed hidden child process to keep large
+history scans off the daemon event loop. The child-process capability carries
+this explicit read-only host-history responsibility; a registry entry alone is
+not proof of it.
+
+The random SQLite export file in the protected runtime staging directory is
+class B temporary storage, with exclusive creation, streaming verification and
+finally cleanup. Its lifecycle review covers abandoned staging after a process
+crash. Per-owner, per-entry summary caches are class A derived service storage;
+their exact deletion capability excludes source archives and other entries, checks
+directory components, cancels the owned helper and prevents late resurrection.
+These classifications do not strengthen the operating-system isolation beyond
+the limitations documented in [knowledge-base.md](./knowledge-base.md).

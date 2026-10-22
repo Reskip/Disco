@@ -1,6 +1,10 @@
 import type { KnowledgeEntryDetail } from '@disco/core/types';
 import { describe, expect, it } from 'vitest';
-import { formatSummaryProgress, sourceReadingText } from './knowledgePresentation';
+import {
+  entrySnippetText,
+  formatSummaryProgress,
+  sourceReadingText,
+} from './knowledgePresentation';
 
 describe('server-attested source reading', () => {
   const marker = `<!-- disco-geospatial-projection:${JSON.stringify({ version: 1, format: 'gpx', sha256: 'a'.repeat(64), counts: { gpx: 1 } })} -->`;
@@ -48,6 +52,44 @@ describe('server-attested source reading', () => {
     '<!-- 用户的注释 -->',
   ])('preserves partial, malformed and user-authored lines: %s', (markdown) => {
     expect(sourceReadingText({ ...detail, markdown })).toBe(markdown);
+  });
+
+  it('removes complete machine comments from previews while preserving normal surrounding text and comments', () => {
+    const snippet = `正常前文\n${marker}\n<!-- 用户注释 -->\n正常后文`;
+    const entry = {
+      ...detail.entry,
+      snippet,
+      searchMatch: { offset: 200, contentHash: 'full-hash' },
+    };
+    expect(entrySnippetText(entry)).toBe('正常前文\n\n<!-- 用户注释 -->\n正常后文');
+    expect(entry.snippet).toBe(snippet);
+    expect(entry.searchMatch).toEqual({ offset: 200, contentHash: 'full-hash' });
+  });
+
+  it('hides a machine comment cut at the preview end and gives marker-only previews useful text', () => {
+    const partial = marker.slice(0, 110);
+    expect(entrySnippetText({ ...detail.entry, snippet: `# 原件\n${partial}` })).toBe('# 原件\n');
+    expect(entrySnippetText({ ...detail.entry, snippet: partial })).toBe(
+      '地图与轨迹资料，打开查看名称、描述和结构概览。'
+    );
+  });
+
+  it('does not hide untrusted, human-edited, changed-version or unrelated preview content', () => {
+    const entry = { ...detail.entry, snippet: marker };
+    expect(entrySnippetText({ ...entry, parseProjection: undefined })).toBe(marker);
+    expect(entrySnippetText({ ...entry, humanEdited: true })).toBe(marker);
+    expect(entrySnippetText({ ...entry, searchMatch: { offset: 0, contentHash: 'changed' } })).toBe(
+      marker
+    );
+    for (const snippet of [
+      '普通用户文字',
+      '<!-- 用户注释 -->',
+      marker.slice(90),
+      '<!-- disco-geospatial-projection:{invalid} -->',
+      `${marker.slice(0, 110)}\n后续用户文字`,
+    ]) {
+      expect(entrySnippetText({ ...entry, snippet })).toBe(snippet);
+    }
   });
 });
 

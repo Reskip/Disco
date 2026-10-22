@@ -42,6 +42,7 @@ import { KnowledgeProgress } from './KnowledgeProgress';
 import { knowledgeApi } from './knowledgeApi';
 import {
   entryOrganization,
+  entrySnippetText,
   errorMessage,
   formatDate,
   GENERATION_LABELS,
@@ -982,9 +983,8 @@ export function KnowledgePage({
                 }}
                 renderItem={(entry) => {
                   const metadata = entryOrganization(entry);
-                  const preview = query
-                    ? entry.snippet || metadata.summary
-                    : metadata.summary || entry.snippet;
+                  const snippet = entrySnippetText(entry);
+                  const preview = query ? snippet || metadata.summary : metadata.summary || snippet;
                   return (
                     <List.Item>
                       <Flex

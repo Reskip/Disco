@@ -7,6 +7,46 @@ import type {
   KnowledgeSummaryProgress,
 } from '@disco/core/types';
 
+function isGeospatialMarker(metadata: string): boolean {
+  try {
+    const value = JSON.parse(metadata);
+    return Boolean(
+      value.version === 1 &&
+        ['gpx', 'kml'].includes(value.format) &&
+        /^[a-f0-9]{64}$/.test(value.sha256) &&
+        value.counts &&
+        typeof value.counts === 'object' &&
+        !Array.isArray(value.counts)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Catalog snippets are display-only; never rewrite source locations or source text. */
+export function entrySnippetText(entry: KnowledgeEntry): string | undefined {
+  const snippet = entry.snippet;
+  const projection = entry.parseProjection;
+  if (
+    !snippet ||
+    entry.humanEdited ||
+    projection?.kind !== 'geospatial' ||
+    projection.version !== 1 ||
+    !projection.contentHash ||
+    (entry.searchMatch && entry.searchMatch.contentHash !== projection.contentHash)
+  )
+    return snippet;
+  const match = /(^|\r?\n)<!-- disco-geospatial-projection:(\{[^\r\n]*?)( -->|$)/.exec(snippet);
+  if (!match) return snippet;
+  const valid = match[3]
+    ? isGeospatialMarker(match[2])
+    : /^\{"version":1,"format":"(?:gpx|kml)"(?:,|$)/.test(match[2]);
+  if (!valid) return snippet;
+  const visible =
+    snippet.slice(0, match.index) + match[1] + snippet.slice(match.index + match[0].length);
+  return visible.trim() ? visible : '地图与轨迹资料，打开查看名称、描述和结构概览。';
+}
+
 /** Hide only a complete server-attested machine marker in the reading view. */
 export function sourceReadingText(detail: KnowledgeEntryDetail): string {
   const projection = detail.entry.parseProjection;
@@ -19,21 +59,7 @@ export function sourceReadingText(detail: KnowledgeEntryDetail): string {
     return detail.markdown;
   return detail.markdown.replace(
     /^<!-- disco-geospatial-projection:(\{[^\r\n]+\}) -->\r?$(?:\n)?/m,
-    (line, metadata: string) => {
-      try {
-        const value = JSON.parse(metadata);
-        return value.version === 1 &&
-          ['gpx', 'kml'].includes(value.format) &&
-          /^[a-f0-9]{64}$/.test(value.sha256) &&
-          value.counts &&
-          typeof value.counts === 'object' &&
-          !Array.isArray(value.counts)
-          ? ''
-          : line;
-      } catch {
-        return line;
-      }
-    }
+    (line, metadata: string) => (isGeospatialMarker(metadata) ? '' : line)
   );
 }
 

@@ -35,6 +35,7 @@ import {
   entryOrganization,
   errorMessage,
   formatDate,
+  formatSummaryProgress,
   GENERATION_LABELS,
   LEVEL_LABELS,
   PARSE_LABELS,
@@ -185,7 +186,19 @@ export function KnowledgeEntryDrawer({
   };
   return (
     <Drawer
-      title={editing ? (!detail ? '新建笔记' : '编辑资料') : detail?.entry.title || '资料详情'}
+      title={
+        <span
+          style={{
+            display: '-webkit-box',
+            WebkitBoxOrient: 'vertical',
+            WebkitLineClamp: mobile ? 3 : 2,
+            overflow: 'hidden',
+            overflowWrap: 'anywhere',
+          }}
+        >
+          {editing ? (!detail ? '新建笔记' : '编辑资料') : detail?.entry.title || '资料详情'}
+        </span>
+      }
       open={open}
       onClose={closeDetail}
       size={mobile ? '100%' : 'min(860px, 90vw)'}
@@ -390,11 +403,22 @@ export function KnowledgeEntryDrawer({
                 showIcon
                 title={GENERATION_LABELS[generation.state]}
                 description={
+                  (generation.state !== 'failed'
+                    ? formatSummaryProgress(generation.progress)
+                    : undefined) ||
                   generation.message ||
                   (generation.retryAt
                     ? `下次重试 ${formatDate(generation.retryAt)}`
                     : '无需保持页面打开，后台会继续处理。')
                 }
+              />
+            )}
+            {!generation && detail.entry.summaryProgress && (
+              <Alert
+                type="info"
+                showIcon
+                title="知识整理进度"
+                description={formatSummaryProgress(detail.entry.summaryProgress)}
               />
             )}
             {detail.entry.indexStatus === 'error' && (

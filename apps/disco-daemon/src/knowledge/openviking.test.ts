@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
@@ -538,6 +539,7 @@ describe('OpenViking derived index isolation', () => {
           configPath: join(base, 'config.json'),
         });
         const result = await client.summarizeContent(owner, { id: 'synthetic', content: '测试' });
+        if ('pending' in result) throw new Error('Expected completed summary');
         expect(result.archiveOnly).toBe(archiveOnly === true ? true : undefined);
         expect(result.overview).toBe('原始记录已保留，无额外知识。');
       }
@@ -573,6 +575,7 @@ describe('OpenViking derived index isolation', () => {
         sources: [source],
         forceSynthesis: true,
       });
+      if ('pending' in result) throw new Error('Expected completed summary');
       expect(result.summaryMode).toBe('structured_overview');
       expect(JSON.parse(result.overview)).toMatchObject({
         scope: openVikingAccountId(owner),
@@ -608,6 +611,277 @@ describe('OpenViking derived index isolation', () => {
       await removeFixture(base);
     }
   });
+
+  it('returns normal pending progress and forwards only validated counters, never stderr text', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'disco-summary-progress-'));
+    const script = join(base, 'summary.cjs');
+    const progress = { phase: 'queued', stage: 'map', completed: 2, total: 5 };
+    try {
+      await writeFile(
+        script,
+        `let body='';process.stdin.on('data',value=>body+=value);process.stdin.on('end',()=>{
+        const input=JSON.parse(body);if('onProgress' in input)process.exit(5);
+        process.stderr.write('PRIVATE_PROVIDER_TEXT\\n'+ 'x'.repeat(6000)+'\\n');
+        process.stderr.write(JSON.stringify({type:'summary_progress',progress:{phase:'processing',stage:'map',completed:-1,total:5,token:'SECRET'}})+'\\n');
+        process.stderr.write(JSON.stringify({type:'summary_progress',progress:{...${JSON.stringify(progress)},token:'SECRET'}})+'\\n');
+        process.stdout.write(JSON.stringify({pending:true,progress:{...${JSON.stringify(progress)},token:'SECRET'}}));
+      });`
+      );
+      const { client } = setup(undefined, {
+        pythonExecutable: process.execPath,
+        scriptPath: script,
+        configPath: join(base, 'config.json'),
+      });
+      const observer = vi.fn();
+      const result = await client.summarizeContent(owner, {
+        id: 'synthetic',
+        content: 'body',
+        onProgress: observer,
+      });
+      expect(result).toEqual({ pending: true, progress });
+      expect(observer).toHaveBeenCalled();
+      expect(
+        observer.mock.calls.every(([value]) => JSON.stringify(value) === JSON.stringify(progress))
+      ).toBe(true);
+      expect(JSON.stringify(observer.mock.calls)).not.toContain('SECRET');
+    } finally {
+      await removeFixture(base);
+    }
+  });
+
+  it('rejects malformed pending results instead of accepting a fake completed summary', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'disco-summary-progress-invalid-'));
+    const script = join(base, 'summary.cjs');
+    try {
+      for (const progress of [
+        { phase: 'queued', stage: 'map', completed: 3, total: 2 },
+        { phase: 'waiting_model', stage: 'map', completed: 0, total: 1 },
+        { phase: 'queued', stage: 'PRIVATE', completed: 0, total: 1 },
+      ]) {
+        await writeFile(
+          script,
+          `process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(${JSON.stringify(JSON.stringify({ pending: true, progress, abstract: 'fake', overview: 'fake' }))}));`
+        );
+        const { client } = setup(undefined, {
+          pythonExecutable: process.execPath,
+          scriptPath: script,
+          configPath: join(base, 'config.json'),
+        });
+        await expect(
+          client.summarizeContent(owner, { id: 'synthetic', content: 'body' })
+        ).rejects.toMatchObject({ code: 'SUMMARY_FORMAT_INVALID' });
+      }
+    } finally {
+      await removeFixture(base);
+    }
+  });
+
+  it('ends a stalled single request even if repeated waiting events arrive', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'disco-summary-request-timeout-'));
+    const script = join(base, 'summary.cjs');
+    try {
+      await writeFile(
+        script,
+        `process.stdin.resume();process.stdin.on('end',()=>{const event=()=>process.stderr.write(JSON.stringify({type:'summary_progress',progress:{phase:'waiting_model',stage:'map',completed:0,total:1,requestStartedAt:new Date().toISOString()}})+'\\n');event();setInterval(event,10);});`
+      );
+      const client = new OpenVikingClient({
+        baseUrl: 'http://127.0.0.1:1933',
+        resolveIdentity: identity,
+        summaryRequestTimeoutMs: 80,
+        summaryTimeoutMs: 3000,
+        summary: {
+          pythonExecutable: process.execPath,
+          scriptPath: script,
+          configPath: join(base, 'config.json'),
+        },
+      });
+      const started = Date.now();
+      await expect(
+        client.summarizeContent(owner, { id: 'synthetic', content: 'small input' })
+      ).rejects.toMatchObject({
+        code: 'SUMMARY_TIMEOUT',
+        message: '模型响应超时，稍后重试；原文已保留',
+      });
+      expect(Date.now() - started).toBeLessThan(2000);
+    } finally {
+      await removeFixture(base);
+    }
+  });
+
+  it('distinguishes a stuck helper before model dispatch and cancels an active child', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'disco-summary-helper-timeout-'));
+    const script = join(base, 'summary.cjs');
+    try {
+      await writeFile(
+        script,
+        `process.stdin.resume();process.stdin.on('end',()=>setInterval(()=>{},100));`
+      );
+      const client = new OpenVikingClient({
+        baseUrl: 'http://127.0.0.1:1933',
+        resolveIdentity: identity,
+        summaryTimeoutMs: 200,
+        summary: {
+          pythonExecutable: process.execPath,
+          scriptPath: script,
+          configPath: join(base, 'config.json'),
+        },
+      });
+      await expect(
+        client.summarizeContent(owner, { id: 'synthetic', content: 'body' })
+      ).rejects.toMatchObject({ code: 'SUMMARY_PROCESS_TIMEOUT' });
+      await writeFile(
+        script,
+        `process.stdin.resume();process.stdin.on('end',()=>{process.stderr.write(JSON.stringify({type:'summary_progress',progress:{phase:'waiting_model',stage:'map',completed:0,total:1,requestStartedAt:new Date().toISOString()}})+'\\n');setInterval(()=>{},100);});`
+      );
+      const active = new OpenVikingClient({
+        baseUrl: 'http://127.0.0.1:1933',
+        resolveIdentity: identity,
+        summary: {
+          pythonExecutable: process.execPath,
+          scriptPath: script,
+          configPath: join(base, 'config.json'),
+        },
+      });
+      await expect(
+        active.summarizeContent(owner, {
+          id: 'synthetic',
+          content: 'body',
+          onProgress: () => active.cancelPending(),
+        })
+      ).rejects.toMatchObject({ code: 'CANCELLED' });
+    } finally {
+      await removeFixture(base);
+    }
+  });
+
+  it.skipIf(process.platform !== 'win32' || !process.env.DISCO_KNOWLEDGE_TEST_PYTHON)(
+    'waits for a real Windows venv wrapper and its Python descendants to exit',
+    async () => {
+      const base = await mkdtemp(join(tmpdir(), 'disco-summary-python-tree-'));
+      const script = join(base, 'summary.py');
+      const childScript = join(base, 'descendant.py');
+      const pids: number[] = [];
+      const client = new OpenVikingClient({
+        baseUrl: 'http://127.0.0.1:1933',
+        resolveIdentity: identity,
+        summaryTimeoutMs: 10_000,
+        summary: {
+          pythonExecutable: process.env.DISCO_KNOWLEDGE_TEST_PYTHON!,
+          scriptPath: script,
+          configPath: join(base, 'unused.json'),
+        },
+      });
+      try {
+        await writeFile(
+          childScript,
+          `import os,time\nfrom pathlib import Path\nPath(__file__).with_suffix('.pid').write_text(str(os.getpid()))\ntime.sleep(60)\n`
+        );
+        await writeFile(
+          script,
+          `import json,os,subprocess,sys,time\nfrom pathlib import Path\njson.load(sys.stdin)\nchild_file=Path(__file__).with_name('descendant.py')\nchild=subprocess.Popen([sys.executable,str(child_file)])\nfor _ in range(500):\n    if child_file.with_suffix('.pid').exists(): break\n    time.sleep(.01)\npids=[os.getpid(),child.pid,int(child_file.with_suffix('.pid').read_text())]\nPath(__file__).with_suffix('.pids.json').write_text(json.dumps(pids))\nprint(json.dumps({'type':'summary_progress','progress':{'phase':'waiting_model','stage':'map','completed':0,'total':1,'requestStartedAt':'2026-01-01T00:00:00Z'}}),file=sys.stderr,flush=True)\ntime.sleep(60)\n`
+        );
+        let ready!: () => void;
+        let failed!: (error: unknown) => void;
+        const started = new Promise<void>((resolve, reject) => {
+          ready = resolve;
+          failed = reject;
+        });
+        const work = client.summarizeContent(owner, {
+          id: 'synthetic',
+          content: 'offline fixture',
+          onProgress: () => ready(),
+        });
+        void work.catch(failed);
+        await started;
+        pids.push(
+          ...(JSON.parse(await readFile(join(base, 'summary.pids.json'), 'utf8')) as number[])
+        );
+        expect(
+          pids.every((pid) => Number.isSafeInteger(pid) && pid > 0 && pid !== process.pid)
+        ).toBe(true);
+        for (const pid of new Set(pids)) expect(() => process.kill(pid, 0)).not.toThrow();
+        const rejected = expect(work).rejects.toMatchObject({ code: 'CANCELLED' });
+        await client.cancelPending();
+        await rejected;
+        for (const pid of new Set(pids)) expect(() => process.kill(pid, 0)).toThrow();
+      } finally {
+        await client.cancelPending().catch(() => undefined);
+        // Clean up only the exact synthetic PIDs if an assertion failed.
+        for (const pid of new Set(pids)) {
+          if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid) continue;
+          try {
+            process.kill(pid, 0);
+            spawnSync(
+              join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe'),
+              ['/PID', String(pid), '/T', '/F'],
+              { windowsHide: true, shell: false, stdio: 'ignore' }
+            );
+          } catch {
+            /* The fixture process has already exited. */
+          }
+        }
+        await removeFixture(base);
+      }
+    },
+    20_000
+  );
+
+  it.skipIf(process.platform !== 'win32')(
+    'reports a failed tree terminator without claiming cancellation finished',
+    async () => {
+      const base = await mkdtemp(join(tmpdir(), 'disco-summary-cancel-failure-'));
+      const script = join(base, 'summary.cjs');
+      let pid: number | undefined;
+      const previousSystemRoot = process.env.SystemRoot;
+      const logger = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const client = new OpenVikingClient({
+        baseUrl: 'http://127.0.0.1:1933',
+        resolveIdentity: identity,
+        summaryCancelTimeoutMs: 500,
+        summaryTimeoutMs: 3000,
+        summary: {
+          pythonExecutable: process.execPath,
+          scriptPath: script,
+          configPath: join(base, 'unused.json'),
+        },
+      });
+      try {
+        await writeFile(
+          script,
+          `require('fs').writeFileSync(${JSON.stringify(join(base, 'pid.json'))},JSON.stringify(process.pid));process.stdin.resume();process.stdin.on('end',()=>{process.stderr.write(JSON.stringify({type:'summary_progress',progress:{phase:'waiting_model',stage:'map',completed:0,total:1,requestStartedAt:new Date().toISOString()}})+'\\n');setInterval(()=>{},100);});`
+        );
+        let ready!: () => void;
+        const started = new Promise<void>((resolve) => {
+          ready = resolve;
+        });
+        const work = client.summarizeContent(owner, {
+          id: 'synthetic',
+          content: 'offline fixture',
+          onProgress: () => ready(),
+        });
+        const rejected = expect(work).rejects.toMatchObject({ code: 'CANCELLED' });
+        await started;
+        pid = JSON.parse(await readFile(join(base, 'pid.json'), 'utf8')) as number;
+        process.env.SystemRoot = base; // Deliberately missing terminator, after child startup.
+        await expect(client.cancelPending()).rejects.toMatchObject({ code: 'CANCEL_FAILED' });
+        await rejected;
+        expect(() => process.kill(pid!, 0)).not.toThrow();
+      } finally {
+        if (previousSystemRoot === undefined) delete process.env.SystemRoot;
+        else process.env.SystemRoot = previousSystemRoot;
+        if (pid && Number.isSafeInteger(pid) && pid !== process.pid) {
+          spawnSync(
+            join(previousSystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe'),
+            ['/PID', String(pid), '/T', '/F'],
+            { windowsHide: true, shell: false, stdio: 'ignore' }
+          );
+        }
+        await client.cancelPending().catch(() => undefined);
+        logger.mockRestore();
+        await removeFixture(base);
+      }
+    }
+  );
 
   it('deletes only the selected derived summary cache and prevents its recreation', async () => {
     const base = await mkdtemp(join(tmpdir(), 'disco-kb-provider-'));

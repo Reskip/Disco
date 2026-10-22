@@ -32,6 +32,7 @@ import type {
   KnowledgeLibraryStatus,
   KnowledgeOwner,
   KnowledgeSource,
+  KnowledgeSummaryProgress,
   Message,
   SessionID,
   TenantID,
@@ -134,8 +135,10 @@ export class KnowledgeRuntime {
   private indexing?: Promise<void>;
   private summarizing?: Promise<void>;
   private archiveReady = new Set<string>();
+  private recoveredSummaryOwners = new Set<string>();
   private activeIndex = new Map<string, string>();
   private activeSummary = new Map<string, string>();
+  private activeSummaryProgress = new Map<string, KnowledgeSummaryProgress>();
   private keywordWarmups = new Map<string, Promise<void>>();
   private keywordWarmedAt = new Map<string, number>();
   private stopped = true;
@@ -273,6 +276,7 @@ export class KnowledgeRuntime {
     if (status.processing) {
       status.processing.index.active = this.activeIndex.get(ownerKey(owner));
       status.processing.summary.active = this.activeSummary.get(ownerKey(owner));
+      status.processing.summary.progress = this.activeSummaryProgress.get(ownerKey(owner));
       status.processing.summary.message = this.archiveReady.has(ownerKey(owner))
         ? '已建立索引的资料会分批整理，失败项单独重试'
         : '首次归档尚未完成，自动整理将在归档完成后开始';
@@ -469,15 +473,17 @@ export class KnowledgeRuntime {
     clearTimeout(this.summaryTimer);
     this.indexTimer = undefined;
     this.summaryTimer = undefined;
-    this.engine?.cancelPending?.();
-    await Promise.allSettled([
+    const cancellation = this.engine?.cancelPending?.();
+    const settled = await Promise.allSettled([
       this.running,
       this.indexing,
       this.summarizing,
+      cancellation,
       ...this.keywordWarmups.values(),
     ]);
     this.keywordIndex.clear();
     this.keywordWarmedAt.clear();
+    if (settled[3].status === 'rejected') throw settled[3].reason;
   }
 
   async runOnce(includeDerived = true): Promise<void> {
@@ -510,6 +516,13 @@ export class KnowledgeRuntime {
           continue;
         }
         await this.assertWritable(owner);
+        if (
+          !this.recoveredSummaryOwners.has(ownerKey(owner)) &&
+          !this.activeSummary.has(ownerKey(owner))
+        ) {
+          await this.library.recoverSummaryProgress(owner);
+          this.recoveredSummaryOwners.add(ownerKey(owner));
+        }
         await this.library.reconcile(owner);
         const existing = new Map(
           (await this.library.snapshot(owner)).map((entry) => [
@@ -1071,14 +1084,18 @@ export class KnowledgeRuntime {
     await this.assertWritable(owner);
     const entries = await this.library.snapshot(owner);
     // Explicit requests work even during initial backfill and survive a process restart.
-    const requested = entries.find(
-      (entry) =>
-        !entry.historical &&
-        !entry.humanEdited &&
-        entry.generation &&
-        entry.generation.state !== 'complete' &&
-        (!entry.generation.retryAt || Date.parse(entry.generation.retryAt) <= Date.now())
-    );
+    const requested = entries
+      .filter(
+        (entry) =>
+          !entry.historical &&
+          !entry.humanEdited &&
+          entry.generation &&
+          entry.generation.state !== 'complete' &&
+          (!entry.generation.retryAt || Date.parse(entry.generation.retryAt) <= Date.now())
+      )
+      .sort((a, b) =>
+        (a.generation?.lastAttemptAt ?? '').localeCompare(b.generation?.lastAttemptAt ?? '')
+      )[0];
     let target = requested ? await this.library.get(owner, requested.id) : null;
     const inputs: KnowledgeEntryDetail[] = [];
     if (target) {
@@ -1116,6 +1133,7 @@ export class KnowledgeRuntime {
         )
         .sort(
           (a, b) =>
+            (a.summaryAttemptedAt ?? '').localeCompare(b.summaryAttemptedAt ?? '') ||
             Number(isStructuredSummaryCandidate(b)) - Number(isStructuredSummaryCandidate(a)) ||
             Number(b.kind === 'conversation') - Number(a.kind === 'conversation') ||
             (a.summaryAttempts ?? 0) - (b.summaryAttempts ?? 0) ||
@@ -1133,14 +1151,70 @@ export class KnowledgeRuntime {
     }
     const previousSummaryAt = this.lastSummaryAt;
     this.lastSummaryAt = Date.now();
+    const attemptedAt = new Date().toISOString();
+    let progressWrites = Promise.resolve();
+    let progressSavedAt = 0;
+    let progressSavedPhase: string | undefined;
+    const recordProgress = (progress: KnowledgeSummaryProgress): void => {
+      this.activeSummaryProgress.set(ownerKey(owner), progress);
+      const phase = `${progress.stage}:${progress.phase}`;
+      if (
+        phase === progressSavedPhase &&
+        progress.phase !== 'queued' &&
+        Date.now() - progressSavedAt < 15_000
+      )
+        return;
+      progressSavedAt = Date.now();
+      progressSavedPhase = phase;
+      progressWrites = progressWrites
+        .then(async () => {
+          if (target)
+            await this.library.markGeneration(owner, target.entry.id, {
+              ...target.entry.generation,
+              state: progress.phase === 'queued' ? 'queued' : 'running',
+              message: undefined,
+              retryAt: undefined,
+              lastAttemptAt: attemptedAt,
+              progress,
+            });
+          else
+            await this.library.markSummaryProgress(
+              owner,
+              inputs[0].entry.id,
+              inputs[0].contentHash,
+              progress,
+              attemptedAt
+            );
+        })
+        .catch(() => undefined);
+    };
     this.activeSummary.set(ownerKey(owner), target?.entry.title ?? inputs[0].entry.title);
-    if (target)
-      await this.library.markGeneration(owner, target.entry.id, {
-        ...target.entry.generation,
-        state: 'running',
-        message: '正在提炼主题、结论和来源',
-      });
     try {
+      if (target)
+        await this.library.markGeneration(owner, target.entry.id, {
+          ...target.entry.generation,
+          state: 'running',
+          lastAttemptAt: attemptedAt,
+          progress: undefined,
+          message: '正在提炼主题、结论和来源',
+        });
+      else
+        await this.library.markSummaryProgress(
+          owner,
+          inputs[0].entry.id,
+          inputs[0].contentHash,
+          undefined,
+          attemptedAt
+        );
+      if (this.stopped) {
+        if (target)
+          await this.library.markGeneration(owner, target.entry.id, {
+            ...target.entry.generation,
+            state: 'queued',
+            message: '后台恢复后继续整理',
+          });
+        return;
+      }
       const summary = await this.engine.summarizeContent(owner, {
         id: target?.entry.id ?? inputs[0].entry.id,
         sources: inputs.map((item) => ({
@@ -1156,6 +1230,7 @@ export class KnowledgeRuntime {
           markdown: item.markdown,
         })),
         forceSynthesis: Boolean(target),
+        onProgress: recordProgress,
         content: inputs
           .map(
             (item) =>
@@ -1166,6 +1241,7 @@ export class KnowledgeRuntime {
           ? `整理为跨资料的专题知识，归并重复内容，分别保留事实、结论、适用条件和未决问题。用户指定主题：${organization(target.entry).topic}。`
           : undefined,
       });
+      await progressWrites;
       for (const source of inputs) {
         const current = await this.library.get(owner, source.entry.id);
         if (!current || current.contentHash !== source.contentHash) {
@@ -1183,6 +1259,11 @@ export class KnowledgeRuntime {
         if (!target || target.entry.humanEdited) return;
       }
       const first = inputs[0];
+      if ('pending' in summary) {
+        recordProgress({ ...summary.progress, phase: 'queued', requestStartedAt: undefined });
+        await progressWrites;
+        return;
+      }
       if (!target && summary.archiveOnly) {
         await this.library.markSummarized(owner, first.entry.id, first.contentHash, {
           disposition: 'archive_only',
@@ -1202,12 +1283,16 @@ export class KnowledgeRuntime {
       const references = inputs
         .map((item) => `- [${item.entry.title}](/knowledge?entry=${item.entry.id})`)
         .join('\n');
-      await this.library.upsertSource(owner, {
+      const saved = await this.library.upsertSource(owner, {
         source: target?.entry.source ?? first.entry.source,
         sourceId: target?.entry.sourceId ?? `summary:${first.entry.id}`,
         kind: 'note',
         title,
         automated: true,
+        expectedSources: inputs.map((item) => ({
+          id: item.entry.id,
+          contentHash: item.contentHash,
+        })),
         summaryMode: summary.summaryMode ?? 'model',
         derivedFrom: target
           ? undefined
@@ -1226,6 +1311,16 @@ export class KnowledgeRuntime {
         markdown: `# ${title}\n\n> ${summary.summaryMode === 'structured_overview' ? '本地生成的资料概览，描述文件结构与可核实的统计；不代表逐条解读了所有记录。' : '根据所列原始资料整理。'}\n\n${summary.abstract}\n\n${summary.overview}\n\n## 来源\n\n${references}\n`,
         rawContent: `${JSON.stringify({ sources: inputs.map((item) => ({ id: item.entry.id, hash: item.contentHash })), generatedAt: new Date().toISOString(), ...summary })}\n`,
       });
+      if (!saved) {
+        if (target)
+          await this.library.markGeneration(owner, target.entry.id, {
+            ...target.entry.generation,
+            state: 'queued',
+            message: '来源已变化，将按当前资料重新整理',
+            progress: undefined,
+          });
+        return;
+      }
       if (!target) {
         await this.library.markSummarized(owner, first.entry.id, first.contentHash);
         await this.library.categorizeSource(owner, first.entry.id, first.contentHash, {
@@ -1241,6 +1336,21 @@ export class KnowledgeRuntime {
         return 'local';
       }
     } catch (error) {
+      await progressWrites;
+      if (this.stopped && error instanceof OpenVikingError && error.code === 'CANCELLED') {
+        const progress = this.activeSummaryProgress.get(ownerKey(owner));
+        if (progress) {
+          recordProgress({ ...progress, phase: 'queued', requestStartedAt: undefined });
+          await progressWrites;
+        } else if (target) {
+          await this.library.markGeneration(owner, target.entry.id, {
+            ...target.entry.generation,
+            state: 'queued',
+            message: '后台恢复后继续整理',
+          });
+        }
+        return;
+      }
       const message =
         error instanceof OpenVikingError ? error.message : '摘要生成未完成，将自动重试';
       if (target) {
@@ -1250,6 +1360,14 @@ export class KnowledgeRuntime {
           state: 'failed',
           message,
           attempts,
+          lastAttemptAt: attemptedAt,
+          progress: this.activeSummaryProgress.has(ownerKey(owner))
+            ? {
+                ...this.activeSummaryProgress.get(ownerKey(owner))!,
+                phase: 'queued',
+                requestStartedAt: undefined,
+              }
+            : undefined,
           retryAt: retryDate(attempts, error instanceof OpenVikingError ? error.retryAfterMs : 0),
         });
       } else
@@ -1262,6 +1380,7 @@ export class KnowledgeRuntime {
         );
     } finally {
       this.activeSummary.delete(ownerKey(owner));
+      this.activeSummaryProgress.delete(ownerKey(owner));
     }
   }
 }

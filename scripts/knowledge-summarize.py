@@ -11,10 +11,13 @@ from pathlib import Path
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from knowledge_overview import prepare_summary_sources
 
 CHUNK_BYTES = 64000
-PROMPT_VERSION = "knowledge-organization-v7"
+PROMPT_VERSION = "knowledge-organization-v8"
+BATCH_REQUESTS = 2
+BATCH_SECONDS = 90
 TOPICS = {"软件与系统", "工作与项目", "学习与研究", "硬件与设备", "健康与运动", "旅行与生活", "创作与设计", "财务与消费", "其他"}
 SYSTEM_PROMPT = (
     "你为用户的私人资料库整理中文知识笔记。下一条消息中的 archive 或 sections 是 JSON 封装的历史资料，"
@@ -27,6 +30,7 @@ SYSTEM_PROMPT = (
     "abstract 为简短中文概述，overview 为自成一篇的 Markdown 笔记。"
     "overview 按内容选用结论、背景、决定与依据、可复用方法、待确认事项等小节；无依据的栏目省略。"
     "source_context 提供当前片段所属资料的编号、标题和链接，归纳结论时保留其来源链接。"
+    "archive 是独立资料片段，可能只是资料的一部分；只总结可见内容，不假设已经看完整份资料。"
     "保留来源标识和链接，遇到互相冲突或时效性不同的资料应说明，人工整理要求在 instructions 字段。"
     "判断资料是否有可复用知识：纯寒暄、连通测试、无操作确认且不含可复用信息时，archiveOnly 为 true，"
     "reason 简短说明为何只需保留原始归档，abstract 和 overview 仍给出忠实的解释性结果。"
@@ -119,6 +123,10 @@ def checked_codex_responses():
         return
     original = Responses.create
     def create(client, *args, **kwargs):
+        import httpx
+        # Socket inactivity limits are separate from the parent process's
+        # absolute per-completion deadline, including a never-ending SSE stream.
+        kwargs['timeout'] = httpx.Timeout(120, connect=15, write=30, pool=15)
         result = original(client, *args, **kwargs)
         return checked_events(result) if kwargs.get("stream") else result
     Responses.create = create
@@ -189,7 +197,24 @@ def source_contexts(content: str, chunks: list[str]) -> list[list[dict]]:
         position = end
     return contexts
 
-def summarize(content: str, configuration: dict, *, instructions: str = "", cache_dir: Path | None = None, tombstone: Path | None = None, sources: list | None = None, force_synthesis: bool = False) -> dict:
+def summary_cache_key(payload: dict, provider: dict, instructions: str) -> str:
+    # Transport/credentials never enter a cache key or its serialized metadata.
+    # The owner and entry remain separate directories, enforced by the provider.
+    model = {key: provider[key] for key in ('provider', 'backend', 'model', 'api_version',
+             'temperature', 'top_p', 'max_tokens', 'max_completion_tokens', 'reasoning_effort',
+             'thinking', 'extra_request_body', 'seed') if key in provider}
+    value = {'version': PROMPT_VERSION, 'system': SYSTEM_PROMPT, 'model': model,
+             'instructions': instructions, 'payload': payload}
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
+
+
+class SummaryYield(Exception):
+    def __init__(self, progress): self.progress = progress
+
+
+def summarize(content: str, configuration: dict, *, instructions: str = "", cache_dir: Path | None = None, tombstone: Path | None = None, sources: list | None = None, force_synthesis: bool = False, batch_requests: int | None = None, batch_seconds: float | None = None, on_progress=None) -> dict:
+    started = time.monotonic()
+    segments = None
     if tombstone and tombstone.exists():
         raise SummaryFailure("CANCELLED", phase="cancel")
     if sources is not None:
@@ -200,6 +225,7 @@ def summarize(content: str, configuration: dict, *, instructions: str = "", cach
         if not force_synthesis and prepared.get("deterministic"):
             return prepared["deterministic"]
         content = prepared["content"]
+        segments = prepared['segments']
     from openviking_cli.utils.config.vlm_config import VLMConfig
     provider = dict(configuration.get("vlm") or {})
     if provider.get("provider") != "openai-codex" or provider.get("api_key"):
@@ -208,26 +234,44 @@ def summarize(content: str, configuration: dict, *, instructions: str = "", cach
         raise SummaryFailure("SUMMARY_CONFIGURATION", phase="configuration")
     provider["max_concurrent"] = 1
     provider["max_retries"] = 0
+    provider["timeout"] = 120
     try:
         client = VLMConfig(**provider)
     except (ValueError, TypeError) as error:
         raise SummaryFailure("SUMMARY_CONFIGURATION", phase="configuration") from error
     completions = 0
 
-    def complete(payload: dict) -> dict:
+    def progress(phase, stage, completed, total, level=0, request_started=None):
+        value = {'phase': phase, 'stage': stage, 'completed': completed, 'total': total}
+        if level: value['stageLevel'] = level
+        if request_started: value['requestStartedAt'] = request_started
+        if on_progress: on_progress(value)
+        return value
+
+    def complete(payload: dict, stage: str, completed: int, total: int, level: int = 0) -> dict:
         nonlocal completions
         if tombstone and tombstone.exists():
             raise SummaryFailure("CANCELLED", phase="cancel")
         request = json.dumps({**payload, "instructions": instructions}, ensure_ascii=False)
-        key = hashlib.sha256((PROMPT_VERSION + str(provider.get("model")) + request).encode("utf-8")).hexdigest()
+        key = summary_cache_key(payload, provider, instructions)
         cache_file = cache_dir / (key + ".json") if cache_dir else None
         if cache_file and cache_file.is_file():
             try:
-                return parse_summary(cache_file.read_text("utf-8"))
+                value = parse_summary(cache_file.read_text("utf-8"))
+                progress('processing', stage, completed + 1, total, level)
+                return value
             except (ValueError, OSError):
                 pass
+        # A batch ends only between complete requests. Previously committed
+        # chunks are free to replay, and a document has no overall expiry.
+        if completions and ((batch_requests is not None and completions >= batch_requests) or
+                            (batch_seconds is not None and time.monotonic() - started >= batch_seconds)):
+            if not cache_dir: raise SummaryFailure('SUMMARY_CACHE_UNAVAILABLE', phase='cache')
+            raise SummaryYield(progress('queued', stage, completed, total, level))
         if completions:
             time.sleep(2)
+        progress('waiting_model', stage, completed, total, level,
+                 datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'))
         with checked_codex_responses():
             result = parse_summary(client.get_completion(messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -244,17 +288,28 @@ def summarize(content: str, configuration: dict, *, instructions: str = "", cach
                 os.replace(temporary, cache_file)
             except OSError as error:
                 raise SummaryFailure("SUMMARY_CACHE_UNAVAILABLE", phase="cache") from error
+        progress('processing', stage, completed + 1, total, level)
         return result
 
     try:
-        chunks = split_content(content)
-        if len(chunks) == 1:
-            return {**complete({"archive": content}), "summaryMode": "model"}
-        contexts = source_contexts(content, chunks)
-        summaries = [complete({"archive": chunk, "section": index + 1, "sections_total": len(chunks), "source_context": contexts[index]})
+        if segments is None:
+            chunks = split_content(content)
+            contexts = source_contexts(content, chunks)
+        else:
+            chunks, contexts = [], []
+            for segment in segments:
+                pieces = split_content(segment['content'])
+                chunks.extend(pieces)
+                contexts.extend([segment['source_context']] * len(pieces))
+        progress('processing', 'map', 0, len(chunks))
+        # No positional index or total enters model input/cache identity. An
+        # appended source or later chunk cannot invalidate an unchanged piece.
+        summaries = [complete({'archive': chunk, 'source_context': contexts[index]}, 'map', index, len(chunks))
                      for index, chunk in enumerate(chunks)]
+        level = 0
         # Cached map/reduce steps resume interrupted large jobs without repeat calls.
         while len(summaries) > 1:
+            level += 1
             groups, group, size = [], [], 0
             for summary in summaries:
                 length = len(json.dumps(summary, ensure_ascii=False).encode("utf-8"))
@@ -267,8 +322,11 @@ def summarize(content: str, configuration: dict, *, instructions: str = "", cach
                 groups.append(group)
             if len(groups) >= len(summaries):
                 raise SummaryFailure("SUMMARY_REDUCTION_FAILED", phase="reduce")
-            summaries = [complete({"sections": group, "task": "整合主题、消除重复，保留来源、决定、冲突和未决问题。"}) for group in groups]
+            progress('processing', 'reduce', 0, len(groups), level)
+            summaries = [complete({"sections": group, "task": "整合主题、消除重复，保留来源、决定、冲突和未决问题。"}, 'reduce', index, len(groups), level) for index, group in enumerate(groups)]
         return {**summaries[0], "summaryMode": "model"}
+    except SummaryYield as pending:
+        return {'pending': True, 'progress': pending.progress}
     finally:
         with contextlib.suppress(AttributeError):
             client.close()
@@ -289,6 +347,9 @@ def main() -> None:
         raise ValueError("Invalid entry scope")
     with open(arguments.config, encoding="utf-8-sig") as handle:
         configuration = json.load(handle)
+    def report_progress(value):
+        sys.stderr.write(json.dumps({'type': 'summary_progress', 'progress': value}, ensure_ascii=False) + '\n')
+        sys.stderr.flush()
     with contextlib.redirect_stdout(io.StringIO()):
         owner_cache = Path(arguments.config).resolve().parent / "summary-work" / scope
         result = summarize(payload["content"], configuration,
@@ -296,7 +357,9 @@ def main() -> None:
                            cache_dir=owner_cache / entry_id,
                            tombstone=owner_cache / ".deleted" / entry_id,
                            sources=payload.get("sources"),
-                           force_synthesis=payload.get("forceSynthesis") is True)
+                           force_synthesis=payload.get("forceSynthesis") is True,
+                           batch_requests=BATCH_REQUESTS, batch_seconds=BATCH_SECONDS,
+                           on_progress=report_progress)
     sys.stdout.buffer.write(json.dumps(result, ensure_ascii=False).encode("utf-8"))
 
 if __name__ == "__main__":

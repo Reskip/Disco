@@ -4,6 +4,39 @@ import { describe, expect, it } from 'vitest';
 import { KnowledgeProgress } from './KnowledgeProgress';
 
 describe('knowledge processing progress', () => {
+  it('shows an active model wait without marking the queued entry as completed', () => {
+    render(
+      <KnowledgeProgress
+        status={{
+          total: 1,
+          conversations: 1,
+          documents: 0,
+          notes: 0,
+          humanEdited: 0,
+          pendingIndex: 0,
+          deleted: 0,
+          totalBytes: 10,
+          processing: {
+            index: { indexed: 1, pending: 0, failed: 0, unsupported: 0 },
+            summary: {
+              completed: 0,
+              pending: 1,
+              failed: 0,
+              active: '原始会话',
+              progress: { phase: 'waiting_model', stage: 'map', completed: 0, total: 1 },
+            },
+          },
+        }}
+      />
+    );
+    expect(screen.getByText('原始会话 · 等待模型响应')).toBeInTheDocument();
+    expect(screen.getByText('知识整理 · 0 份已处理')).toBeInTheDocument();
+    expect(screen.getByRole('progressbar', { name: '知识整理进度' })).toHaveAttribute(
+      'aria-valuenow',
+      '0'
+    );
+  });
+
   it('does not mark a large batch complete while a few entries remain', () => {
     const status: KnowledgeLibraryStatus = {
       total: 1712,

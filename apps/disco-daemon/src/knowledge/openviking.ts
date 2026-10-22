@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { createHash, createHmac } from 'node:crypto';
 import { lstat, mkdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import type { KnowledgeKind, KnowledgeOwner } from '@disco/core/types';
+import type { KnowledgeKind, KnowledgeOwner, KnowledgeSummaryProgress } from '@disco/core/types';
 
 /** Provision one OpenViking account per authenticated Disco owner. */
 export function openVikingAccountId(owner: KnowledgeOwner): string {
@@ -33,6 +33,8 @@ export interface OpenVikingOptions {
   requestTimeoutMs?: number;
   indexTimeoutMs?: number;
   summaryTimeoutMs?: number;
+  summaryRequestTimeoutMs?: number;
+  summaryCancelTimeoutMs?: number;
   summary?: {
     pythonExecutable: string;
     scriptPath: string;
@@ -60,6 +62,10 @@ export interface KnowledgeSummary {
   summaryMode?: 'structured_overview' | 'model';
 }
 
+export type KnowledgeSummaryResult =
+  | KnowledgeSummary
+  | { pending: true; progress: KnowledgeSummaryProgress };
+
 /** Sources are resolved from the same authenticated library by the caller. */
 export interface KnowledgeSummarySource {
   id: string;
@@ -80,10 +86,11 @@ const providerMessages: Record<string, string> = {
   PROCESSING_ERROR: '语义索引计算失败，将自动重试',
   SUMMARY_RATE_LIMITED: '摘要额度暂时不足，将稍后自动重试',
   SUMMARY_AUTH_REQUIRED: '摘要账号需要重新登录，原文与索引保持可用',
-  SUMMARY_TIMEOUT: '本轮摘要整理尚未完成，将从已完成的片段继续',
+  SUMMARY_TIMEOUT: '模型响应超时，稍后重试；原文已保留',
+  SUMMARY_PROCESS_TIMEOUT: '本轮摘要处理超时，稍后重试；原文与已完成结果已保留',
   SUMMARY_FORMAT_INVALID: '摘要返回格式不完整，将稍后重新整理；原文保持可用',
   SUMMARY_EMPTY: '摘要模型未返回内容，将稍后重新整理',
-  SUMMARY_INCOMPLETE: '摘要响应中途结束，将从已完成的片段继续',
+  SUMMARY_INCOMPLETE: '摘要响应中途结束，将稍后重试；原文已保留',
   SUMMARY_NETWORK: '摘要服务连接失败，将稍后自动重试',
   SUMMARY_SERVICE_UNAVAILABLE: '摘要服务暂时不可用，将稍后自动重试',
   SUMMARY_MODEL_UNAVAILABLE: '当前摘要模型不可用，请检查模型配置',
@@ -94,12 +101,14 @@ const providerMessages: Record<string, string> = {
   SUMMARY_REDUCTION_FAILED: '资料片段过多且无法合并，请调整整理范围',
   SUMMARY_FAILED: '资料摘要未生成，原文与索引保持可用',
   CANCELLED: '后台处理已暂停，将在下次继续',
+  CANCEL_FAILED: '摘要后台进程尚未退出，请稍后检查后台状态',
 };
 
 const summaryRetryMs: Record<string, number> = {
   SUMMARY_NETWORK: 30_000,
   SUMMARY_SERVICE_UNAVAILABLE: 30_000,
   SUMMARY_TIMEOUT: 60_000,
+  SUMMARY_PROCESS_TIMEOUT: 60_000,
   SUMMARY_FORMAT_INVALID: 300_000,
   SUMMARY_EMPTY: 300_000,
   SUMMARY_INCOMPLETE: 300_000,
@@ -153,6 +162,44 @@ function summaryDiagnostic(value: unknown): Record<string, string | number> {
       result[key] = count;
   }
   return result;
+}
+
+/** Only counters/states cross the helper telemetry boundary, never model text. */
+function summaryProgress(value: unknown): KnowledgeSummaryProgress | undefined {
+  const input = record(value);
+  if (
+    !input ||
+    !['queued', 'waiting_model', 'processing'].includes(String(input.phase)) ||
+    !['map', 'reduce'].includes(String(input.stage)) ||
+    !Number.isSafeInteger(input.completed) ||
+    !Number.isSafeInteger(input.total) ||
+    Number(input.completed) < 0 ||
+    Number(input.total) < 1 ||
+    Number(input.completed) > Number(input.total) ||
+    Number(input.total) > 1_000_000 ||
+    (input.stageLevel !== undefined &&
+      (!Number.isSafeInteger(input.stageLevel) ||
+        Number(input.stageLevel) < 1 ||
+        Number(input.stageLevel) > 1000))
+  )
+    return undefined;
+  if (
+    input.phase === 'waiting_model' &&
+    (typeof input.requestStartedAt !== 'string' ||
+      !/^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(input.requestStartedAt) ||
+      !Number.isFinite(Date.parse(input.requestStartedAt)))
+  )
+    return undefined;
+  return {
+    phase: input.phase as KnowledgeSummaryProgress['phase'],
+    stage: input.stage as KnowledgeSummaryProgress['stage'],
+    completed: Number(input.completed),
+    total: Number(input.total),
+    ...(input.stageLevel !== undefined ? { stageLevel: Number(input.stageLevel) } : {}),
+    ...(input.phase === 'waiting_model'
+      ? { requestStartedAt: input.requestStartedAt as string }
+      : {}),
+  };
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -307,11 +354,13 @@ export class OpenVikingClient {
   private readonly requestTimeoutMs: number;
   private readonly indexTimeoutMs: number;
   private readonly summaryTimeoutMs: number;
+  private readonly summaryRequestTimeoutMs: number;
+  private readonly summaryCancelTimeoutMs: number;
   /** Keep accepted work across retries instead of submitting it a second time. */
   private readonly pendingBatches = new Map<string, unknown>();
   private readonly requests = new Set<AbortController>();
-  private readonly summaries = new Set<() => void>();
-  private readonly summariesByEntry = new Map<string, Set<() => void>>();
+  private readonly summaries = new Set<() => Promise<void>>();
+  private readonly summariesByEntry = new Map<string, Set<() => Promise<void>>>();
   private readonly summaryExits = new Map<string, Set<Promise<void>>>();
   private cancellationEpoch = 0;
 
@@ -320,14 +369,38 @@ export class OpenVikingClient {
     this.fetcher = options.fetch ?? fetch;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 10_000;
     this.indexTimeoutMs = options.indexTimeoutMs ?? 180_000;
-    this.summaryTimeoutMs = options.summaryTimeoutMs ?? 600_000;
+    this.summaryTimeoutMs = options.summaryTimeoutMs ?? 300_000;
+    this.summaryRequestTimeoutMs = options.summaryRequestTimeoutMs ?? 180_000;
+    this.summaryCancelTimeoutMs = options.summaryCancelTimeoutMs ?? 5000;
   }
 
   /** Stop only work owned by this client; a later worker pass can safely resume. */
-  cancelPending(): void {
+  async cancelPending(): Promise<void> {
     this.cancellationEpoch += 1;
     for (const request of this.requests) request.abort();
-    for (const cancel of [...this.summaries]) cancel();
+    const exits = [...this.summaryExits.values()].flatMap((values) => [...values]);
+    const cancellations = [...this.summaries].map((cancel) => cancel());
+    await this.waitForSummaryExit([...exits, ...cancellations]);
+  }
+
+  private async waitForSummaryExit(work: Promise<void>[]): Promise<void> {
+    if (!work.length) return;
+    await new Promise<void>((done, reject) => {
+      const timer = setTimeout(
+        () => reject(new OpenVikingError('摘要进程退出超时', 'CANCEL_FAILED')),
+        this.summaryCancelTimeoutMs
+      );
+      Promise.all(work).then(
+        () => {
+          clearTimeout(timer);
+          done();
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        }
+      );
+    });
   }
 
   private assertActive(epoch: number): void {
@@ -339,7 +412,10 @@ export class OpenVikingClient {
     const entryId = safeEntryId(id);
     const key = `${scope}:${entryId}`;
     const exits = [...(this.summaryExits.get(key) ?? [])];
-    for (const cancel of [...(this.summariesByEntry.get(key) ?? [])]) cancel();
+    const cancellations = [...(this.summariesByEntry.get(key) ?? [])].map((cancel) => cancel());
+    // Attach rejection handlers before filesystem work while cancellation runs.
+    const cancelled = Promise.all(cancellations);
+    void cancelled.catch(() => undefined);
     const settings = this.options.summary;
     if (!settings) return;
     try {
@@ -363,14 +439,7 @@ export class OpenVikingClient {
           if (error.code !== 'EEXIST') throw error;
         }
       );
-      if (exits.length)
-        await new Promise<void>((done, reject) => {
-          const timer = setTimeout(() => reject(new Error('Summary child is still exiting')), 5000);
-          Promise.all(exits).then(() => {
-            clearTimeout(timer);
-            done();
-          }, reject);
-        });
+      await this.waitForSummaryExit([...exits, cancelled.then(() => undefined)]);
       const target = resolve(base, 'summary-work', scope, entryId);
       const child = relative(base, target);
       if (isAbsolute(child) || child === '..' || child.startsWith(`..${sep}`))
@@ -785,7 +854,7 @@ export class OpenVikingClient {
   }
 
   /** Call only from the separate low-speed summary queue after original indexing. */
-  async summarize(owner: KnowledgeOwner, id: string): Promise<KnowledgeSummary> {
+  async summarize(owner: KnowledgeOwner, id: string): Promise<KnowledgeSummaryResult> {
     const root = `${this.root(owner)}/${safeEntryId(id)}`;
     const identity = await this.identity(owner);
     const parts = await this.readParts(identity, root);
@@ -804,8 +873,9 @@ export class OpenVikingClient {
       instructions?: string;
       sources?: KnowledgeSummarySource[];
       forceSynthesis?: boolean;
+      onProgress?: (progress: KnowledgeSummaryProgress) => void;
     }
-  ): Promise<KnowledgeSummary> {
+  ): Promise<KnowledgeSummaryResult> {
     openVikingAccountId(owner);
     safeEntryId(document.id);
     if (document.sources) {
@@ -840,7 +910,7 @@ export class OpenVikingClient {
         {
           windowsHide: true,
           shell: false,
-          stdio: ['pipe', 'pipe', 'ignore'],
+          stdio: ['pipe', 'pipe', 'pipe'],
           env: {
             ...process.env,
             PYTHONIOENCODING: 'utf-8',
@@ -856,6 +926,10 @@ export class OpenVikingClient {
       );
       let output = '';
       let settled = false;
+      let progressBuffer = '';
+      let discardingProgressLine = false;
+      let requestTimer: ReturnType<typeof setTimeout> | undefined;
+      let termination: Promise<void> | undefined;
       const jobKey = `${openVikingAccountId(owner)}:${document.id}`;
       const exited = new Promise<void>((done) => child.once('close', () => done()));
       const exits = this.summaryExits.get(jobKey) ?? new Set<Promise<void>>();
@@ -865,7 +939,10 @@ export class OpenVikingClient {
         exits.delete(exited);
         if (!exits.size) this.summaryExits.delete(jobKey);
       });
-      const cancel = () => fail('CANCELLED');
+      const cancel = () => {
+        fail('CANCELLED');
+        return termination ?? exited;
+      };
       const release = () => {
         this.summaries.delete(cancel);
         const jobs = this.summariesByEntry.get(jobKey);
@@ -877,23 +954,58 @@ export class OpenVikingClient {
         settled = true;
         release();
         clearTimeout(timer);
+        clearTimeout(requestTimer);
         if (child.exitCode === null && child.signalCode === null) {
-          if (process.platform === 'win32' && child.pid) {
-            // A Windows venv launcher owns a second Python process. Terminate
-            // this specific child tree so a timeout cannot leave a cloud request.
-            const terminator = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
-              windowsHide: true,
-              shell: false,
-              stdio: 'ignore',
-            });
-            terminator.on('error', () => child.kill());
-          } else child.kill();
+          termination = this.waitForSummaryExit([
+            exited,
+            new Promise<void>((done, failed) => {
+              if (process.platform === 'win32' && child.pid) {
+                // A venv launcher owns another Python process. Killing only
+                // the wrapper can leave a cloud request alive indefinitely.
+                const terminator = spawn(
+                  join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe'),
+                  ['/PID', String(child.pid), '/T', '/F'],
+                  {
+                    windowsHide: true,
+                    shell: false,
+                    stdio: 'ignore',
+                  }
+                );
+                terminator.on('error', () =>
+                  failed(new OpenVikingError('无法终止摘要进程树', 'CANCEL_FAILED'))
+                );
+                terminator.on('close', (code) => {
+                  if (code === 0) done();
+                  else failed(new OpenVikingError('摘要进程树未退出', 'CANCEL_FAILED'));
+                });
+              } else if (child.kill() || child.exitCode !== null || child.signalCode !== null)
+                done();
+              else failed(new OpenVikingError('摘要进程未退出', 'CANCEL_FAILED'));
+            }),
+          ]);
+          // Timeouts also terminate a child, without an explicit cancel caller.
+          void termination.catch(() => console.warn('[knowledge] 摘要后台进程未能按时退出'));
         }
         reject(new OpenVikingError('资料摘要未生成，原文与索引保持可用', code));
       };
-      const timer = setTimeout(() => fail('SUMMARY_TIMEOUT'), this.summaryTimeoutMs);
+      const timer = setTimeout(() => fail('SUMMARY_PROCESS_TIMEOUT'), this.summaryTimeoutMs);
+      const updateProgress = (progress: KnowledgeSummaryProgress) => {
+        if (settled) return;
+        if (progress.phase === 'waiting_model') {
+          // Repeated activity/heartbeats cannot extend an in-flight request.
+          requestTimer ??= setTimeout(() => fail('SUMMARY_TIMEOUT'), this.summaryRequestTimeoutMs);
+        } else {
+          clearTimeout(requestTimer);
+          requestTimer = undefined;
+        }
+        try {
+          document.onProgress?.(progress);
+        } catch {
+          /* UI observers cannot fail a model job. */
+        }
+      };
       this.summaries.add(cancel);
-      const jobs = this.summariesByEntry.get(jobKey) ?? new Set<() => void>();
+      const jobs = this.summariesByEntry.get(jobKey) ?? new Set<() => Promise<void>>();
       jobs.add(cancel);
       this.summariesByEntry.set(jobKey, jobs);
       child.on('error', () => fail());
@@ -902,6 +1014,31 @@ export class OpenVikingClient {
       child.stdout.on('data', (chunk: string) => {
         output += chunk;
         if (output.length > 2_000_000) fail('INVALID_RESPONSE');
+      });
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (chunk: string) => {
+        for (const character of chunk) {
+          if (character === '\n') {
+            if (!discardingProgressLine) {
+              try {
+                const event = record(JSON.parse(progressBuffer));
+                const progress =
+                  event?.type === 'summary_progress' ? summaryProgress(event.progress) : undefined;
+                if (progress) updateProgress(progress);
+              } catch {
+                /* Third-party stderr is not exposed or retained. */
+              }
+            }
+            progressBuffer = '';
+            discardingProgressLine = false;
+          } else if (!discardingProgressLine) {
+            progressBuffer += character;
+            if (progressBuffer.length > 4096) {
+              progressBuffer = '';
+              discardingProgressLine = true;
+            }
+          }
+        }
       });
       child.on('close', (code) => {
         if (settled) return;
@@ -927,6 +1064,17 @@ export class OpenVikingClient {
         }
         try {
           const result = record(JSON.parse(output));
+          if (result?.pending === true) {
+            const progress = summaryProgress(result.progress);
+            if (progress?.phase !== 'queued') return fail('SUMMARY_FORMAT_INVALID');
+            updateProgress(progress);
+            settled = true;
+            release();
+            clearTimeout(timer);
+            clearTimeout(requestTimer);
+            resolve({ pending: true, progress });
+            return;
+          }
           if (
             typeof result?.abstract !== 'string' ||
             typeof result.overview !== 'string' ||
@@ -936,6 +1084,7 @@ export class OpenVikingClient {
           settled = true;
           release();
           clearTimeout(timer);
+          clearTimeout(requestTimer);
           resolve({
             abstract: result.abstract,
             overview: result.overview,

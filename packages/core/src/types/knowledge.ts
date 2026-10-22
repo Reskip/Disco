@@ -17,12 +17,22 @@ export interface KnowledgeOrganization {
   tags?: string[];
   sourceEntryIds?: string[];
 }
+export interface KnowledgeSummaryProgress {
+  phase: 'queued' | 'waiting_model' | 'processing';
+  stage: 'map' | 'reduce';
+  completed: number;
+  total: number;
+  requestStartedAt?: string;
+  stageLevel?: number;
+}
 export interface KnowledgeGeneration {
   state: 'queued' | 'running' | 'failed' | 'complete';
   message?: string;
   attempts?: number;
   retryAt?: string;
   requestedTitle?: string;
+  progress?: KnowledgeSummaryProgress;
+  lastAttemptAt?: string;
 }
 
 export interface KnowledgeSourceVersion {
@@ -71,6 +81,8 @@ export interface KnowledgeEntry {
   summaryMessage?: string;
   summaryAttempts?: number;
   summaryRetryAt?: string;
+  summaryProgress?: KnowledgeSummaryProgress;
+  summaryAttemptedAt?: string;
   summaryDisposition?: 'summarized' | 'archive_only';
   summaryReason?: string;
   /** Distinguishes a locally computed file inventory from model-based synthesis. */
@@ -122,6 +134,8 @@ export interface KnowledgeSourceInput {
   summaryMode?: 'structured_overview' | 'model';
   /** Server-only: automatic drafts remain writable until a human edits them. */
   automated?: boolean;
+  /** Server-only commit guard for summaries generated from these exact source versions. */
+  expectedSources?: Array<{ id: string; contentHash: string }>;
 }
 
 export interface KnowledgeListOptions {
@@ -185,6 +199,7 @@ export interface KnowledgeLibraryStatus {
       completed: number;
       failed: number;
       archivedOnly?: number;
+      progress?: KnowledgeSummaryProgress;
       active?: string;
       message?: string;
     };

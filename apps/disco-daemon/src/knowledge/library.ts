@@ -26,6 +26,7 @@ import type {
   KnowledgeOwner,
   KnowledgeParseStatus,
   KnowledgeSourceInput,
+  KnowledgeSummaryProgress,
 } from '@disco/core/types';
 import { canSummarize, materialType, organization, retryDate } from './organization.js';
 import { searchTerms } from './search.js';
@@ -546,6 +547,10 @@ export class KnowledgeLibrary {
       entry.humanEdited = true;
       entry.summaryDisposition = undefined;
       entry.summaryReason = undefined;
+      entry.summaryProgress = undefined;
+      entry.summaryAttemptedAt = undefined;
+      entry.summaryMessage = undefined;
+      entry.summaryRetryAt = undefined;
       entry.updatedAt = nowAfter(entry.updatedAt);
       entry.sizeBytes = Buffer.byteLength(markdown);
       entry.indexStatus = 'pending';
@@ -613,7 +618,18 @@ export class KnowledgeLibrary {
       throw new Error('知识库来源无效。');
     return this.exclusive(owner, async (base) => {
       const id = this.entryId(owner, input.source, input.sourceId);
-      if ((await this.deletedEntries(base)).some((item) => item.id === id)) return null;
+      const deleted = new Set((await this.deletedEntries(base)).map((item) => item.id));
+      if (deleted.has(id)) return null;
+      for (const expected of input.expectedSources ?? []) {
+        if (deleted.has(expected.id)) return null;
+        const source = await this.metadata(base, expected.id);
+        if (
+          !source ||
+          !(await this.refreshEntry(base, source)) ||
+          source.contentHash !== expected.contentHash
+        )
+          return null;
+      }
       let entry = await this.metadata(base, id);
       let current: KnowledgeEntryDetail | null = null;
       if (entry) {
@@ -703,6 +719,9 @@ export class KnowledgeLibrary {
         summaryMessage: entry?.contentHash === digest(body) ? entry?.summaryMessage : undefined,
         summaryAttempts: entry?.contentHash === digest(body) ? entry?.summaryAttempts : undefined,
         summaryRetryAt: entry?.contentHash === digest(body) ? entry?.summaryRetryAt : undefined,
+        summaryProgress: entry?.contentHash === digest(body) ? entry?.summaryProgress : undefined,
+        summaryAttemptedAt:
+          entry?.contentHash === digest(body) ? entry?.summaryAttemptedAt : undefined,
         summaryDisposition:
           entry?.contentHash === digest(body) ? entry?.summaryDisposition : undefined,
         summaryReason: entry?.contentHash === digest(body) ? entry?.summaryReason : undefined,
@@ -767,6 +786,10 @@ export class KnowledgeLibrary {
       entry.humanEdited = true;
       entry.summaryDisposition = undefined;
       entry.summaryReason = undefined;
+      entry.summaryProgress = undefined;
+      entry.summaryAttemptedAt = undefined;
+      entry.summaryMessage = undefined;
+      entry.summaryRetryAt = undefined;
       if (title !== undefined) entry.title = title.trim();
       entry.organization = grouping ?? { ...organization(entry), state: 'reviewed' };
       if (body !== current.markdown) entry.organization.summary = undefined;
@@ -968,6 +991,7 @@ export class KnowledgeLibrary {
     generation: KnowledgeGeneration
   ): Promise<boolean> {
     return this.exclusive(owner, async (base) => {
+      if ((await this.deletedEntries(base)).some((item) => item.id === id)) return false;
       const entry = await this.metadata(base, id);
       if (!entry || !(await this.refreshEntry(base, entry)) || entry.humanEdited) return false;
       entry.generation = generation;
@@ -1127,9 +1151,64 @@ export class KnowledgeLibrary {
       const entry = await this.metadata(base, id);
       if (!entry || !(await this.refreshEntry(base, entry)) || entry.contentHash !== hash) return;
       entry.summaryMessage = message;
+      if (entry.summaryProgress)
+        entry.summaryProgress = {
+          ...entry.summaryProgress,
+          phase: 'queued',
+          requestStartedAt: undefined,
+        };
       entry.summaryAttempts = (entry.summaryAttempts ?? 0) + 1;
       entry.summaryRetryAt = retryDate(entry.summaryAttempts, minimumRetryMs);
       await this.save(base, entry);
+    });
+  }
+
+  async markSummaryProgress(
+    owner: KnowledgeOwner,
+    id: string,
+    hash: string,
+    progress: KnowledgeSummaryProgress | undefined,
+    attemptedAt: string
+  ): Promise<boolean> {
+    return this.exclusive(owner, async (base) => {
+      if ((await this.deletedEntries(base)).some((item) => item.id === id)) return false;
+      const entry = await this.metadata(base, id);
+      if (!entry || !(await this.refreshEntry(base, entry)) || entry.contentHash !== hash)
+        return false;
+      entry.summaryProgress = progress;
+      entry.summaryAttemptedAt = attemptedAt;
+      entry.summaryMessage = undefined;
+      entry.summaryRetryAt = undefined;
+      await this.save(base, entry);
+      return true;
+    });
+  }
+
+  async recoverSummaryProgress(owner: KnowledgeOwner): Promise<void> {
+    await this.exclusive(owner, async (base) => {
+      for (const entry of (await this.state(base)).entries) {
+        let changed = false;
+        if (entry.summaryProgress && entry.summaryProgress.phase !== 'queued') {
+          entry.summaryProgress = {
+            ...entry.summaryProgress,
+            phase: 'queued',
+            requestStartedAt: undefined,
+          };
+          changed = true;
+        }
+        if (entry.generation?.state === 'running' && !entry.humanEdited) {
+          entry.generation = {
+            ...entry.generation,
+            state: 'queued',
+            message: '后台已恢复，将继续整理',
+            progress: entry.generation.progress
+              ? { ...entry.generation.progress, phase: 'queued', requestStartedAt: undefined }
+              : undefined,
+          };
+          changed = true;
+        }
+        if (changed) await this.save(base, entry);
+      }
     });
   }
 
@@ -1181,6 +1260,8 @@ export class KnowledgeLibrary {
       entry.summaryMessage = undefined;
       entry.summaryRetryAt = undefined;
       entry.summaryAttempts = undefined;
+      entry.summaryProgress = undefined;
+      entry.summaryAttemptedAt = undefined;
       await this.save(base, entry);
       return true;
     });

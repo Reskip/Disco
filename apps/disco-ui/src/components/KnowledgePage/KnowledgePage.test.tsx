@@ -204,6 +204,51 @@ describe('knowledge library management', () => {
     expect(knowledgeApi.downloadAttachment).not.toHaveBeenCalled();
   });
 
+  it('opens imported originals from the upload feedback and preserves existing selections', async () => {
+    vi.mocked(knowledgeApi.uploadDocument).mockResolvedValue({
+      ...DETAIL,
+      parsing: { status: 'parsed' },
+    });
+    const { container } = renderPage();
+    fireEvent.click(await screen.findByRole('checkbox', { name: '选择 产品讨论' }));
+    fireEvent.change(screen.getByRole('textbox', { name: '搜索知识库' }), {
+      target: { value: '产品' },
+    });
+    const chooser = container.querySelector('input[type="file"]');
+    if (!chooser) throw new Error('Expected file chooser');
+    fireEvent.change(chooser, { target: { files: [new File(['# 资料'], '资料.md')] } });
+    expect(await screen.findByText('已导入 1 份原件')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '查看原始资料' }));
+    await waitFor(() =>
+      expect(knowledgeApi.catalog).toHaveBeenLastCalledWith('', 'all', 0, expect.any(AbortSignal), {
+        level: 'source',
+        includeHistory: false,
+      })
+    );
+    expect(screen.getByRole('radio', { name: '原始资料 1' })).toBeChecked();
+    expect(screen.getByRole('textbox', { name: '搜索知识库' })).toHaveValue('');
+    expect(screen.getByRole('checkbox', { name: '选择 产品讨论' })).toBeChecked();
+    expect(screen.queryByText('已导入 1 份原件')).not.toBeInTheDocument();
+  });
+
+  it('dismisses a parsing notice without removing the uploaded original', async () => {
+    vi.mocked(knowledgeApi.uploadDocument).mockResolvedValue({
+      ...DETAIL,
+      parsing: { status: 'unsupported' },
+    });
+    const { container } = renderPage();
+    const chooser = container.querySelector('input[type="file"]');
+    if (!chooser) throw new Error('Expected file chooser');
+    fireEvent.change(chooser, { target: { files: [new File(['binary'], '资料.custom')] } });
+    const notice = await screen.findByText('原件已保留，请留意正文解析状态');
+    const alert = notice.closest('.ant-alert');
+    if (!alert) throw new Error('Expected upload notice');
+    fireEvent.click(within(alert as HTMLElement).getByRole('button', { name: '关闭导入提示' }));
+    expect(screen.queryByText('原件已保留，请留意正文解析状态')).not.toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: '产品讨论' })).toBeInTheDocument();
+    expect(knowledgeApi.remove).not.toHaveBeenCalled();
+  });
+
   it('keeps an edited draft on conflict and sends the version that was opened', async () => {
     vi.mocked(knowledgeApi.save).mockRejectedValue(new Error('这份资料已有新修改'));
     renderPage();
@@ -553,6 +598,72 @@ describe('knowledge library management', () => {
     fireEvent.click(screen.getByRole('button', { name: '产品讨论' }));
     expect(await screen.findByText(overview.markdown)).toBeInTheDocument();
     expect(within(screen.getByRole('dialog')).getByText('资料概览')).toBeInTheDocument();
+  });
+
+  it('updates an active source summary phase and stops polling once source processing completes', async () => {
+    vi.mocked(knowledgeApi.detail)
+      .mockResolvedValueOnce({
+        ...DETAIL,
+        entry: {
+          ...DETAIL.entry,
+          summaryProgress: {
+            phase: 'waiting_model',
+            stage: 'map',
+            completed: 0,
+            total: 2,
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        ...DETAIL,
+        entry: {
+          ...DETAIL.entry,
+          summaryProgress: {
+            phase: 'waiting_model',
+            stage: 'map',
+            completed: 1,
+            total: 2,
+          },
+        },
+      })
+      .mockResolvedValueOnce(DETAIL);
+    renderPage('entry-a');
+    expect(await screen.findByText('等待模型响应 · 共 2 段')).toBeInTheDocument();
+    fireEvent(document, new Event('visibilitychange'));
+    expect(await screen.findByText('已完成 1/2 段 · 等待模型响应')).toBeInTheDocument();
+    fireEvent(document, new Event('visibilitychange'));
+    await waitFor(() => expect(screen.queryByText('知识整理进度')).not.toBeInTheDocument());
+    fireEvent(document, new Event('visibilitychange'));
+    expect(knowledgeApi.detail).toHaveBeenCalledTimes(3);
+  });
+
+  it('keeps the current long-source segment while its background summary progress updates', async () => {
+    vi.mocked(knowledgeApi.detail).mockImplementation(async (_id, _signal, page) => ({
+      ...DETAIL,
+      entry: {
+        ...DETAIL.entry,
+        summaryProgress: { phase: 'waiting_model', stage: 'map', completed: 0, total: 1 },
+      },
+      markdown: page?.offset ? '第二段继续阅读' : '第一段原文',
+      page: {
+        offset: page?.offset ?? 0,
+        totalChars: 40_008,
+        nextOffset: page?.offset ? null : 40_000,
+        hasMore: !page?.offset,
+      },
+    }));
+    renderPage('entry-a');
+    fireEvent.click(await screen.findByRole('button', { name: '下一段' }));
+    expect(await screen.findByText('第二段继续阅读')).toBeInTheDocument();
+    fireEvent(document, new Event('visibilitychange'));
+    await waitFor(() =>
+      expect(knowledgeApi.detail).toHaveBeenLastCalledWith('entry-a', expect.any(AbortSignal), {
+        offset: 40_000,
+        limit: 40_000,
+      })
+    );
+    expect(screen.getByText('第二段继续阅读')).toBeInTheDocument();
+    expect(screen.queryByText('第一段原文')).not.toBeInTheDocument();
   });
 
   it('never replaces a human draft with a late automatic-generation response', async () => {

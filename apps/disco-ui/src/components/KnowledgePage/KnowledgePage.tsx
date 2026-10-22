@@ -226,10 +226,13 @@ export function KnowledgePage({
 
   const generatingId =
     !editing &&
-    detail?.entry.generation &&
-    ['queued', 'running', 'failed'].includes(detail.entry.generation.state)
+    detail &&
+    (detail.entry.summaryProgress ||
+      (detail.entry.generation &&
+        ['queued', 'running', 'failed'].includes(detail.entry.generation.state)))
       ? detail.entry.id
       : null;
+  const generatingPageOffset = detail?.page?.offset ?? 0;
   useEffect(() => {
     if (!generatingId) return;
     const controller = new AbortController();
@@ -239,7 +242,7 @@ export function KnowledgePage({
       pending = true;
       try {
         const value = await knowledgeApi.detail(generatingId, controller.signal, {
-          offset: 0,
+          offset: generatingPageOffset,
           limit: 40_000,
         });
         if (controller.signal.aborted || editingRef.current) return;
@@ -260,7 +263,7 @@ export function KnowledgePage({
       window.clearInterval(interval);
       document.removeEventListener('visibilitychange', refresh);
     };
-  }, [generatingId]);
+  }, [generatingId, generatingPageOffset]);
 
   const closeDetail = useCallback(() => {
     if (saving) return;
@@ -535,7 +538,7 @@ export function KnowledgePage({
   const selectedVisibleCount = visibleEntries.filter((entry) => selection.has(entry.id)).length;
   const filterStyle = {
     minWidth: 130,
-    flex: mobile ? '1 1 140px' : undefined,
+    flex: mobile ? '1 1 130px' : undefined,
     fontSize: mobile ? 16 : undefined,
   };
 
@@ -592,7 +595,13 @@ export function KnowledgePage({
           <Typography.Paragraph type="secondary" style={{ margin: 0 }}>
             原始资料保留出处，摘要提取要点，专题知识沉淀结论。人工修改的笔记始终由你维护。
           </Typography.Paragraph>
-          <KnowledgeImportActions onChanged={() => setRevision((value) => value + 1)} />
+          <KnowledgeImportActions
+            onChanged={() => setRevision((value) => value + 1)}
+            onViewSources={() => {
+              clearFilters();
+              changeView('sources');
+            }}
+          />
           {status && <KnowledgeProgress status={status} mobile={mobile} />}
           <Segmented
             block={mobile}

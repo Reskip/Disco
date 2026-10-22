@@ -72,7 +72,7 @@ that begin midway through a document, preserving source IDs and links. Prompts
 extract conclusions, decisions, reusable methods and unresolved conflicts instead
 of rewriting the transcript in chronological order. Input is never truncated,
 and original library files are never written by the helper.
-Prompt version v7 permits an explicit `archiveOnly` decision for greeting-only,
+Prompt version v8 permits an explicit `archiveOnly` decision for greeting-only,
 connection-test or no-action records without reusable information. Short but
 substantive preferences or decisions remain eligible. Automatic organization
 records the disposition without producing a knowledge note; explicit synthesis
@@ -102,9 +102,31 @@ only bounded structural diagnostics, never response bodies or credentials.
 The provider supplies minimum retry delays appropriate to those categories.
 
 Intermediate results are resumable under the protected operator configuration
-directory's `summary-work/<owner-account-hash>/<entry-id>/`, keyed by content,
-instructions, model and prompt version. A ten-minute job timeout therefore does
-not repeat already completed cloud calls on retry. Explicit entry deletion
+directory's `summary-work/<owner-account-hash>/<entry-id>/`, keyed by complete
+piece content, source context, instructions, semantic model configuration and
+prompt version/text. Each typed source has independent chunk boundaries; neither
+the position nor total chunk count enters a map request or key. Appending content
+reuses unchanged full chunks, and inserting another source does not shift existing
+source chunks. Reduction keys preserve the ordered child summaries.
+
+The helper performs at most two new model calls per batch. A 90-second soft
+budget prevents starting another call after the current call completes. Cache
+hits do not consume that budget, and unfinished work returns normal
+`pending: true` with progress instead of a failure. There is no whole-document
+deadline or original-data truncation. The caller resumes the job through its
+fair queue without increasing failure attempts. A single cloud request has a
+180-second absolute parent deadline; repeated SSE/telemetry activity cannot
+extend it. HTTP connect/pool, write and read-inactivity timeouts are 15, 30 and
+120 seconds, respectively. A separate 300-second helper deadline covers startup
+or local processing stalls. These real timeouts remain failures with a clear
+message and retain all previously completed cache entries.
+
+Whitelisted progress records use stderr NDJSON; stdout retains the final
+summary or pending result. States distinguish `waiting_model`, `processing`
+and `queued`, with map/reduce counters and a reduction level. Arbitrary provider
+stderr, model text and credentials never enter progress/status data. The
+`onProgress` observer is a local callback and is not serialized to the helper.
+Explicit entry deletion
 cancels only that entry's helper, writes a deletion marker to prevent late cache
 resurrection, and removes its derived cache. Cache filesystem failure is logged
 without undoing a successful original/vector deletion. No new automatic expiry
@@ -187,8 +209,9 @@ local embedding connection and user-isolated round-trip checks pass.
 `OpenVikingOptions.summary` uses absolute paths: `pythonExecutable`, `scriptPath`,
 `configPath`, and optional `codexAuthFile` / `authStorePath`. Production script paths
 belong under the deployed source directory; runtime credentials remain outside
-it. The helper reads archives only from stdin and returns only validated summary
-JSON. Provider exceptions and stderr are not exposed to users. OpenViking 0.5.1.1's
+it. The helper reads archives only from stdin and returns validated summary or
+pending-result JSON. Only whitelisted progress counters are consumed from stderr;
+provider exceptions and raw stderr are not exposed to users. OpenViking 0.5.1.1's
 Codex client cleanup lacks `close()` on its shim; that specific cleanup exception
 is suppressed in this isolated helper so it does not discard valid output.
 

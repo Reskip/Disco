@@ -170,6 +170,85 @@ describe('portable knowledge library', () => {
     expect(edited.entry.indexRetryAt).toBeUndefined();
   });
 
+  it('persists resumable progress without editing the source and rejects stale or deleted progress', async () => {
+    const record = (await library.upsertSource(owner, source))!;
+    const progress = {
+      phase: 'waiting_model' as const,
+      stage: 'map' as const,
+      completed: 2,
+      total: 5,
+      requestStartedAt: new Date().toISOString(),
+    };
+    await library.markSummaryFailed(owner, record.entry.id, record.contentHash, '旧失败');
+    expect(
+      await library.markSummaryProgress(
+        owner,
+        record.entry.id,
+        record.contentHash,
+        progress,
+        new Date().toISOString()
+      )
+    ).toBe(true);
+    const running = (await library.get(owner, record.entry.id))!;
+    expect(running.markdown).toBe(record.markdown);
+    expect(running.entry.updatedAt).toBe(record.entry.updatedAt);
+    expect(running.entry.summaryMessage).toBeUndefined();
+    await library.recoverSummaryProgress(owner);
+    expect((await library.get(owner, record.entry.id))?.entry.summaryProgress).toMatchObject({
+      phase: 'queued',
+      completed: 2,
+      total: 5,
+    });
+    await library.edit(owner, record.entry.id, '# 人工新的内容');
+    expect(
+      await library.markSummaryProgress(
+        owner,
+        record.entry.id,
+        record.contentHash,
+        progress,
+        new Date().toISOString()
+      )
+    ).toBe(false);
+    expect((await library.get(owner, record.entry.id))?.entry.summaryProgress).toBeUndefined();
+    await library.remove(owner, record.entry.id);
+    expect(
+      await library.markSummaryProgress(
+        owner,
+        record.entry.id,
+        record.contentHash,
+        progress,
+        new Date().toISOString()
+      )
+    ).toBe(false);
+    expect(
+      await library.markGeneration(owner, record.entry.id, { state: 'running', progress })
+    ).toBe(false);
+  });
+
+  it('atomically rejects a synthesized note after its source changes or disappears', async () => {
+    const record = (await library.upsertSource(owner, source))!;
+    const summary = {
+      source: 'manual' as const,
+      sourceId: 'guarded-summary',
+      kind: 'note' as const,
+      title: '受版本保护的摘要',
+      markdown: '旧来源的结论',
+      automated: true,
+      expectedSources: [{ id: record.entry.id, contentHash: record.contentHash }],
+    };
+    await library.edit(owner, record.entry.id, '更新后的来源');
+    expect(await library.upsertSource(owner, summary)).toBeNull();
+    expect((await library.list(owner, { kind: 'note' })).total).toBe(0);
+    const current = (await library.get(owner, record.entry.id))!;
+    summary.expectedSources[0].contentHash = current.contentHash;
+    expect(await library.upsertSource(owner, summary)).not.toBeNull();
+    await library.remove(owner, record.entry.id);
+    expect(
+      await library.upsertSource(owner, { ...summary, markdown: '删除来源后不应提交' })
+    ).toBeNull();
+    expect((await library.list(owner, { kind: 'note' })).total).toBe(1);
+  });
+
   it('preserves full raw records and readable Markdown with deterministic, per-owner IDs', async () => {
     const rawContent = `${JSON.stringify({ content: '原文'.repeat(600_000) })}\n`;
     const first = (await library.upsertSource(owner, { ...source, rawContent }))!;

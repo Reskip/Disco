@@ -227,7 +227,7 @@ def prepare_summary_sources(sources):
     keep their entire Markdown as narrative rather than silently losing content.
     """
     if not isinstance(sources, list) or not sources: raise ValueError("Invalid summary sources")
-    prepared, reports, all_structured = [], [], True
+    prepared, segments, reports, all_structured = [], [], [], True
     for source in sources:
         if not isinstance(source, dict) or not isinstance(source.get('id'), str) or not SOURCE_ID.fullmatch(source['id']) or not isinstance(source.get('title'), str) or not isinstance(source.get('markdown'), str) or source.get('kind') not in {'document', 'conversation', 'note'}:
             raise ValueError("Invalid summary source")
@@ -252,8 +252,12 @@ def prepare_summary_sources(sources):
         else:
             content, all_structured = raw, False
         prepared.append(source_section(source, content))
+        # Keep source boundaries independent of earlier sources and their sizes.
+        segments.append({'content': prepared[-1], 'source_context': [
+            {'id': source['id'], 'title': source['title'], 'url': '/knowledge?entry=' + source['id']}
+        ]})
     content = '\n\n---\n\n'.join(prepared)
-    result = {'content': content}
+    result = {'content': content, 'segments': segments}
     if all_structured:
         topic = reports[0]['topic'] if len({r['topic'] for r in reports}) == 1 else '其他'
         title = re.sub(r'\.(?:json|csv|tsv|html?)$', '', sources[0]['title'], flags=re.I) if len(sources)==1 else '多份资料'

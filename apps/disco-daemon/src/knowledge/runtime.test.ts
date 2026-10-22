@@ -22,6 +22,7 @@ import {
   type User,
 } from '@disco/core/types';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { OpenVikingError } from './openviking';
 import { approvedTranscriptCwd, KnowledgeRuntime } from './runtime';
 
 // SQLite has no write gate. Preserve the real repositories and emulate only
@@ -406,6 +407,140 @@ describe('knowledge background synchronization', () => {
     expect((await runtime.library.list(owner, { kind: 'note' })).total).toBe(0);
     await runtime.runSummaryOnce();
     expect(summarizeContent).toHaveBeenCalledTimes(1);
+  });
+
+  it('resumes partial summaries without failures and gives untouched sources their turn', async () => {
+    for (const title of ['甲资料', '乙资料']) {
+      const session = await createSession(primary, title);
+      await append(session, 0, `${title}的长期保留规则。`);
+    }
+    await runtime.runOnce(false);
+    for (const entry of (await runtime.library.list(owner)).entries)
+      await runtime.library.markIndexed(owner, entry.id);
+    const summarizeContent = vi.fn(async (_owner, input) => {
+      input.onProgress({ phase: 'waiting_model', stage: 'map', completed: 0, total: 4 });
+      expect((await runtime.status(owner)).processing?.summary.progress).toMatchObject({
+        phase: 'waiting_model',
+        completed: 0,
+        total: 4,
+      });
+      return { pending: true, progress: { phase: 'queued', stage: 'map', completed: 2, total: 4 } };
+    });
+    Object.defineProperty(runtime, 'engine', { value: { summarizeContent } });
+    await runtime.runSummaryOnce();
+    const firstId = summarizeContent.mock.calls[0][1].id;
+    const first = (await runtime.library.get(owner, firstId))!;
+    expect(first.entry.summaryProgress).toMatchObject({ phase: 'queued', completed: 2, total: 4 });
+    expect(first.entry.summaryAttempts).toBeUndefined();
+    expect(first.entry.summaryMessage).toBeUndefined();
+    expect(first.entry.summaryContentHash).toBeUndefined();
+    expect((await runtime.status(owner)).processing?.summary).toMatchObject({
+      pending: 2,
+      failed: 0,
+    });
+    expect((await runtime.status(owner)).processing?.summary.progress).toBeUndefined();
+    (runtime as unknown as { lastSummaryAt: number }).lastSummaryAt = 0;
+    await runtime.runSummaryOnce();
+    expect(summarizeContent.mock.calls[1][1].id).not.toBe(firstId);
+  });
+
+  it('persists explicit partial work as queued and fairly rotates requested drafts', async () => {
+    await runtime.runOnce(false);
+    const source = (await runtime.library.upsertSource(owner, {
+      source: 'manual',
+      sourceId: 'partial-source',
+      kind: 'note',
+      title: '来源',
+      markdown: '完整来源',
+    }))!;
+    const summarizeContent = vi.fn().mockResolvedValue({
+      pending: true,
+      progress: { phase: 'queued', stage: 'reduce', completed: 1, total: 3, stageLevel: 1 },
+    });
+    Object.defineProperty(runtime, 'engine', { value: { summarizeContent } });
+    const drafts = await Promise.all(
+      ['专题甲', '专题乙'].map((title) =>
+        runtime.organize(owner, { entryIds: [source.entry.id], mode: 'automatic', title })
+      )
+    );
+    await runtime.runSummaryOnce();
+    const firstId = summarizeContent.mock.calls[0][1].id;
+    const first = (await runtime.library.get(owner, firstId))!;
+    expect(first.entry.generation).toMatchObject({
+      state: 'queued',
+      progress: { stage: 'reduce', completed: 1, total: 3 },
+    });
+    expect(first.entry.generation?.attempts).toBeUndefined();
+    expect(first.entry.generation?.retryAt).toBeUndefined();
+    (runtime as unknown as { lastSummaryAt: number }).lastSummaryAt = 0;
+    await runtime.runSummaryOnce();
+    expect(summarizeContent.mock.calls[1][1].id).toBe(
+      drafts.find((item) => item.entry.id !== firstId)!.entry.id
+    );
+  });
+
+  it('stops background synthesis without marking a graceful pause as a failure', async () => {
+    const session = await createSession(primary, '可恢复任务');
+    await append(session, 0, '保存资料，后台逐步整理。');
+    await runtime.runOnce(false);
+    const source = (await runtime.library.list(owner)).entries[0];
+    await runtime.library.markIndexed(owner, source.id);
+    let cancel!: () => void;
+    let began!: () => void;
+    const started = new Promise<void>((resolve) => {
+      began = resolve;
+    });
+    const engine = {
+      summarizeContent: vi.fn(async (_owner, input) => {
+        input.onProgress({ phase: 'waiting_model', stage: 'map', completed: 2, total: 5 });
+        return new Promise((_, reject) => {
+          cancel = () => reject(new OpenVikingError('暂停', 'CANCELLED'));
+          began();
+        });
+      }),
+      cancelPending: vi.fn(async () => cancel?.()),
+    };
+    Object.defineProperty(runtime, 'engine', { value: engine });
+    const work = runtime.runSummaryOnce();
+    await started;
+    await runtime.stop();
+    await work;
+    const result = (await runtime.library.get(owner, source.id))!;
+    expect(result.entry.summaryProgress).toMatchObject({ phase: 'queued', completed: 2 });
+    expect(result.entry.summaryAttempts).toBeUndefined();
+    expect(result.entry.summaryMessage).toBeUndefined();
+  });
+
+  it('clears the active label when initial progress persistence fails', async () => {
+    const session = await createSession(primary, '进度写入失败');
+    await append(session, 0, '仍需重试，不能留下永远运行的标记。');
+    await runtime.runOnce(false);
+    const source = (await runtime.library.list(owner)).entries[0];
+    await runtime.library.markIndexed(owner, source.id);
+    const engine = { summarizeContent: vi.fn() };
+    Object.defineProperty(runtime, 'engine', { value: engine });
+    vi.spyOn(runtime.library, 'markSummaryProgress').mockRejectedValueOnce(
+      new Error('synthetic write error')
+    );
+    await runtime.runSummaryOnce();
+    expect(engine.summarizeContent).not.toHaveBeenCalled();
+    expect((await runtime.status(owner)).processing?.summary.active).toBeUndefined();
+  });
+
+  it('does not start a model after shutdown during source preparation', async () => {
+    const session = await createSession(primary, '准备期间停止');
+    await append(session, 0, '应停止发出新的请求。');
+    await runtime.runOnce(false);
+    const source = (await runtime.library.list(owner)).entries[0];
+    await runtime.library.markIndexed(owner, source.id);
+    const engine = { summarizeContent: vi.fn(), cancelPending: vi.fn() };
+    Object.defineProperty(runtime, 'engine', { value: engine });
+    vi.spyOn(runtime.library, 'markSummaryProgress').mockImplementationOnce(async () => {
+      await runtime.stop();
+      return true;
+    });
+    await runtime.runSummaryOnce();
+    expect(engine.summarizeContent).not.toHaveBeenCalled();
   });
 
   it('keeps manual takeover when a queued automatic draft finishes late', async () => {

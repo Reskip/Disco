@@ -3,6 +3,7 @@ import type {
   KnowledgeGeneration,
   KnowledgeMaterialType,
   KnowledgeOrganization,
+  KnowledgeSummaryProgress,
 } from '@disco/core/types';
 
 export const MATERIAL_LABELS: Record<KnowledgeMaterialType, string> = {
@@ -64,6 +65,35 @@ export function errorMessage(cause: unknown): string {
 export function formatDate(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN');
+}
+
+export function formatSummaryProgress(progress?: KnowledgeSummaryProgress): string | undefined {
+  if (!progress) return undefined;
+  const total = Math.max(0, Math.floor(progress.total));
+  const completed = Math.min(total, Math.max(0, Math.floor(progress.completed)));
+  const reduced = progress.stage === 'reduce';
+  const completedText =
+    completed > 0 ? `已完成 ${completed}/${total} ${reduced ? '组归并' : '段'}` : '';
+  const activity =
+    progress.phase === 'queued'
+      ? '等待后台处理'
+      : progress.phase === 'waiting_model'
+        ? '等待模型响应'
+        : completed === total && total > 0
+          ? '正在保存整理结果'
+          : completed > 0
+            ? '正在处理后续内容'
+            : reduced
+              ? '正在汇总分段结果'
+              : '正在准备资料';
+  return [
+    reduced ? '归并整理阶段' : '',
+    completedText,
+    activity,
+    !reduced && completed === 0 && total > 1 ? `共 ${total} 段` : '',
+  ]
+    .filter(Boolean)
+    .join(' · ');
 }
 
 export function safeSourceUrl(value: string | undefined): string | undefined {

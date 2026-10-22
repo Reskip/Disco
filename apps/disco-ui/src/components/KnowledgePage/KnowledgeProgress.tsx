@@ -1,6 +1,6 @@
 import type { KnowledgeLibraryStatus } from '@disco/core/types';
 import { Alert, Card, Collapse, Flex, Progress, Space, Typography, theme } from 'antd';
-import { formatDate } from './knowledgePresentation';
+import { formatDate, formatSummaryProgress } from './knowledgePresentation';
 
 function completionPercent(completed: number, total: number): number {
   if (!total) return 0;
@@ -75,9 +75,11 @@ export function KnowledgeProgress({
             {summary?.archivedOnly ? ` · ${summary.archivedOnly} 份仅归档` : ''}
             {summary?.failed ? ` · ${summary.failed} 份失败，后台重试` : ''}
           </Typography.Text>
-          <Typography.Text type="secondary">
-            {summary?.message ||
-              (summary?.active ? `正在整理：${summary.active}` : '自动生成草稿，确认后由你维护')}
+          <Typography.Text type="secondary" style={{ overflowWrap: 'anywhere' }}>
+            {summary?.progress
+              ? `${summary.active ? `${summary.active} · ` : ''}${formatSummaryProgress(summary.progress)}`
+              : summary?.message ||
+                (summary?.active ? `正在整理：${summary.active}` : '自动生成草稿，确认后由你维护')}
           </Typography.Text>
         </Space>
       </Flex>

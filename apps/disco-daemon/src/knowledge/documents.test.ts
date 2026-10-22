@@ -150,6 +150,88 @@ describe('knowledge document extraction', () => {
     ).toBe('original bytes');
   });
 
+  it('uses the secure map parser even for text MIME and binds its projection to saved Markdown', async () => {
+    const bytes = Buffer.from('<gpx><trkpt lat="12.345678" lon="98.765432"/></gpx>');
+    const record = await document('route.gpx', bytes);
+    await library.putAttachment(owner, record.entry.id, {
+      name: 'route.gpx',
+      bytes,
+      mimeType: 'text/xml',
+    });
+    const body = '## 地图与轨迹资料概览\n\n紫砂风铃路线，轨迹点：1。坐标保留在原件。';
+    const metadata = {
+      version: 1,
+      format: 'gpx',
+      counts: { gpx: 1, trkpt: 1 },
+      sha256: createHash('sha256').update(body).digest('hex'),
+    };
+    const output =
+      `<!-- disco-geospatial-projection:${JSON.stringify(metadata)} -->\n${body}\n`.replace(
+        /\n/g,
+        '\r\n'
+      );
+    const fixture = join(root, 'map-parser.cjs');
+    await writeFile(
+      fixture,
+      `process.stdin.resume();process.stdin.on('end',()=>{if(process.argv[2]!=='gpx')process.exit(2);process.stdout.write(${JSON.stringify(output)});});`
+    );
+    const parsed = await extractKnowledgeDocument(library, owner, record.entry.id, {
+      pythonExecutable: process.execPath,
+      scriptPath: fixture,
+    });
+    expect(parsed.parsed).toBe(true);
+    expect(parsed.detail?.markdown).toContain('紫砂风铃');
+    expect(parsed.detail?.markdown).not.toContain('12.345678');
+    expect(parsed.detail?.entry.parseProjection).toEqual({
+      kind: 'geospatial',
+      version: 1,
+      contentHash: parsed.detail?.contentHash,
+    });
+    expect(
+      Buffer.from(
+        (await library.getAttachment(owner, record.entry.id, record.attachment.id!))!.bytes
+      )
+    ).toEqual(bytes);
+    await library.edit(owner, record.entry.id, '# 人工修改的说明');
+    const protectedResult = await extractKnowledgeDocument(library, owner, record.entry.id, {
+      pythonExecutable: process.execPath,
+      scriptPath: fixture,
+    });
+    expect(protectedResult.status).toBe('protected');
+    expect(protectedResult.detail?.markdown).toBe('# 人工修改的说明');
+    expect(protectedResult.detail?.entry.parseProjection).toBeUndefined();
+  });
+
+  it('records deterministic XML failures without automatic retry and rejects unmarked map output', async () => {
+    const record = await document('broken.kml', Buffer.from('<kml><broken>'));
+    const fixture = join(root, 'failed-map-parser.cjs');
+    await writeFile(
+      fixture,
+      `process.stdin.resume();process.stdin.on('end',()=>{process.stderr.write('GEOSPATIAL_XML_MALFORMED: 地图 XML 结构不完整或已损坏；原件已完整保留。');process.exitCode=2;});`
+    );
+    const failed = await extractKnowledgeDocument(library, owner, record.entry.id, {
+      pythonExecutable: process.execPath,
+      scriptPath: fixture,
+    });
+    expect(failed.status).toBe('error');
+    expect(failed.detail?.entry.parseRetryable).toBe(false);
+    expect(failed.message).not.toContain('GEOSPATIAL_');
+    expect(
+      (await library.getAttachment(owner, record.entry.id, record.attachment.id!))?.bytes
+    ).toBeDefined();
+    await writeFile(
+      fixture,
+      `process.stdin.resume();process.stdin.on('end',()=>process.stdout.write('<kml>raw coordinates must not become a parsed projection</kml>'));`
+    );
+    const invalid = await extractKnowledgeDocument(library, owner, record.entry.id, {
+      pythonExecutable: process.execPath,
+      scriptPath: fixture,
+    });
+    expect(invalid.status).toBe('error');
+    expect(invalid.detail?.entry.parseProjection).toBeUndefined();
+    expect(invalid.detail?.markdown).not.toContain('raw coordinates');
+  });
+
   it('extracts the latest attachment while retaining old originals, and records protected unsupported results correctly', async () => {
     const record = await document('latest.txt', Buffer.from('old text'));
     await extractKnowledgeDocument(library, owner, record.entry.id);
@@ -173,3 +255,5 @@ describe('knowledge document extraction', () => {
     expect(protectedResult.detail?.markdown).toBe('# 人工正文');
   });
 });
+
+import { createHash } from 'node:crypto';

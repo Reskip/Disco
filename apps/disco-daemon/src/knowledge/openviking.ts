@@ -2,7 +2,12 @@ import { spawn } from 'node:child_process';
 import { createHash, createHmac } from 'node:crypto';
 import { lstat, mkdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import type { KnowledgeKind, KnowledgeOwner, KnowledgeSummaryProgress } from '@disco/core/types';
+import type {
+  KnowledgeEntry,
+  KnowledgeKind,
+  KnowledgeOwner,
+  KnowledgeSummaryProgress,
+} from '@disco/core/types';
 
 /** Provision one OpenViking account per authenticated Disco owner. */
 export function openVikingAccountId(owner: KnowledgeOwner): string {
@@ -73,6 +78,7 @@ export interface KnowledgeSummarySource {
   kind: KnowledgeKind;
   format?: string;
   markdown: string;
+  projection?: KnowledgeEntry['parseProjection'];
 }
 
 const providerMessages: Record<string, string> = {
@@ -1113,12 +1119,21 @@ export class OpenVikingClient {
         JSON.stringify({
           content: document.content,
           instructions: document.instructions,
-          sources: document.sources?.map(({ id, title, kind, format, markdown }) => ({
+          sources: document.sources?.map(({ id, title, kind, format, markdown, projection }) => ({
             id,
             title,
             kind,
             format,
             markdown,
+            ...(projection
+              ? {
+                  projection: {
+                    kind: projection.kind,
+                    version: projection.version,
+                    contentHash: projection.contentHash,
+                  },
+                }
+              : {}),
           })),
           forceSynthesis: document.forceSynthesis === true,
           scope: openVikingAccountId(owner),

@@ -1,0 +1,2 @@
+# GPX/KML must reject DTD, entities and external references; no stdlib fallback.
+defusedxml==0.7.1

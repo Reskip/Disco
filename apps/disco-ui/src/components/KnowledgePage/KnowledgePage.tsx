@@ -309,12 +309,18 @@ export function KnowledgePage({
     const refresh = async () => {
       if (pending || editingRef.current || document.visibilityState === 'hidden') return;
       pending = true;
+      const requestId = detailRequestRef.current;
       try {
         const value = await knowledgeApi.detail(generatingId, controller.signal, {
           offset: generatingPageOffset,
           limit: 40_000,
         });
-        if (controller.signal.aborted || editingRef.current) return;
+        if (
+          controller.signal.aborted ||
+          editingRef.current ||
+          requestId !== detailRequestRef.current
+        )
+          return;
         const previous = detailRef.current;
         if (previous?.entry.id !== generatingId) return;
         if (previous.contentHash !== value.contentHash) {

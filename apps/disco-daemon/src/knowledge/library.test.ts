@@ -1181,6 +1181,88 @@ describe('portable knowledge library', () => {
     ).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it('rejects stale extraction results and resets deterministic failures when originals change', async () => {
+    const input = {
+      ...source,
+      kind: 'document' as const,
+      sourceId: 'map-guard',
+      title: 'route.gpx',
+    };
+    const detail = (await library.upsertSource(owner, input))!;
+    const first = (await library.putAttachment(owner, detail.entry.id, {
+      name: 'route.gpx',
+      bytes: Buffer.from('v1'),
+    }))!;
+    const projection = {
+      kind: 'geospatial' as const,
+      version: 1 as const,
+      contentHash: detail.contentHash,
+    };
+    expect(
+      await library.markParsed(owner, detail.entry.id, 'parsed', undefined, {
+        expectedAttachmentId: first.id,
+        expectedContentHash: detail.contentHash,
+        projection,
+      })
+    ).toBe(true);
+    expect((await library.get(owner, detail.entry.id))?.entry.parseProjection).toEqual(projection);
+    const second = (await library.putAttachment(owner, detail.entry.id, {
+      name: 'route.gpx',
+      bytes: Buffer.from('v2'),
+    }))!;
+    expect(
+      await library.upsertSource(owner, {
+        ...input,
+        markdown: 'stale extraction',
+        expectedAttachmentId: first.id,
+      })
+    ).toBeNull();
+    expect(
+      await library.markParsed(owner, detail.entry.id, 'parsed', undefined, {
+        expectedAttachmentId: first.id,
+        expectedContentHash: detail.contentHash,
+        projection,
+      })
+    ).toBe(false);
+    expect((await library.get(owner, detail.entry.id))?.entry).toMatchObject({
+      parseStatus: 'pending',
+    });
+    expect((await library.get(owner, detail.entry.id))?.entry.parseProjection).toBeUndefined();
+    await library.markParsed(owner, detail.entry.id, 'error', 'XML 损坏', {
+      expectedAttachmentId: second.id,
+      retryable: false,
+    });
+    const failed = (await library.get(owner, detail.entry.id))!;
+    expect(failed.entry.parseRetryable).toBe(false);
+    expect(failed.entry.parseRetryAt).toBeUndefined();
+    // Selecting an already stored older original is still a change of parsing input.
+    await library.putAttachment(owner, detail.entry.id, {
+      name: 'route.gpx',
+      bytes: Buffer.from('v1'),
+    });
+    expect((await library.get(owner, detail.entry.id))?.entry.parseRetryable).toBeUndefined();
+    await library.edit(owner, detail.entry.id, '# 人工修改');
+    expect(
+      await library.markParsed(owner, detail.entry.id, 'parsed', undefined, {
+        expectedAttachmentId: first.id,
+        expectedContentHash: detail.contentHash,
+        projection,
+      })
+    ).toBe(false);
+    const manual = (await library.get(owner, detail.entry.id))!;
+    await library.markParsed(owner, detail.entry.id, 'parsed', undefined, {
+      expectedAttachmentId: first.id,
+      expectedContentHash: manual.contentHash,
+      projection: { ...projection, contentHash: manual.contentHash },
+    });
+    expect((await library.get(owner, detail.entry.id))?.entry.parseProjection).toBeUndefined();
+    expect((await library.get(owner, detail.entry.id))?.markdown).toBe('# 人工修改');
+    await library.remove(owner, detail.entry.id);
+    expect(
+      await library.upsertSource(owner, { ...input, expectedAttachmentId: first.id })
+    ).toBeNull();
+  });
+
   it('persists parsing progress across restarts and source refreshes without changing human edits', async () => {
     const input = { ...source, kind: 'document' as const };
     const record = (await library.upsertSource(owner, input))!;

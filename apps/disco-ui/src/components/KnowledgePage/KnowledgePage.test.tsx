@@ -1252,6 +1252,47 @@ describe('knowledge library management', () => {
     });
   });
 
+  it('ignores a delayed background poll when pagination completes in the same update batch', async () => {
+    const firstPage: KnowledgeEntryDetail = {
+      ...DETAIL,
+      entry: { ...DETAIL.entry, generation: { state: 'running' } },
+      markdown: '第一段正文',
+      page: { offset: 0, totalChars: 80_000, nextOffset: 40_000, hasMore: true },
+    };
+    let resolvePoll!: (value: KnowledgeEntryDetail) => void;
+    let resolveNext!: (value: KnowledgeEntryDetail) => void;
+    const delayedPoll = new Promise<KnowledgeEntryDetail>((resolve) => {
+      resolvePoll = resolve;
+    });
+    const delayedNext = new Promise<KnowledgeEntryDetail>((resolve) => {
+      resolveNext = resolve;
+    });
+    vi.mocked(knowledgeApi.detail)
+      .mockResolvedValueOnce(firstPage)
+      .mockImplementationOnce(() => delayedPoll)
+      .mockImplementationOnce(() => delayedNext);
+    renderPage('entry-a');
+    await screen.findByText('第一段正文');
+    fireEvent(document, new Event('visibilitychange'));
+    expect(knowledgeApi.detail).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole('button', { name: '下一段' }));
+    expect(knowledgeApi.detail).toHaveBeenCalledTimes(3);
+    await act(async () => {
+      resolveNext({
+        ...firstPage,
+        markdown: '第二段正文',
+        page: { offset: 40_000, totalChars: 80_000, nextOffset: null, hasMore: false },
+      });
+      await Promise.resolve();
+      resolvePoll({ ...firstPage, markdown: '旧页后台结果' });
+      await Promise.resolve();
+    });
+    expect(screen.getByText('第二段正文')).toBeInTheDocument();
+    expect(screen.queryByText('旧页后台结果')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '下一段' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '上一段' })).toBeEnabled();
+  });
+
   it.each([409, 503])(
     'handles search location status %s without hiding non-conflict errors',
     async (status) => {

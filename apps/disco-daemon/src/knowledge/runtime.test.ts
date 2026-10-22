@@ -22,6 +22,7 @@ import {
   type User,
 } from '@disco/core/types';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as documents from './documents';
 import { OpenVikingError } from './openviking';
 import { approvedTranscriptCwd, KnowledgeRuntime } from './runtime';
 
@@ -352,6 +353,75 @@ describe('knowledge background synchronization', () => {
       archivedOnly: 1,
       pending: 0,
     });
+  });
+
+  it('backfills newly supported map originals without retrying unrelated or deterministic failures', async () => {
+    await runtime.runOnce(false);
+    const expected = [];
+    for (const [name, status, retryable, historical] of [
+      ['old.gpx', 'unsupported', undefined, false],
+      ['old.kml', 'unsupported', undefined, false],
+      ['photo.png', 'unsupported', undefined, false],
+      ['broken.gpx', 'error', false, false],
+      ['archive.kml', 'unsupported', undefined, true],
+    ] as const) {
+      const detail = (await runtime.library.upsertSource(owner, {
+        source: 'manual',
+        sourceId: name,
+        title: name,
+        kind: 'document',
+        markdown: '旧版元数据',
+      }))!;
+      await runtime.library.putAttachment(owner, detail.entry.id, {
+        name,
+        bytes: Buffer.from(name),
+      });
+      await runtime.library.markParsed(owner, detail.entry.id, status, undefined, { retryable });
+      if (historical) await runtime.library.markHistorical(owner, detail.entry.id);
+      if (name.startsWith('old.')) expected.push(detail.entry.id);
+    }
+    const extract = vi
+      .spyOn(documents, 'extractKnowledgeDocument')
+      .mockResolvedValue({ parsed: true, status: 'parsed' });
+    await runtime.runIndexOnce();
+    expect(extract.mock.calls.map((call) => call[2]).sort()).toEqual(expected.sort());
+  });
+
+  it('only sends the parser attestation for unchanged nonhuman map projections', async () => {
+    await runtime.runOnce(false);
+    for (const mode of ['current', 'changed', 'human']) {
+      const input = {
+        source: 'manual' as const,
+        sourceId: mode,
+        title: `${mode}.gpx`,
+        kind: 'document' as const,
+        markdown: '# 地图名称与描述',
+      };
+      const detail = (await runtime.library.upsertSource(owner, input))!;
+      await runtime.library.markParsed(owner, detail.entry.id, 'parsed', undefined, {
+        projection: { kind: 'geospatial', version: 1, contentHash: detail.contentHash },
+      });
+      if (mode === 'changed')
+        await runtime.library.upsertSource(owner, { ...input, markdown: '# 新版正文' });
+      if (mode === 'human') await runtime.library.edit(owner, detail.entry.id, '# 人工解释');
+      await runtime.library.markIndexed(owner, detail.entry.id);
+    }
+    const summarizeContent = vi.fn(async (_owner, input) => ({
+      title: `${input.sources[0].title} 概览`,
+      abstract: '说明',
+      overview: '结构计数',
+      summaryMode: 'structured_overview',
+    }));
+    Object.defineProperty(runtime, 'engine', { value: { summarizeContent } });
+    await runtime.runSummaryOnce();
+    expect(summarizeContent).toHaveBeenCalledTimes(3);
+    const sources = summarizeContent.mock.calls.map((call) => call[1].sources[0]);
+    expect(sources.find((item) => item.title === 'current.gpx')?.projection).toMatchObject({
+      kind: 'geospatial',
+      version: 1,
+    });
+    expect(sources.find((item) => item.title === 'changed.gpx')?.projection).toBeUndefined();
+    expect(sources.find((item) => item.title === 'human.gpx')?.projection).toBeUndefined();
   });
 
   it('batches local file inventories without spending the model cooldown and preserves synthesis provenance', async () => {

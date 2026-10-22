@@ -6,6 +6,7 @@ library. Run in the configured parser environment; this helper installs nothing.
 
 import sys
 import tempfile
+from knowledge_geospatial import GeospatialParseError, extract_geospatial, render_geospatial_projection
 
 
 def line(value=""):
@@ -116,7 +117,9 @@ def pptx(source):
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
-    parsers = {"pdf": pdf, "docx": docx, "xlsx": xlsx, "pptx": pptx}
+    parsers = {"pdf": pdf, "docx": docx, "xlsx": xlsx, "pptx": pptx,
+               "gpx": lambda source: line(render_geospatial_projection(extract_geospatial(source, "gpx"))),
+               "kml": lambda source: line(render_geospatial_projection(extract_geospatial(source, "kml")))}
     if len(sys.argv) != 2 or sys.argv[1] not in parsers:
         raise ValueError("不支持的文档格式。")
     # Seekable parsers use an anonymous temporary file, rather than buffering an
@@ -134,6 +137,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except GeospatialParseError as error:
+        print("GEOSPATIAL_" + error.code.upper() + ": " + str(error), file=sys.stderr)
+        sys.exit(2)
     except ModuleNotFoundError:
         print("服务器文档解析依赖尚未安装，原件已完整保留。", file=sys.stderr)
         sys.exit(2)

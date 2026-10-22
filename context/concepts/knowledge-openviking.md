@@ -246,6 +246,18 @@ history, and users can inspect or remove every selected source before organizing
 Malformed file parsing backs off instead of relaunching a parser on every scan;
 replacing the original resets this retry state.
 
+GPX and KML use a local streaming XML parser with DTD, entity and external-resource
+loading disabled. Names, complete plain-text descriptions, narrative extended
+fields and structure counts form a searchable reading projection. Coordinates,
+timestamps, elevations and other fields remain in the complete original download;
+the projection does not calculate or validate distance, coverage or geometry.
+Automatic map overviews do not call a model. The shortcut requires parser metadata
+bound to the complete Markdown hash; human edits and stale projections cannot use
+it. Historical unsupported GPX/KML entries are retried when active in the catalog,
+while malformed/unsafe XML waits for a replaced original instead of retrying forever.
+Commit guards reject extraction that raced an original replacement, deletion or
+human edit. Other unsupported formats remain explicitly labeled, not falsely indexed.
+
 ## Host MCP
 
 `scripts/knowledge-host-mcp.mjs` exposes search, list, paged read, save, revision-

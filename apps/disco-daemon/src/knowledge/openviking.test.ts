@@ -567,6 +567,11 @@ describe('OpenViking derived index isolation', () => {
         kind: 'document' as const,
         format: 'json',
         markdown: '[{"count":1}]',
+        projection: {
+          kind: 'geospatial' as const,
+          version: 1 as const,
+          contentHash: 'bound-source-hash',
+        },
         privateField: 'DO_NOT_FORWARD',
       };
       const result = await client.summarizeContent(owner, {
@@ -588,6 +593,7 @@ describe('OpenViking derived index isolation', () => {
             kind: 'document',
             format: 'json',
             markdown: '[{"count":1}]',
+            projection: { kind: 'geospatial', version: 1, contentHash: 'bound-source-hash' },
           },
         ],
       });

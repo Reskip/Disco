@@ -75,6 +75,13 @@ export interface KnowledgeSourceReference {
 
 export type KnowledgeSourceRevisionStatus = 'current' | 'changed' | 'deleted' | 'unknown';
 
+/** Server-attested local reading projection, valid only for this complete Markdown hash. */
+export interface KnowledgeParseProjection {
+  kind: 'geospatial';
+  version: 1;
+  contentHash: string;
+}
+
 export interface KnowledgeEntry {
   id: string;
   title: string;
@@ -121,6 +128,8 @@ export interface KnowledgeEntry {
   parseMessage?: string;
   parseAttempts?: number;
   parseRetryAt?: string;
+  parseRetryable?: boolean;
+  parseProjection?: KnowledgeParseProjection;
 }
 
 export interface KnowledgeEntryDetail {
@@ -167,6 +176,8 @@ export interface KnowledgeSourceInput {
   automated?: boolean;
   /** Server-only commit guard for summaries generated from these exact source versions. */
   expectedSources?: Array<{ id: string; contentHash: string }>;
+  /** Server-only extraction commit guard against a replaced original attachment. */
+  expectedAttachmentId?: string;
 }
 
 export interface KnowledgeListOptions {

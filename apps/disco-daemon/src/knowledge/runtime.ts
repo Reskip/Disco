@@ -619,10 +619,16 @@ export class KnowledgeRuntime {
         const unparsed = (await this.library.snapshot(owner)).filter(
           (entry) =>
             entry.kind === 'document' &&
+            !entry.historical &&
             entry.attachments?.some((file) => file.id) &&
             (!entry.parseStatus ||
               entry.parseStatus === 'pending' ||
+              (entry.parseStatus === 'unsupported' &&
+                ['.gpx', '.kml'].includes(
+                  extname(entry.attachments.at(-1)?.name ?? '').toLowerCase()
+                )) ||
               (entry.parseStatus === 'error' &&
+                entry.parseRetryable !== false &&
                 (!entry.parseRetryAt || Date.parse(entry.parseRetryAt) <= Date.now())))
         );
         for (const entry of unparsed.slice(0, 10)) {
@@ -1305,6 +1311,10 @@ export class KnowledgeRuntime {
                   .toLowerCase()
               : undefined,
           markdown: item.markdown,
+          projection:
+            !item.entry.humanEdited && item.entry.parseProjection?.contentHash === item.contentHash
+              ? item.entry.parseProjection
+              : undefined,
         })),
         forceSynthesis: Boolean(target),
         onProgress: recordProgress,
@@ -1471,9 +1481,10 @@ export class KnowledgeRuntime {
 function isStructuredSummaryCandidate(entry: KnowledgeEntry): boolean {
   return (
     entry.kind === 'document' &&
-    ['.json', '.jsonl', '.ndjson', '.csv', '.tsv', '.html', '.htm'].includes(
+    (['.json', '.jsonl', '.ndjson', '.csv', '.tsv', '.html', '.htm'].includes(
       extname(entry.attachments?.at(-1)?.name ?? entry.title).toLowerCase()
-    )
+    ) ||
+      (!entry.humanEdited && entry.parseProjection?.kind === 'geospatial'))
   );
 }
 

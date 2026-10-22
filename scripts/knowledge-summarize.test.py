@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import hashlib
+import io
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -8,6 +10,7 @@ import subprocess
 import sys
 import os
 from unittest.mock import patch
+from knowledge_geospatial import extract_geospatial, render_geospatial_projection
 
 spec = importlib.util.spec_from_file_location("knowledge_summarize", Path(__file__).with_name("knowledge-summarize.py"))
 module = importlib.util.module_from_spec(spec)
@@ -15,6 +18,26 @@ spec.loader.exec_module(module)
 
 
 class SummaryProviderTests(unittest.TestCase):
+    def test_attested_map_projection_never_initializes_model_and_explicit_synthesis_gets_no_coordinates(self):
+        xml = '<gpx><trk><name>合成路线</name><trkseg>' + '<trkpt lat="12.345678" lon="98.765432"/>' * 1000 + '</trkseg></trk></gpx>'
+        markdown = render_geospatial_projection(extract_geospatial(io.BytesIO(xml.encode()), 'gpx'))
+        projection = {'kind': 'geospatial', 'version': 1, 'contentHash': hashlib.sha256(markdown.encode()).hexdigest()}
+        sources = [{'id': 'map-source', 'kind': 'document', 'title': '合成.gpx', 'format': 'gpx', 'markdown': markdown, 'projection': projection}]
+        with patch.dict('sys.modules', {'openviking_cli.utils.config.vlm_config': SimpleNamespace(VLMConfig=lambda **_: self.fail('unexpected model call'))}):
+            result = module.summarize('legacy', {}, sources=sources)
+        self.assertEqual(result['summaryMode'], 'structured_overview')
+        calls = []
+        class FakeVLM:
+            def __init__(self, **configuration): pass
+            def get_completion(self, **arguments):
+                calls.append(arguments)
+                return '{"abstract":"摘要","overview":"保留范围与来源"}'
+            def close(self): pass
+        with patch.dict('sys.modules', {'openviking_cli.utils.config.vlm_config': SimpleNamespace(VLMConfig=FakeVLM)}):
+            module.summarize('legacy', {'vlm': {'provider': 'openai-codex'}}, sources=sources, force_synthesis=True)
+        self.assertIn('合成路线', str(calls))
+        self.assertNotIn('12.345678', str(calls))
+
     def test_one_completion_receives_the_entire_archive_without_tools(self):
         archive = "完整原始记录🙂\n" * 100 + "LAST_SENTINEL"
         calls = []

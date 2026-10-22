@@ -1,8 +1,10 @@
 import csv
+import hashlib
 import io
 import json
 import unittest
 from knowledge_overview import inspect_csv, inspect_html, inspect_json, prepare_summary_sources
+from knowledge_geospatial import extract_geospatial, render_geospatial_projection
 
 
 def source(text, format='json', **extra):
@@ -10,6 +12,20 @@ def source(text, format='json', **extra):
 
 
 class LocalOverviewTests(unittest.TestCase):
+    def test_map_overview_requires_server_attested_exact_source_hash(self):
+        report = extract_geospatial(io.BytesIO('<gpx><trk><name>长江路线</name><trkseg><trkpt lat="123.456" lon="78.901"/></trkseg></trk></gpx>'.encode()), 'gpx')
+        body = render_geospatial_projection(report)
+        markdown = '# 轨迹.gpx\n\n[原始文件：轨迹.gpx](../assets/source/original.gpx)\n\n' + body
+        projection = {'kind': 'geospatial', 'version': 1, 'contentHash': hashlib.sha256(markdown.encode()).hexdigest()}
+        parsed = source(markdown, 'gpx', projection=projection)
+        result = prepare_summary_sources([parsed])
+        self.assertEqual(result['deterministic']['summaryMode'], 'structured_overview')
+        self.assertIn('长江路线', result['content'])
+        self.assertNotIn('123.456', result['content'])
+        self.assertNotIn('disco-geospatial-projection:', result['content'])
+        self.assertNotIn('deterministic', prepare_summary_sources([source(markdown, 'gpx')]))
+        self.assertNotIn('deterministic', prepare_summary_sources([{**parsed, 'markdown': markdown + '人工修改'}]))
+
     def test_topics_describe_the_content_instead_of_the_file_format(self):
         cases = [('酒店至植物园跑步轨迹', '健康与运动'), ('铁路覆盖图', '旅行与生活'),
                  ('知识库索引状态', '软件与系统'), ('一个页面', '其他')]

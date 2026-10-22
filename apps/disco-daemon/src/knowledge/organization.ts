@@ -36,6 +36,8 @@ export function materialType(entry: KnowledgeEntry): KnowledgeMaterialType {
         '.jsonl',
         '.yaml',
         '.yml',
+        '.gpx',
+        '.kml',
       ].includes(extname(name).toLowerCase())
     )
   )

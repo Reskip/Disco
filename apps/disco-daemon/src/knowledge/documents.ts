@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { extname, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { TextDecoder } from 'node:util';
@@ -12,6 +13,7 @@ export interface KnowledgeDocumentExtraction {
   message?: string;
   characters?: number;
   detail?: KnowledgeEntryDetail;
+  retryable?: boolean;
 }
 
 export interface KnowledgeDocumentParserOptions {
@@ -64,8 +66,27 @@ const textFormats = new Set([
   'ipynb',
   'bib',
 ]);
-const pythonFormats = new Set(['pdf', 'docx', 'xlsx', 'pptx']);
+const pythonFormats = new Set(['pdf', 'docx', 'xlsx', 'pptx', 'gpx', 'kml']);
+const geospatialFormats = new Set(['gpx', 'kml']);
 const safeHeading = (value: string) => value.replace(/[\r\n]/g, ' ');
+
+function isGeospatialProjection(body: string, format: string): boolean {
+  const marker = /^<!-- disco-geospatial-projection:(\{[^\r\n]+\}) -->\r?\n/.exec(body);
+  if (!marker) return false;
+  try {
+    const metadata = JSON.parse(marker[1]);
+    return (
+      metadata.version === 1 &&
+      metadata.format === format &&
+      metadata.sha256 ===
+        createHash('sha256')
+          .update(body.slice(marker[0].length).replace(/\r\n/g, '\n').trim())
+          .digest('hex')
+    );
+  } catch {
+    return false;
+  }
+}
 
 async function readText(stream: AsyncIterable<Uint8Array>): Promise<string> {
   let decoder: TextDecoder | undefined;
@@ -123,7 +144,13 @@ async function runPythonParser(
     throw new Error('文档解析器未能启动，请检查服务器解析环境。');
   if (exitResult.value !== 0) {
     const detail = stderr.trim().split(/\r?\n/).at(-1);
-    throw new Error(detail || '文档解析失败，原件已完整保留。');
+    const mapError = /^GEOSPATIAL_([A-Z_]+): (.+)$/.exec(detail ?? '');
+    throw Object.assign(new Error(mapError?.[2] || detail || '文档解析失败，原件已完整保留。'), {
+      retryable:
+        mapError && ['XML_SECURITY', 'XML_MALFORMED', 'ROOT'].includes(mapError[1])
+          ? false
+          : undefined,
+    });
   }
   if (inputResult.status === 'rejected') throw new Error('读取原始附件失败，原件已保留。');
   if (outputResult.status === 'rejected') throw new Error('文档解析器没有返回有效的 UTF-8 文本。');
@@ -140,6 +167,7 @@ export async function extractKnowledgeDocument(
   const current = await library.get(owner, id);
   if (current?.entry.kind !== 'document')
     return { parsed: false, status: 'error', message: '资料不存在或不是文档。' };
+  let attachmentId: string | undefined;
   const finish = async (
     result: KnowledgeDocumentExtraction,
     status: KnowledgeParseStatus = result.parsed
@@ -148,7 +176,23 @@ export async function extractKnowledgeDocument(
         ? 'unsupported'
         : 'error'
   ): Promise<KnowledgeDocumentExtraction> => {
-    await library.markParsed(owner, id, status, result.message);
+    const saved = result.detail ?? current;
+    const applied = await library.markParsed(owner, id, status, result.message, {
+      expectedAttachmentId: attachmentId,
+      expectedContentHash: saved.contentHash,
+      retryable: result.retryable,
+      projection:
+        result.parsed && geospatialFormats.has(result.format ?? '') && !saved.entry.humanEdited
+          ? { kind: 'geospatial', version: 1, contentHash: saved.contentHash }
+          : undefined,
+    });
+    if (!applied)
+      return {
+        parsed: false,
+        status: 'error',
+        format: result.format,
+        message: '资料已更新，旧解析结果未应用。',
+      };
     return { ...result, detail: (await library.get(owner, id)) ?? undefined };
   };
   // Previous originals remain downloadable, while extraction follows the newest saved version.
@@ -156,6 +200,7 @@ export async function extractKnowledgeDocument(
     ?.slice()
     .reverse()
     .find((item) => item.id && item.relativePath);
+  attachmentId = attachment?.id;
   if (!attachment?.id)
     return finish({
       parsed: false,
@@ -164,7 +209,9 @@ export async function extractKnowledgeDocument(
       detail: current,
     });
   const format = extname(attachment.name).slice(1).toLowerCase();
-  const nativeText = textFormats.has(format) || attachment.mimeType?.startsWith('text/');
+  const nativeText =
+    !geospatialFormats.has(format) &&
+    (textFormats.has(format) || attachment.mimeType?.startsWith('text/'));
   let result: KnowledgeDocumentExtraction;
   let body = '';
   if (!nativeText && !pythonFormats.has(format)) {
@@ -188,6 +235,8 @@ export async function extractKnowledgeDocument(
       body = nativeText
         ? await readText(opened.body)
         : await runPythonParser(opened.body, format, options);
+      if (geospatialFormats.has(format) && !isGeospatialProjection(body, format))
+        throw new Error('地图解析器未返回有效的本地概览；原件已完整保留。');
       result = body.trim()
         ? { parsed: true, status: 'parsed', format, characters: body.length }
         : {
@@ -205,6 +254,7 @@ export async function extractKnowledgeDocument(
         status: 'error',
         format,
         message: error instanceof Error ? error.message : '文档解析失败，原件已保留。',
+        retryable: (error as { retryable?: boolean })?.retryable === false ? false : undefined,
       };
     } finally {
       opened.body.destroy();
@@ -221,9 +271,16 @@ export async function extractKnowledgeDocument(
     sourceUpdatedAt: current.entry.sourceUpdatedAt,
     sourceUrl: current.entry.sourceUrl,
     attachments: current.entry.attachments,
+    expectedAttachmentId: attachment.id,
+    expectedSources: [{ id: current.entry.id, contentHash: current.contentHash }],
   });
   if (!detail)
-    return { parsed: false, status: 'error', format, message: '资料已删除，解析结果未重新入库。' };
+    return {
+      parsed: false,
+      status: 'error',
+      format,
+      message: '资料已更新或删除，旧解析结果未应用。',
+    };
   if (detail.entry.humanEdited)
     return finish(
       {

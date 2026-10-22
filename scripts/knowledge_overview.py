@@ -12,6 +12,7 @@ import io
 import json
 import math
 import re
+from knowledge_geospatial import read_geospatial_projection
 
 OVERVIEW_VERSION = "structured-overview-v2"
 DETAIL_FIELDS = 80
@@ -267,6 +268,7 @@ def prepare_summary_sources(sources):
                 if format == 'json': report = inspect_json(body)
                 elif format in {'csv', 'tsv'}: report = inspect_csv(body, '\t' if format == 'tsv' else None)
                 elif format in {'html', 'htm'}: report = inspect_html(body)
+                elif format in {'gpx', 'kml'}: report = read_geospatial_projection(body, format, source.get('projection'), raw)
             except (ValueError, csv.Error, RecursionError):
                 pass
         if report:
@@ -291,7 +293,7 @@ def prepare_summary_sources(sources):
     result = {'content': content, 'segments': segments}
     if all_structured:
         topic = reports[0]['topic'] if len({r['topic'] for r in reports}) == 1 else '其他'
-        title = re.sub(r'\.(?:json|csv|tsv|html?)$', '', sources[0]['title'], flags=re.I) if len(sources)==1 else '多份资料'
+        title = re.sub(r'\.(?:json|csv|tsv|html?|gpx|kml)$', '', sources[0]['title'], flags=re.I) if len(sources)==1 else '多份资料'
         result['deterministic'] = {'title': title[:60]+'资料概览', 'topic': topic, 'tags': list(dict.fromkeys(tag for report in reports for tag in report['tags']))[:6],
             'abstract': f"已在本地生成 {len(sources)} 份资料的结构概览，未调用生成模型；这是格式、规模和可用字段说明，不代表逐条提炼了全部知识。",
             'overview': content, 'summaryMode': 'structured_overview'}

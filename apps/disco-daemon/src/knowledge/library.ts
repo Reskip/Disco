@@ -25,6 +25,7 @@ import type {
   KnowledgeOrganization,
   KnowledgeOverview,
   KnowledgeOwner,
+  KnowledgeParseProjection,
   KnowledgeParseStatus,
   KnowledgeSourceInput,
   KnowledgeSummaryProgress,
@@ -652,6 +653,11 @@ export class KnowledgeLibrary {
           return null;
       }
       let entry = await this.metadata(base, id);
+      if (
+        input.expectedAttachmentId &&
+        entry?.attachments?.at(-1)?.id !== input.expectedAttachmentId
+      )
+        return null;
       let current: KnowledgeEntryDetail | null = null;
       if (entry) {
         current = await this.refreshEntry(base, entry);
@@ -746,6 +752,8 @@ export class KnowledgeLibrary {
         parseMessage: entry?.parseMessage,
         parseAttempts: entry?.parseAttempts,
         parseRetryAt: entry?.parseRetryAt,
+        parseRetryable: entry?.parseRetryable,
+        parseProjection: entry?.parseProjection,
         organization: grouping,
         generation: entry?.humanEdited ? entry.generation : (input.generation ?? entry?.generation),
         indexMessage: entry?.contentHash === digest(body) ? entry.indexMessage : undefined,
@@ -1486,17 +1494,38 @@ export class KnowledgeLibrary {
     owner: KnowledgeOwner,
     id: string,
     status: KnowledgeParseStatus,
-    message?: string
+    message?: string,
+    options: {
+      expectedAttachmentId?: string;
+      expectedContentHash?: string;
+      projection?: KnowledgeParseProjection;
+      retryable?: boolean;
+    } = {}
   ): Promise<boolean> {
     return this.exclusive(owner, async (base) => {
       if ((await this.deletedEntries(base)).some((item) => item.id === id)) return false;
       const entry = await this.metadata(base, id);
       if (entry?.kind !== 'document' || !(await this.refreshEntry(base, entry))) return false;
+      if (
+        (options.expectedAttachmentId &&
+          entry.attachments?.at(-1)?.id !== options.expectedAttachmentId) ||
+        (options.expectedContentHash && entry.contentHash !== options.expectedContentHash)
+      )
+        return false;
       entry.parseStatus = status;
       entry.parseMessage = message;
+      entry.parseRetryable = status === 'error' ? options.retryable : undefined;
+      entry.parseProjection =
+        status === 'parsed' &&
+        !entry.humanEdited &&
+        options.projection?.contentHash === entry.contentHash
+          ? options.projection
+          : undefined;
       entry.parseAttempts = status === 'error' ? (entry.parseAttempts ?? 0) + 1 : undefined;
       entry.parseRetryAt =
-        status === 'error' ? retryDate(entry.parseAttempts!, 5 * 60_000) : undefined;
+        status === 'error' && options.retryable !== false
+          ? retryDate(entry.parseAttempts!, 5 * 60_000)
+          : undefined;
       await this.save(base, entry);
       return true;
     });
@@ -1538,6 +1567,7 @@ export class KnowledgeLibrary {
       const extension = extname(input.name);
       const safeExtension = /^\.[a-zA-Z0-9]{1,16}$/.test(extension) ? extension : '';
       const previous = entry.attachments?.find((item) => item.id === attachmentId);
+      const previousLatestId = entry.attachments?.at(-1)?.id;
       const path =
         previous?.relativePath && this.validAttachmentPath(id, attachmentId, previous.relativePath)
           ? previous.relativePath
@@ -1570,11 +1600,13 @@ export class KnowledgeLibrary {
         ),
         attachment,
       ];
-      if (!previous && entry.kind === 'document') {
+      if (previousLatestId !== attachmentId && entry.kind === 'document') {
         entry.parseStatus = 'pending';
         entry.parseMessage = undefined;
         entry.parseAttempts = undefined;
         entry.parseRetryAt = undefined;
+        entry.parseRetryable = undefined;
+        entry.parseProjection = undefined;
       }
       entry.updatedAt = nowAfter(entry.updatedAt);
       await this.save(base, entry);

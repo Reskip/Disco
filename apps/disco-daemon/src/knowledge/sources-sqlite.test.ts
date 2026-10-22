@@ -179,6 +179,55 @@ describe('Codex paginated SQLite history', () => {
     expect(state.prepare('SELECT COUNT(*) AS count FROM threads').get()?.count).toBe(2);
   });
 
+  it('repairs a wrapper title from real messages while keeping the original title in the raw snapshot', async () => {
+    const originalTitle = '# Files mentioned by the user: ## image.png: E:/attachments/image.png';
+    state.prepare('UPDATE threads SET title=? WHERE id=?').run(originalTitle, 'parent');
+    history.prepare('UPDATE thread_items SET item_json=? WHERE item_id=?').run(
+      JSON.stringify({
+        type: 'userMessage',
+        content: [{ type: 'text', text: '# Files mentioned by the user:\n\n## My request:' }],
+      }),
+      'user'
+    );
+    history.prepare('INSERT INTO thread_realtime_items VALUES(?,?,?,?,?,?)').run(
+      'parent',
+      'real-request',
+      10,
+      1_700_000_000_100,
+      'userMessage',
+      JSON.stringify({
+        type: 'userMessage',
+        content: [{ type: 'text', text: '查找重复照片\n保留原件' }],
+      })
+    );
+    const path = join(root, 'title-repair.jsonl');
+    const result = (await exportHostSqliteThread(root, 'parent', path))!;
+    expect(result.source.title).toBe('查找重复照片');
+    expect(result.source.titleProjectionVersion).toBe(1);
+    expect(result.source.markdown).toContain('# 查找重复照片\n');
+    expect(result.source.markdown).toContain('# Files mentioned by the user:');
+    const header = JSON.parse((await readFile(path, 'utf8')).split('\n')[0]!);
+    expect(header.payload.title).toBe(originalTitle);
+    expect(state.prepare('SELECT title FROM threads WHERE id=?').get('parent')?.title).toBe(
+      originalTitle
+    );
+  });
+
+  it('uses a recovery archive real request but retains a safe placeholder for reply-only history', async () => {
+    state.prepare('DELETE FROM threads WHERE id=?').run('parent');
+    const repaired = (await exportHostSqliteThread(root, 'parent', join(root, 'repair.jsonl')))!;
+    expect(repaired.source.title).toBe('第一行');
+    expect(repaired.source.markdown).toContain('来源会话已移除');
+    history.prepare('DELETE FROM thread_items WHERE item_id=?').run('user');
+    const noRequest = (await exportHostSqliteThread(
+      root,
+      'parent',
+      join(root, 'reply-only.jsonl')
+    ))!;
+    expect(noRequest.source.title).toBe('恢复归档 · parent');
+    expect(noRequest.source.titleProjectionVersion).toBe(1);
+  });
+
   it('retains orphaned history as an explicitly labeled recovery archive and counts empty conversations', async () => {
     history
       .prepare('INSERT INTO thread_items VALUES(?,?,?,?,?,?,?,?)')

@@ -52,9 +52,109 @@ export function hostVisibleMessage(text: string): string {
 }
 
 export function hostConversationTitle(text: string): string {
-  const visible = hostVisibleMessage(text);
-  const request = /(?:^|\n)## My request:\s*\n([\s\S]*)/.exec(visible)?.[1] ?? visible;
-  return request.replace(/\s+/g, ' ').trim().slice(0, 100);
+  let visible = hostVisibleMessage(text);
+  while (true) {
+    const stripped = visible.replace(/^<(app-context|user_instructions)>[\s\S]*?<\/\1>\s*/i, '');
+    if (stripped === visible) break;
+    visible = hostVisibleMessage(stripped);
+  }
+  const marker = /(?:^|\n)## My request:[ \t]*(?:\r?\n|$)/i.exec(visible);
+  // A pasted filename can contain an entire prompt. It is still attachment
+  // metadata, not evidence of what the user actually asked in this message.
+  if (!marker && /^#{0,6}\s*Files (?:mentioned|pasted) by the user:/i.test(visible)) return '';
+  const request = (marker ? visible.slice(marker.index + marker[0].length) : visible)
+    .replace(/\[图片，原始引用保存在会话记录中\]/g, '')
+    .trim();
+  if (!request || hostTitleContext(request)) return '';
+  const firstLine = request
+    .split(/\r?\n/, 1)[0]!
+    .replace(/^#{1,6}\s+/, '')
+    .replace(/!\[[^\]]*\]\([^\n]*?\)/g, '')
+    .replace(/\[([^\]]*)\]\([^\n]*?\)/g, '$1')
+    .trim();
+  if (
+    !firstLine ||
+    /^<?https?:\/\/\S+>?$/i.test(firstLine) ||
+    /已将本次附件放入当前工作区[：:]/.test(firstLine) ||
+    /^(?:继续(?:工作)?|好(?:的)?|可以|行|嗯+|收到|谢谢|ok|开始吧)[。.!！\s]*$/i.test(firstLine)
+  )
+    return '';
+  return firstLine.slice(0, 100);
+}
+
+function hostTitleContext(title: string): boolean {
+  return /^<(?:environment_context|recommended_plugins|external_codex_apps_open_page|skills_instructions|permissions_instructions|collaboration_mode|app-context|user_instructions|send_user_message_question_reply)(?:\s|>)/i.test(
+    title
+  );
+}
+
+/** Repair only known generated placeholders, never a normal host/user title. */
+export function needsHostTitleRepair(title: string, id: string): boolean {
+  const value = title.trim();
+  const placeholder = /^(?:Codex\s*会话|恢复归档)\s*[·:：-]?\s*(.*)$/i.exec(value);
+  return (
+    !value ||
+    Boolean(placeholder && (!placeholder[1] || placeholder[1] === id)) ||
+    /^#{0,6}\s*Files (?:mentioned|pasted) by the user:/i.test(value) ||
+    /^#{0,6}\s*My request:/i.test(value) ||
+    /^\[图片，原始引用保存在会话记录中\]$/.test(value) ||
+    /已将本次附件放入当前工作区[：:]/.test(value) ||
+    hostTitleContext(value)
+  );
+}
+
+/** A reply must name its subject explicitly before it can supply a missing label. */
+export function hostAssistantTitle(text: string, id: string): string | undefined {
+  const title = /^# ([^\r\n]{1,100})(?:\r?\n|$)/.exec(text.trim())?.[1]?.trim();
+  return title &&
+    !/^(?:总结|结论|答案|回复|进度|说明|结果)[：:]?$/.test(title) &&
+    !needsHostTitleRepair(title, id)
+    ? title
+    : undefined;
+}
+
+/** Derive a display label from already archived messages without touching raw data. */
+export function hostArchiveDisplayTitle(
+  markdown: string,
+  id: string,
+  currentTitle: string
+): string | undefined {
+  if (!needsHostTitleRepair(currentTitle, id)) return undefined;
+  let role = '';
+  let body: string[] = [];
+  let assistantTitle: string | undefined;
+  let fence: { marker: string; length: number } | undefined;
+  const candidate = (): string | undefined => {
+    const text = body.join('\n').trim();
+    if (role === 'user') {
+      const title = hostConversationTitle(text);
+      if (title && !needsHostTitleRepair(title, id)) return title;
+    } else if (role === 'assistant' && !assistantTitle) {
+      // Only an explicit top-level title, not a guessed topic from reply prose.
+      assistantTitle = hostAssistantTitle(text, id);
+    }
+    return undefined;
+  };
+  for (const line of markdown.split(/\r?\n/)) {
+    const boundary = !fence && /^## (user|assistant) ·(?:[ \t].*)?$/.exec(line);
+    if (boundary) {
+      const title = candidate();
+      if (title) return title;
+      role = boundary[1]!;
+      body = [];
+    } else {
+      body.push(line);
+      const delimiter = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+      if (delimiter) {
+        const marker = delimiter[1]![0]!;
+        const length = delimiter[1]!.length;
+        if (!fence) fence = { marker, length };
+        else if (fence.marker === marker && length >= fence.length && !delimiter[2]!.trim())
+          fence = undefined;
+      }
+    }
+  }
+  return candidate() ?? assistantTitle;
 }
 
 /** Render human conversation text; the untouched JSONL remains the complete record. */
@@ -134,8 +234,11 @@ export async function readHostRollout(path: string): Promise<HostRolloutSource |
   let agentPath: string | undefined;
   const messages: string[] = [];
   const fallback: string[] = [];
-  let title = '';
-  let fallbackTitle = '';
+  let metadataTitle = '';
+  let userTitle = '';
+  let fallbackUserTitle = '';
+  let assistantTitle: string | undefined;
+  let fallbackAssistantTitle: string | undefined;
   let firstEventAt: string | undefined;
   let lastEventAt: string | undefined;
   let recordCount = 0;
@@ -166,6 +269,7 @@ export async function readHostRollout(path: string): Promise<HostRolloutSource |
     // own header. The first header owns this file; later headers are provenance.
     if (!id && row.type === 'session_meta' && typeof payload.id === 'string' && payload.id) {
       id = payload.id;
+      if (typeof payload.title === 'string') metadataTitle = payload.title;
       const threadSpawn = record(record(record(payload.source).subagent).thread_spawn);
       if (typeof threadSpawn.agent_path === 'string') agentPath = threadSpawn.agent_path;
     }
@@ -174,15 +278,18 @@ export async function readHostRollout(path: string): Promise<HostRolloutSource |
       if (!['user', 'assistant'].includes(role)) continue;
       const text = hostVisibleMessage(conversationText(payload.content));
       if (!text) continue;
-      if (!title && role === 'user') title = hostConversationTitle(text);
+      if (role === 'user' && !userTitle) userTitle = hostConversationTitle(text);
+      if (role === 'assistant' && !assistantTitle) assistantTitle = hostAssistantTitle(text, id);
       messages.push(`## ${role} · ${String(row.timestamp ?? '')}\n\n${text}`);
     } else if (
       row.type === 'event_msg' &&
       ['user_message', 'agent_message'].includes(String(payload.type))
     ) {
       const text = hostVisibleMessage(String(payload.message ?? ''));
-      if (!fallbackTitle && payload.type === 'user_message')
-        fallbackTitle = hostConversationTitle(text);
+      if (payload.type === 'user_message' && !fallbackUserTitle)
+        fallbackUserTitle = hostConversationTitle(text);
+      if (payload.type === 'agent_message' && !fallbackAssistantTitle)
+        fallbackAssistantTitle = hostAssistantTitle(text, id);
       if (text)
         fallback.push(
           `## ${payload.type === 'user_message' ? 'user' : 'assistant'} · ${String(row.timestamp ?? '')}\n\n${text}`
@@ -190,18 +297,26 @@ export async function readHostRollout(path: string): Promise<HostRolloutSource |
     }
   }
   if (!id) return null;
-  title = agentPath
-    ? `Codex 子任务 · ${agentPath.replace(/^\/root\//, '')}`
-    : title || fallbackTitle;
+  const transcript = (messages.length ? messages : fallback).join('\n\n');
+  const title = !needsHostTitleRepair(metadataTitle, id)
+    ? metadataTitle
+    : agentPath
+      ? `Codex 子任务 · ${agentPath.replace(/^\/root\//, '')}`
+      : userTitle ||
+        fallbackUserTitle ||
+        assistantTitle ||
+        fallbackAssistantTitle ||
+        `Codex 会话 ${id}`;
   return {
     source: 'codex',
     sourceId: id,
-    title: title || `Codex 会话 ${id}`,
+    title,
+    titleProjectionVersion: 1,
     kind: 'conversation',
     // A copied file's mtime says nothing about the conversation's semantic freshness.
     sourceUpdatedAt: lastEventAt ?? new Date(0).toISOString(),
     sourceUrl: `codex://threads/${id}`,
-    markdown: `# ${title || 'Codex 会话'}\n\n来源：Codex 会话 ${id}\n\n${(messages.length ? messages : fallback).join('\n\n')}`,
+    markdown: `# ${title}\n\n来源：Codex 会话 ${id}\n\n${transcript}`,
     rawContent: raw,
     sourceVersion: {
       kind: 'codex-rollout',

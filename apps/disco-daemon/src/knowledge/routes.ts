@@ -127,6 +127,8 @@ function listOptions(query: Request['query']): KnowledgeListOptions {
       '文件类型'
     ),
     level: choice(query.level, ['source', 'summary', 'knowledge'] as const, '知识层级'),
+    noteType: choice(query.noteType, ['knowledge', 'summary', 'overview'] as const, '笔记类型'),
+    sort: choice(query.sort, ['updated', 'curated'] as const, '排序方式'),
     topic: scalar(query.topic),
     reviewState: choice(query.reviewState, ['draft', 'reviewed'] as const, '确认状态'),
     includeHistory: query.includeHistory === 'true',

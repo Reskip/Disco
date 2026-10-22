@@ -70,6 +70,115 @@ describe('portable knowledge library', () => {
     expect(await library.get(owner, image.entry.id)).not.toBeNull();
   });
 
+  it('filters all note categories before pagination and prioritizes maintained knowledge', async () => {
+    const knowledge = (await library.upsertSource(owner, {
+      ...source,
+      sourceId: 'knowledge',
+      kind: 'note',
+      source: 'manual',
+      title: '人工维护的专题',
+      markdown: '人工确认的可靠规则',
+      organization: { topic: '软件', level: 'knowledge', state: 'reviewed' },
+    }))!;
+    const summary = (await library.upsertSource(owner, {
+      ...source,
+      sourceId: 'summary',
+      kind: 'note',
+      automated: true,
+      title: '自动摘要',
+      markdown: '保存缓存的具体规则',
+      summaryMode: 'model',
+      organization: { topic: '软件', level: 'summary', state: 'draft' },
+    }))!;
+    const overview = (await library.upsertSource(owner, {
+      ...source,
+      sourceId: 'overview',
+      kind: 'note',
+      automated: true,
+      title: '文件结构概览',
+      summaryMode: 'structured_overview',
+      organization: { topic: '数据', level: 'summary', state: 'draft' },
+    }))!;
+    await library.upsertSource(owner, { ...source, sourceId: 'unclassified-raw' });
+    for (const [type, expected] of [
+      ['knowledge', knowledge],
+      ['summary', summary],
+      ['overview', overview],
+    ] as const) {
+      const found = await library.list(owner, { noteType: type, limit: 1 });
+      expect(found.total).toBe(1);
+      expect(found.entries[0].id).toBe(expected.entry.id);
+    }
+    expect(
+      (await library.list(owner, { kind: 'note', sort: 'curated', limit: 1 })).entries[0].id
+    ).toBe(knowledge.entry.id);
+    expect(
+      (await library.list(owner, { kind: 'note', sort: 'curated', query: '保存缓存' })).entries[0]
+        .id
+    ).toBe(summary.entry.id);
+    const facets = await library.overview(owner);
+    expect(facets.noteTopics).toEqual([
+      { topic: '软件', count: 2 },
+      { topic: '数据', count: 1 },
+    ]);
+    expect(facets.topics).toContainEqual({ topic: '未分类', count: 1 });
+    await library.edit(owner, overview.entry.id, '经过人工核实的结论', undefined, undefined, {
+      topic: '数据',
+      level: 'knowledge',
+      state: 'reviewed',
+    });
+    expect((await library.list(owner, { noteType: 'overview' })).total).toBe(0);
+    expect((await library.list(owner, { noteType: 'knowledge' })).total).toBe(2);
+  });
+
+  it('repairs imported display titles without touching raw records, content, or completed summaries', async () => {
+    const imported = (await library.upsertSource(owner, {
+      ...source,
+      source: 'codex',
+      title: 'Codex 会话 session-1',
+    }))!;
+    await library.markSummarized(owner, imported.entry.id, imported.contentHash);
+    const rawPath = join(library.ownerPath(owner), 'sources', `${imported.entry.id}.jsonl`);
+    const raw = await readFile(rawPath);
+    expect(
+      await library.repairImportedTitle(
+        owner,
+        imported.entry.id,
+        imported.contentHash,
+        imported.entry.title,
+        '清理缓存并保留原件'
+      )
+    ).toBe(true);
+    const fixed = (await library.get(owner, imported.entry.id))!;
+    expect(fixed.entry.title).toBe('清理缓存并保留原件');
+    expect(fixed.entry.titleProjectionVersion).toBe(1);
+    expect(fixed.contentHash).toBe(imported.contentHash);
+    expect(fixed.markdown).toBe(imported.markdown);
+    expect(fixed.entry.updatedAt).toBe(imported.entry.updatedAt);
+    expect(fixed.entry.summaryContentHash).toBe(imported.contentHash);
+    expect(await readFile(rawPath)).toEqual(raw);
+    const another = (await library.upsertSource(owner, {
+      ...source,
+      source: 'codex',
+      sourceId: 'manual-takeover',
+      title: '恢复归档 · x',
+    }))!;
+    await writeFile(
+      join(library.ownerPath(owner), another.entry.relativePath),
+      '# 人工标题\n保留人工正文'
+    );
+    expect(
+      await library.repairImportedTitle(
+        owner,
+        another.entry.id,
+        another.contentHash,
+        another.entry.title,
+        '后台旧题'
+      )
+    ).toBe(false);
+    expect((await library.get(owner, another.entry.id))?.entry.title).toBe('人工标题');
+  });
+
   it('ranks multi-term Chinese catalog matches without requiring the entire question verbatim', async () => {
     const relevant = (await library.upsertSource(owner, {
       ...source,

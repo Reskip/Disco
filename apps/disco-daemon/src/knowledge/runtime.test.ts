@@ -134,6 +134,26 @@ describe('knowledge background synchronization', () => {
     expect((await runtime.status(owner)).sync?.state).toBe('idle');
   });
 
+  it('repairs imported placeholder titles from the readable archive without reimporting raw history', async () => {
+    const sourceId = '01a116ed-6f30-7833-bf5d-31f35ba3c9c5';
+    const imported = (await runtime.library.upsertSource(owner, {
+      source: 'codex',
+      sourceId,
+      kind: 'conversation',
+      title: `恢复归档 · ${sourceId}`,
+      markdown: `# 恢复归档 · ${sourceId}\n\n## user · 2026-10-01T00:00:00Z\n\n修复照片重名问题\n\n## assistant · 2026-10-01T00:00:01Z\n\n先核对原件。`,
+      rawContent: '{"complete":"original"}\n',
+    }))!;
+    await runtime.library.markSummarized(owner, imported.entry.id, imported.contentHash);
+    await runtime.runOnce(false);
+    const repaired = (await runtime.library.get(owner, imported.entry.id))!;
+    expect(repaired.entry.title).toBe('修复照片重名问题');
+    expect(repaired.entry.titleProjectionVersion).toBe(1);
+    expect(repaired.markdown).toBe(imported.markdown);
+    expect(repaired.contentHash).toBe(imported.contentHash);
+    expect(repaired.entry.summaryContentHash).toBe(imported.contentHash);
+  });
+
   it('imports appended messages even when the session updated_at value is unchanged', async () => {
     const session = await createSession(primary, '增量会话');
     await append(session, 0, '第一次消息');

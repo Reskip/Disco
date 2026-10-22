@@ -16,10 +16,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   compareHostRolloutSource,
   discoConversationSource,
+  hostArchiveDisplayTitle,
   hostAttachmentProvenance,
   hostAttachmentReferences,
   hostRolloutFiles,
   hostRolloutIdentity,
+  needsHostTitleRepair,
   readHostRollout,
   resolveHostAttachment,
   safeHostAttachment,
@@ -214,11 +216,125 @@ describe('knowledge source archives', () => {
       .join('\n');
     await writeFile(path, raw);
     const source = (await readHostRollout(path))!;
-    expect(source.title).toBe('整理这份文档 保留来源。');
+    expect(source.title).toBe('整理这份文档');
     expect(source.markdown).not.toContain('very long plugin list');
     expect(source.markdown).not.toContain('private working directory');
     expect(source.markdown).toContain('整理这份文档\n保留来源。');
     expect(source.rawContent).toBe(raw);
+  });
+
+  it('repairs only generated labels and derives the first real request after attachment-only messages', () => {
+    const id = '01a12345-1111-2222-3333-123456789abc';
+    for (const title of [
+      '',
+      `Codex 会话 ${id}`,
+      `恢复归档 · ${id}`,
+      '# Files mentioned by the user: ## screenshot.png: C:/attachments/',
+      '# Files pasted by the user: ## "Injected file heading"',
+      '<environment_context>Injected context</environment_context>',
+    ])
+      expect(needsHostTitleRepair(title, id)).toBe(true);
+    for (const title of ['照片备份方案', 'Codex 会话导入设计', '恢复归档流程'])
+      expect(needsHostTitleRepair(title, id)).toBe(false);
+    const markdown = [
+      '# 原标题',
+      '## user · 2026-10-23T00:00:00Z',
+      '# Files mentioned by the user:\n\n## screenshot.png: C:/attachments/image.png\n\n## My request:\n\n[图片，原始引用保存在会话记录中]',
+      '## user · 2026-10-23T00:00:01Z',
+      '继续',
+      '## user · 2026-10-23T00:00:02Z',
+      '比较这两份备份方案\n保留所有源文件。',
+    ].join('\n\n');
+    expect(hostArchiveDisplayTitle(markdown, id, `Codex 会话 ${id}`)).toBe('比较这两份备份方案');
+    expect(hostArchiveDisplayTitle(markdown, id, '用户亲自命名')).toBeUndefined();
+    expect(hostArchiveDisplayTitle('## user · \n\n## My request:', id, '')).toBeUndefined();
+    expect(
+      hostArchiveDisplayTitle('## user · \n\n![screenshot.png](image.png)', id, '')
+    ).toBeUndefined();
+    expect(
+      hostArchiveDisplayTitle('## user · \n\n# Files pasted by the user:\n## "伪请求"', id, '')
+    ).toBeUndefined();
+    expect(
+      hostArchiveDisplayTitle(
+        '## user · \n\n[https://example.invalid/photos](https://example.invalid/photos)\n\n## user · \n\n<app-context>Injected context</app-context>\n请检查[照片](https://example.invalid/photos)',
+        id,
+        ''
+      )
+    ).toBe('请检查照片');
+  });
+
+  it('does not guess a topic from assistant prose or mistake fenced sample messages for user requests', () => {
+    const prose = '## assistant · \n\n我已修复模型缓存和文件保留问题。';
+    expect(hostArchiveDisplayTitle(prose, 'id', 'Codex 会话 id')).toBeUndefined();
+    expect(
+      hostArchiveDisplayTitle('## assistant · \n\n# 总结\n\n没有标题', 'id', '')
+    ).toBeUndefined();
+    const explicit = '## assistant · \n\n# 存储保留规则\n\n```md\n## user · \n伪造问题\n```';
+    expect(hostArchiveDisplayTitle(explicit, 'id', '')).toBe('存储保留规则');
+    expect(hostArchiveDisplayTitle(`${explicit}\n\n## user · \n\n修复资料索引`, 'id', '')).toBe(
+      '修复资料索引'
+    );
+    const contaminated = '这是谁 客户端 已将本次附件放入当前工作区： - pasted-screenshot.png';
+    expect(needsHostTitleRepair(contaminated, 'id')).toBe(true);
+    expect(
+      hostArchiveDisplayTitle(
+        '## user · \n\n这是谁\n\n客户端 已将本次附件放入当前工作区：\n- screenshot.png',
+        'id',
+        contaminated
+      )
+    ).toBe('这是谁');
+  });
+
+  it('preserves the owning rollout explicit title, repairs missing titles, and never rewrites the raw archive', async () => {
+    const path = join(root, 'titles.jsonl');
+    for (const [originalTitle, expectedTitle] of [
+      ['手动会话名称', '手动会话名称'],
+      ['Codex 会话 owned', '查找重复照片'],
+      ['', '查找重复照片'],
+    ]) {
+      const raw = [
+        { type: 'session_meta', payload: { id: 'owned', title: originalTitle } },
+        { type: 'session_meta', payload: { id: 'parent', title: '继承的父标题' } },
+        {
+          type: 'response_item',
+          payload: { type: 'message', role: 'user', content: '查找重复照片\n保留原件' },
+        },
+      ]
+        .map((row) => JSON.stringify(row))
+        .join('\n');
+      await writeFile(path, raw);
+      const source = (await readHostRollout(path))!;
+      expect(source.title).toBe(expectedTitle);
+      expect(source.titleProjectionVersion).toBe(1);
+      expect(source.rawContent).toBe(raw);
+    }
+  });
+
+  it('uses real event user requests when canonical replies exist and ignores role-like text inside replies', async () => {
+    const path = join(root, 'event-title.jsonl');
+    const records = [
+      { type: 'session_meta', payload: { id: 'event-title' } },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: '没有明确标题的回复\n\n## user · \n这是回复里的示例',
+        },
+      },
+    ];
+    await writeFile(path, records.map((row) => JSON.stringify(row)).join('\n'));
+    expect((await readHostRollout(path))?.title).toBe('Codex 会话 event-title');
+    await writeFile(
+      path,
+      [
+        ...records,
+        { type: 'event_msg', payload: { type: 'user_message', message: '真实的事件请求' } },
+      ]
+        .map((row) => JSON.stringify(row))
+        .join('\n')
+    );
+    expect((await readHostRollout(path))?.title).toBe('真实的事件请求');
   });
 
   it('allows only canonical attachments under explicitly configured roots and rejects junction escapes', async () => {

@@ -10,6 +10,18 @@ def source(text, format='json', **extra):
 
 
 class LocalOverviewTests(unittest.TestCase):
+    def test_readable_source_headings_keep_internal_ids_only_in_links_and_metadata(self):
+        original = '[{"lat":1,"lng":2}]'
+        sources = [source(original, title='吉林轨迹站点.json'), source('id,value\n1,2\n', 'csv', id='kb_'+'b'*64, title='里程统计.csv')]
+        result = prepare_summary_sources(sources)
+        headings = [line for line in result['deterministic']['overview'].splitlines() if line.startswith('# ')]
+        self.assertEqual(headings, ['# 吉林轨迹站点.json', '# 里程统计.csv'])
+        for item in sources:
+            self.assertNotIn(item['id'], '\n'.join(headings))
+            self.assertIn('/knowledge?entry='+item['id'], result['content'])
+        self.assertEqual(result['segments'][0]['source_context'][0]['id'], sources[0]['id'])
+        self.assertEqual(sources[0]['markdown'], original)
+
     def test_large_keyed_json_is_fully_counted_without_enumerating_every_record(self):
         records = {f'站点{i}': {'lat': i/1000, 'lng': 100+i/1000, 'name': f'名称{i}'} for i in range(8033)}
         records['站点8032']['tailOnly'] = True

@@ -79,7 +79,7 @@ export function KnowledgePage({
   const [query, setQuery] = useState('');
   const [source, setSource] = useState('all');
   const [view, setView] = useState<'notes' | 'sources'>('notes');
-  const [level, setLevel] = useState<'all' | 'summary' | 'knowledge'>('all');
+  const [noteType, setNoteType] = useState<'all' | 'summary' | 'knowledge' | 'overview'>('all');
   const [material, setMaterial] = useState<'all' | 'conversation' | 'document' | 'image' | 'file'>(
     'all'
   );
@@ -152,7 +152,8 @@ export function KnowledgePage({
         ...(view === 'notes'
           ? {
               kind: 'note',
-              ...(level !== 'all' ? { level } : {}),
+              sort: 'curated',
+              ...(noteType !== 'all' ? { noteType } : {}),
               ...(reviewState !== 'all' ? { reviewState } : {}),
             }
           : {
@@ -194,7 +195,18 @@ export function KnowledgePage({
       document.removeEventListener('visibilitychange', onVisible);
       window.removeEventListener('focus', onVisible);
     };
-  }, [query, source, offset, revision, view, level, material, reviewState, topic, includeHistory]);
+  }, [
+    query,
+    source,
+    offset,
+    revision,
+    view,
+    noteType,
+    material,
+    reviewState,
+    topic,
+    includeHistory,
+  ]);
 
   useEffect(() => {
     if (!selectedId) return;
@@ -447,19 +459,27 @@ export function KnowledgePage({
     setView(value);
     setOffset(0);
     setResult(null);
+    if (
+      value === 'notes' &&
+      overview?.noteTopics &&
+      topic !== 'all' &&
+      !overview.noteTopics.some((item) => item.topic === topic)
+    ) {
+      setTopic('all');
+    }
   };
   const hasActiveFilters = Boolean(
     query ||
       source !== 'all' ||
       topic !== 'all' ||
-      (view === 'notes' ? level !== 'all' || reviewState !== 'all' : material !== 'all')
+      (view === 'notes' ? noteType !== 'all' || reviewState !== 'all' : material !== 'all')
   );
   const clearFilters = () => {
     setSearch('');
     setQuery('');
     setSource('all');
     setTopic('all');
-    setLevel('all');
+    setNoteType('all');
     setMaterial('all');
     setReviewState('all');
     setIncludeHistory(false);
@@ -509,7 +529,7 @@ export function KnowledgePage({
       setResult(null);
       setSource('all');
       setTopic('all');
-      setLevel('all');
+      setNoteType('all');
       setReviewState('all');
       setSearch('');
       setQuery('');
@@ -522,7 +542,9 @@ export function KnowledgePage({
         setDetail(saved);
         setTitle(saved.entry.title);
         setMarkdown(saved.markdown);
-        setOrganization(entryOrganization(saved.entry));
+        // This newly created template is authored by the person editing it.
+        // Confirm it only when they save; automatic drafts keep their review state.
+        setOrganization({ ...entryOrganization(saved.entry), state: 'reviewed' });
         setEditing(true);
       } else {
         openEntry(saved.entry.id);
@@ -619,6 +641,30 @@ export function KnowledgePage({
               },
             ]}
           />
+          {view === 'notes' && (
+            <Flex wrap gap={token.marginXS} role="group" aria-label="笔记分类">
+              {[
+                { value: 'all', label: '全部笔记' },
+                { value: 'knowledge', label: '专题知识' },
+                { value: 'summary', label: '摘要' },
+                { value: 'overview', label: '资料概览' },
+              ].map((item) => (
+                <Button
+                  key={item.value}
+                  size="small"
+                  type={noteType === item.value ? 'primary' : 'default'}
+                  aria-pressed={noteType === item.value}
+                  onClick={() => {
+                    setNoteType(item.value as typeof noteType);
+                    setOffset(0);
+                  }}
+                  style={{ flex: mobile ? '1 1 calc(50% - 4px)' : undefined }}
+                >
+                  {item.label}
+                </Button>
+              ))}
+            </Flex>
+          )}
           <Flex wrap gap={token.marginSM}>
             <Input
               value={search}
@@ -641,7 +687,11 @@ export function KnowledgePage({
               optionFilterProp="label"
               options={[
                 { value: 'all', label: '全部主题' },
-                ...(overview?.topics ?? []).map((item) => ({
+                ...(
+                  (view === 'notes' ? overview?.noteTopics : undefined) ??
+                  overview?.topics ??
+                  []
+                ).map((item) => ({
                   value: item.topic,
                   label: `${item.topic} (${item.count})`,
                 })),
@@ -661,36 +711,20 @@ export function KnowledgePage({
               ]}
             />
             {view === 'notes' ? (
-              <>
-                <Select
-                  aria-label="知识层级"
-                  value={level}
-                  onChange={(value) => {
-                    setLevel(value);
-                    setOffset(0);
-                  }}
-                  style={filterStyle}
-                  options={[
-                    { value: 'all', label: '全部笔记' },
-                    { value: 'summary', label: '摘要' },
-                    { value: 'knowledge', label: '专题知识' },
-                  ]}
-                />
-                <Select
-                  aria-label="审阅状态"
-                  value={reviewState}
-                  onChange={(value) => {
-                    setReviewState(value);
-                    setOffset(0);
-                  }}
-                  style={filterStyle}
-                  options={[
-                    { value: 'all', label: '全部状态' },
-                    { value: 'draft', label: '待审阅' },
-                    { value: 'reviewed', label: '已确认' },
-                  ]}
-                />
-              </>
+              <Select
+                aria-label="审阅状态"
+                value={reviewState}
+                onChange={(value) => {
+                  setReviewState(value);
+                  setOffset(0);
+                }}
+                style={filterStyle}
+                options={[
+                  { value: 'all', label: '全部状态' },
+                  { value: 'draft', label: '待审阅' },
+                  { value: 'reviewed', label: '已确认' },
+                ]}
+              />
             ) : (
               <Select
                 aria-label="资料类型"
@@ -862,7 +896,8 @@ export function KnowledgePage({
                             <Tag>{metadata.topic}</Tag>
                             <Typography.Text type="secondary">
                               {entry.kind === 'note'
-                                ? entry.summaryMode === 'structured_overview'
+                                ? metadata.level !== 'knowledge' &&
+                                  entry.summaryMode === 'structured_overview'
                                   ? '资料概览'
                                   : LEVEL_LABELS[metadata.level]
                                 : MATERIAL_LABELS[entry.materialType ?? entry.kind]}

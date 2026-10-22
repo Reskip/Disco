@@ -21,6 +21,7 @@ vi.mock('antd', async (importOriginal) => {
       target,
       style,
       'aria-label': label,
+      'aria-pressed': pressed,
     }: ButtonProps) =>
       href ? (
         <a href={href} target={target} style={style} aria-label={label}>
@@ -33,6 +34,7 @@ vi.mock('antd', async (importOriginal) => {
           onClick={onClick}
           style={style}
           aria-label={label}
+          aria-pressed={pressed}
         >
           {children}
         </button>
@@ -334,9 +336,10 @@ describe('knowledge library management', () => {
     await waitFor(() =>
       expect(knowledgeApi.catalog).toHaveBeenLastCalledWith('', 'all', 0, expect.any(AbortSignal), {
         kind: 'note',
+        sort: 'curated',
       })
     );
-    expect(screen.getByRole('combobox', { name: '知识层级' })).toBeInTheDocument();
+    expect(screen.getByRole('group', { name: '笔记分类' })).toBeInTheDocument();
     expect(screen.queryByRole('combobox', { name: '资料类型' })).not.toBeInTheDocument();
     fireEvent.click(await screen.findByRole('button', { name: '查看原始资料' }));
     await waitFor(() =>
@@ -345,7 +348,7 @@ describe('knowledge library management', () => {
         includeHistory: false,
       })
     );
-    expect(screen.queryByRole('combobox', { name: '知识层级' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('group', { name: '笔记分类' })).not.toBeInTheDocument();
     fireEvent.mouseDown(screen.getByRole('combobox', { name: '资料类型' }));
     fireEvent.click(
       await screen.findByText('图片', { selector: '.ant-select-item-option-content' })
@@ -366,6 +369,71 @@ describe('knowledge library management', () => {
       })
     );
     expect(knowledgeApi.detail).not.toHaveBeenCalled();
+  });
+
+  it('filters note categories on the server, resets pagination and retains selected sources', async () => {
+    vi.mocked(knowledgeApi.catalog).mockResolvedValue({ ...CATALOG, total: 21 });
+    renderPage();
+    fireEvent.click(await screen.findByRole('checkbox', { name: '选择 产品讨论' }));
+    fireEvent.click(screen.getByTitle('2'));
+    await waitFor(() =>
+      expect(knowledgeApi.catalog).toHaveBeenLastCalledWith(
+        '',
+        'all',
+        20,
+        expect.any(AbortSignal),
+        { kind: 'note', sort: 'curated' }
+      )
+    );
+    for (const [label, noteType] of [
+      ['专题知识', 'knowledge'],
+      ['摘要', 'summary'],
+      ['资料概览', 'overview'],
+    ]) {
+      fireEvent.click(screen.getByRole('button', { name: label, exact: true }));
+      await waitFor(() =>
+        expect(knowledgeApi.catalog).toHaveBeenLastCalledWith(
+          '',
+          'all',
+          0,
+          expect.any(AbortSignal),
+          { kind: 'note', sort: 'curated', noteType }
+        )
+      );
+      expect(screen.getByText('已选 1 份')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: label, exact: true })).toHaveAttribute(
+        'aria-pressed',
+        'true'
+      );
+    }
+    fireEvent.click(screen.getByRole('button', { name: '全部笔记', exact: true }));
+    await waitFor(() =>
+      expect(knowledgeApi.catalog).toHaveBeenLastCalledWith('', 'all', 0, expect.any(AbortSignal), {
+        kind: 'note',
+        sort: 'curated',
+      })
+    );
+  });
+
+  it('offers note topics without raw-archive-only categories in the note view', async () => {
+    vi.mocked(knowledgeApi.catalog).mockResolvedValue({
+      ...CATALOG,
+      overview: {
+        ...CATALOG.overview,
+        topics: [
+          { topic: '未分类原件', count: 100 },
+          { topic: '产品设计', count: 2 },
+        ],
+        noteTopics: [{ topic: '产品设计', count: 2 }],
+      },
+    });
+    renderPage();
+    await screen.findByRole('button', { name: '产品讨论' });
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: '知识主题' }));
+    expect(
+      await screen.findByText('产品设计 (2)', { selector: '.ant-select-item-option-content' })
+    ).toBeInTheDocument();
+    expect(screen.queryByText('未分类原件 (100)')).not.toBeInTheDocument();
   });
 
   it('shows matching content during search instead of hiding it behind a general summary', async () => {
@@ -467,6 +535,13 @@ describe('knowledge library management', () => {
       total: 21,
     }));
     vi.mocked(knowledgeApi.organize).mockResolvedValue(manual);
+    vi.mocked(knowledgeApi.save).mockResolvedValue({
+      ...manual,
+      entry: {
+        ...manual.entry,
+        organization: { ...manual.entry.organization!, state: 'reviewed' },
+      },
+    });
     renderPage();
     fireEvent.click(await screen.findByRole('checkbox', { name: '选择 产品讨论' }));
     fireEvent.click(screen.getByTitle('2'));
@@ -496,6 +571,18 @@ describe('knowledge library management', () => {
     expect(screen.getByText('来源在新页面打开，当前编辑内容会保留。')).toBeInTheDocument();
     expect(knowledgeApi.detail).not.toHaveBeenCalled();
     expect(knowledgeApi.downloadAttachment).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: '保存', exact: true }));
+    await waitFor(() =>
+      expect(knowledgeApi.save).toHaveBeenCalledWith(
+        'note-manual',
+        '产品结论',
+        manual.markdown,
+        manual.entry.updatedAt,
+        expect.objectContaining({ state: 'reviewed', sourceEntryIds: ['entry-a', 'entry-b'] })
+      )
+    );
+    expect(await screen.findByText('已由人工编辑，自动总结不会覆盖。')).toBeInTheDocument();
+    expect(within(screen.getByRole('dialog')).getByText('已确认')).toBeInTheDocument();
   });
 
   it('shows every selected source and removes a source from the actual organization request', async () => {
@@ -594,10 +681,29 @@ describe('knowledge library management', () => {
     vi.mocked(knowledgeApi.catalog).mockResolvedValue({ ...CATALOG, entries: [overview.entry] });
     vi.mocked(knowledgeApi.detail).mockResolvedValue(overview);
     renderPage();
-    expect(await screen.findByText('资料概览')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: '产品讨论' }));
+    fireEvent.click(await screen.findByRole('button', { name: '产品讨论' }));
     expect(await screen.findByText(overview.markdown)).toBeInTheDocument();
     expect(within(screen.getByRole('dialog')).getByText('资料概览')).toBeInTheDocument();
+  });
+
+  it('shows an overview promoted by its author as topic knowledge', async () => {
+    const promoted: KnowledgeEntryDetail = {
+      ...DETAIL,
+      entry: {
+        ...DETAIL.entry,
+        kind: 'note',
+        summaryMode: 'structured_overview',
+        humanEdited: true,
+        organization: { topic: '数据资料', level: 'knowledge', state: 'reviewed' },
+      },
+      markdown: '作者补充的跨资料结论。',
+    };
+    vi.mocked(knowledgeApi.detail).mockResolvedValue(promoted);
+    renderPage('entry-a');
+    await screen.findByText(promoted.markdown);
+    const drawer = within(screen.getByRole('dialog'));
+    expect(drawer.getByText('专题知识')).toBeInTheDocument();
+    expect(drawer.queryByText('资料概览')).not.toBeInTheDocument();
   });
 
   it('updates an active source summary phase and stops polling once source processing completes', async () => {
@@ -745,6 +851,19 @@ describe('knowledge library management', () => {
     expect(await screen.findByRole('heading', { name: '已确认的设计方向' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '确认并人工维护' })).toBeInTheDocument();
     expect(screen.queryByRole('textbox', { name: 'Markdown 正文' })).not.toBeInTheDocument();
+    vi.mocked(knowledgeApi.save).mockResolvedValue(completed);
+    fireEvent.click(screen.getByRole('button', { name: '编辑', exact: true }));
+    await screen.findByRole('textbox', { name: 'Markdown 正文' });
+    fireEvent.click(screen.getByRole('button', { name: '保存', exact: true }));
+    await waitFor(() =>
+      expect(knowledgeApi.save).toHaveBeenCalledWith(
+        'automatic-note',
+        '设计结论',
+        completed.markdown,
+        completed.entry.updatedAt,
+        expect.objectContaining({ state: 'draft' })
+      )
+    );
   });
 
   it('shows independent failures and confirms a generated note without changing its source links', async () => {

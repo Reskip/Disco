@@ -103,7 +103,14 @@ async function exportLibrary(): Promise<void> {
 
 type CatalogFilters = Pick<
   KnowledgeListOptions,
-  'kind' | 'materialType' | 'level' | 'topic' | 'reviewState' | 'includeHistory'
+  | 'kind'
+  | 'materialType'
+  | 'level'
+  | 'topic'
+  | 'reviewState'
+  | 'includeHistory'
+  | 'noteType'
+  | 'sort'
 >;
 
 function listParams(query: string, source: string, offset: number, filters?: CatalogFilters) {

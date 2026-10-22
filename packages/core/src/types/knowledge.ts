@@ -9,6 +9,7 @@ export type KnowledgeKind = 'conversation' | 'document' | 'note';
 export type KnowledgeIndexStatus = 'pending' | 'indexed' | 'error';
 export type KnowledgeParseStatus = 'pending' | 'parsed' | 'unsupported' | 'error';
 export type KnowledgeMaterialType = 'conversation' | 'image' | 'document' | 'file' | 'note';
+export type KnowledgeNoteType = 'knowledge' | 'summary' | 'overview';
 export interface KnowledgeOrganization {
   topic: string;
   summary?: string;
@@ -96,6 +97,7 @@ export interface KnowledgeEntry {
   derivedFrom?: { entryId: string; contentHash: string };
   summaryContentHash?: string;
   sourceVersion?: KnowledgeSourceVersion;
+  titleProjectionVersion?: number;
   parseStatus?: KnowledgeParseStatus;
   parseMessage?: string;
   parseAttempts?: number;
@@ -129,6 +131,7 @@ export interface KnowledgeSourceInput {
   attachments?: KnowledgeAttachment[];
   derivedFrom?: { entryId: string; contentHash: string };
   sourceVersion?: KnowledgeSourceVersion;
+  titleProjectionVersion?: number;
   organization?: KnowledgeOrganization;
   generation?: KnowledgeGeneration;
   summaryMode?: 'structured_overview' | 'model';
@@ -147,6 +150,8 @@ export interface KnowledgeListOptions {
   topic?: string;
   reviewState?: KnowledgeOrganization['state'];
   includeHistory?: boolean;
+  noteType?: KnowledgeNoteType;
+  sort?: 'updated' | 'curated';
   offset?: number;
   limit?: number;
 }
@@ -163,6 +168,7 @@ export interface KnowledgeCatalogResult extends KnowledgeListResult {
 
 export interface KnowledgeOverview {
   topics: Array<{ topic: string; count: number }>;
+  noteTopics?: Array<{ topic: string; count: number }>;
   counts: Record<KnowledgeOrganization['level'], number>;
   materials: Record<KnowledgeMaterialType, number>;
 }

@@ -73,6 +73,25 @@ describe('knowledge HTTP client', () => {
     expect(authenticatedFetch).toHaveBeenCalledTimes(1);
   });
 
+  it('requests a complete note category and curated ordering from the backend', async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValue(new Response('{}', { status: 200 }));
+    await knowledgeApi.catalog('', 'all', 20, undefined, {
+      kind: 'note',
+      noteType: 'overview',
+      sort: 'curated',
+    });
+    const url = new URL(vi.mocked(authenticatedFetch).mock.calls[0][0] as string);
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      query: '',
+      offset: '20',
+      limit: '20',
+      kind: 'note',
+      noteType: 'overview',
+      sort: 'curated',
+    });
+    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+  });
+
   it('pins subsequent reading segments to their content version and leaves edit reads complete', async () => {
     vi.mocked(authenticatedFetch).mockImplementation(
       async () => new Response('{}', { status: 200 })

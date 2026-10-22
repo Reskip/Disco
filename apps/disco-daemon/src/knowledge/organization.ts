@@ -2,6 +2,7 @@ import { extname } from 'node:path';
 import type {
   KnowledgeEntry,
   KnowledgeMaterialType,
+  KnowledgeNoteType,
   KnowledgeOrganization,
 } from '@disco/core/types';
 
@@ -60,6 +61,12 @@ export function canSummarize(entry: KnowledgeEntry): boolean {
     !entry.sourceId.includes(':variant:') &&
     (entry.kind === 'conversation' || entry.parseStatus === 'parsed')
   );
+}
+
+export function noteType(entry: KnowledgeEntry): KnowledgeNoteType | undefined {
+  if (entry.kind !== 'note') return undefined;
+  if (organization(entry).level === 'knowledge') return 'knowledge';
+  return entry.summaryMode === 'structured_overview' ? 'overview' : 'summary';
 }
 
 export function retryDate(attempts: number, minimumMs = 0): string {

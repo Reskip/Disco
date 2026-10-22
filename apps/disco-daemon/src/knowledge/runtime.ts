@@ -65,9 +65,11 @@ import {
   type HostAttachmentReference,
   type HostAttachmentResolution,
   type HostRolloutSource,
+  hostArchiveDisplayTitle,
   hostAttachmentProvenance,
   hostRolloutFiles,
   hostRolloutIdentity,
+  needsHostTitleRepair,
   readHostRollout,
   resolveHostAttachment,
 } from './sources.js';
@@ -530,6 +532,37 @@ export class KnowledgeRuntime {
             entry,
           ])
         );
+        for (const entry of existing.values()) {
+          if (this.stopped) break;
+          if (
+            entry.source !== 'codex' ||
+            entry.kind !== 'conversation' ||
+            entry.historical ||
+            entry.humanEdited ||
+            (entry.titleProjectionVersion ?? 0) >= 1 ||
+            !needsHostTitleRepair(entry.title, entry.sourceId)
+          )
+            continue;
+          const detail = await this.library.get(owner, entry.id);
+          if (!detail) continue;
+          const title = hostArchiveDisplayTitle(
+            detail.markdown,
+            entry.sourceId,
+            detail.entry.title
+          );
+          if (
+            await this.library.repairImportedTitle(
+              owner,
+              entry.id,
+              detail.contentHash,
+              detail.entry.title,
+              title
+            )
+          ) {
+            entry.title = title ?? entry.title;
+            entry.titleProjectionVersion = 1;
+          }
+        }
         await this.importDisco(owner, existing, state);
         if (this.settings.host && ownerKey(this.settings.host) === ownerKey(owner)) {
           await this.importHost(owner, this.settings.host, existing, state);

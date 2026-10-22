@@ -366,7 +366,8 @@ export function KnowledgeEntryDrawer({
                 <Space wrap>
                   <Tag>{metadata.topic}</Tag>
                   <Tag>
-                    {detail.entry.summaryMode === 'structured_overview'
+                    {metadata.level !== 'knowledge' &&
+                    detail.entry.summaryMode === 'structured_overview'
                       ? '资料概览'
                       : LEVEL_LABELS[metadata.level]}
                   </Tag>

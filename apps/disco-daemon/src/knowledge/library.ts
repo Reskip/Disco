@@ -28,7 +28,7 @@ import type {
   KnowledgeSourceInput,
   KnowledgeSummaryProgress,
 } from '@disco/core/types';
-import { canSummarize, materialType, organization, retryDate } from './organization.js';
+import { canSummarize, materialType, noteType, organization, retryDate } from './organization.js';
 import { searchTerms } from './search.js';
 import type { HostAttachmentReference } from './sources.js';
 
@@ -666,6 +666,8 @@ export class KnowledgeLibrary {
         entry.sourceUrl === input.sourceUrl &&
         JSON.stringify(entry.derivedFrom) === JSON.stringify(derivedFrom) &&
         JSON.stringify(entry.sourceVersion) === JSON.stringify(sourceVersion) &&
+        (input.titleProjectionVersion === undefined ||
+          entry.titleProjectionVersion === input.titleProjectionVersion) &&
         JSON.stringify(entry.organization) === JSON.stringify(grouping) &&
         JSON.stringify(entry.generation) === JSON.stringify(input.generation ?? entry.generation) &&
         JSON.stringify(attachments) === JSON.stringify(entry.attachments ?? [])
@@ -707,6 +709,7 @@ export class KnowledgeLibrary {
         summaryContentHash: entry?.summaryContentHash,
         summaryMode: input.summaryMode ?? entry?.summaryMode,
         sourceVersion,
+        titleProjectionVersion: input.titleProjectionVersion ?? entry?.titleProjectionVersion,
         parseStatus: entry?.parseStatus,
         parseMessage: entry?.parseMessage,
         parseAttempts: entry?.parseAttempts,
@@ -836,6 +839,7 @@ export class KnowledgeLibrary {
       if (entry.historical && !options.includeHistory) continue;
       if (
         (options.kind && entry.kind !== options.kind) ||
+        (options.noteType && noteType(entry) !== options.noteType) ||
         (options.source && entry.source !== options.source) ||
         (options.materialType && materialType(entry) !== options.materialType) ||
         (options.level && organization(entry).level !== options.level) ||
@@ -878,6 +882,10 @@ export class KnowledgeLibrary {
     results.sort(
       (a, b) =>
         (relevance.get(b.id) ?? 0) - (relevance.get(a.id) ?? 0) ||
+        (options.sort === 'curated'
+          ? Number(b.humanEdited) - Number(a.humanEdited) ||
+            Number(noteType(b) === 'knowledge') - Number(noteType(a) === 'knowledge')
+          : 0) ||
         b.updatedAt.localeCompare(a.updatedAt) ||
         a.id.localeCompare(b.id)
     );
@@ -972,14 +980,20 @@ export class KnowledgeLibrary {
       materials: { conversation: 0, document: 0, image: 0, file: 0, note: 0 },
     };
     const topics = new Map<string, number>();
+    const noteTopics = new Map<string, number>();
     for (const entry of entries) {
       if (entry.historical) continue;
       const group = organization(entry);
       result.counts[group.level]++;
       result.materials[materialType(entry)]++;
       topics.set(group.topic, (topics.get(group.topic) ?? 0) + 1);
+      if (entry.kind === 'note')
+        noteTopics.set(group.topic, (noteTopics.get(group.topic) ?? 0) + 1);
     }
     result.topics = [...topics]
+      .map(([topic, count]) => ({ topic, count }))
+      .sort((a, b) => b.count - a.count || a.topic.localeCompare(b.topic));
+    result.noteTopics = [...noteTopics]
       .map(([topic, count]) => ({ topic, count }))
       .sort((a, b) => b.count - a.count || a.topic.localeCompare(b.topic));
     return result;
@@ -995,6 +1009,35 @@ export class KnowledgeLibrary {
       const entry = await this.metadata(base, id);
       if (!entry || !(await this.refreshEntry(base, entry)) || entry.humanEdited) return false;
       entry.generation = generation;
+      await this.save(base, entry);
+      return true;
+    });
+  }
+
+  async repairImportedTitle(
+    owner: KnowledgeOwner,
+    id: string,
+    expectedHash: string,
+    previousTitle: string,
+    title?: string
+  ): Promise<boolean> {
+    return this.exclusive(owner, async (base) => {
+      if ((await this.deletedEntries(base)).some((item) => item.id === id)) return false;
+      const entry = await this.metadata(base, id);
+      if (
+        !entry ||
+        !(await this.refreshEntry(base, entry)) ||
+        entry.humanEdited ||
+        entry.historical ||
+        entry.source !== 'codex' ||
+        entry.kind !== 'conversation' ||
+        entry.contentHash !== expectedHash ||
+        entry.title !== previousTitle ||
+        (entry.titleProjectionVersion ?? 0) >= 1
+      )
+        return false;
+      if (title?.trim()) entry.title = title.trim().slice(0, 100);
+      entry.titleProjectionVersion = 1;
       await this.save(base, entry);
       return true;
     });

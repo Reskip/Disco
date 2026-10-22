@@ -6,9 +6,11 @@ import {
   conversationText,
   type HostAttachmentReference,
   type HostRolloutSource,
+  hostAssistantTitle,
   hostAttachmentProvenance,
   hostConversationTitle,
   hostVisibleMessage,
+  needsHostTitleRepair,
 } from './sources';
 
 type SqlRow = Record<string, SQLOutputValue>;
@@ -286,16 +288,18 @@ export async function exportHostSqliteThread(
       }
     };
     const cwd = String(metadata.cwd);
-    const title = hostConversationTitle(String(metadata.title)) || `Codex 会话 ${id}`;
+    const originalTitle = String(metadata.title ?? '');
     const sourceUpdatedAt = iso(metadata.updated) ?? new Date(0).toISOString();
     await append(
-      `${JSON.stringify({ type: 'session_meta', timestamp: sourceUpdatedAt, payload: { id, title, cwd, archived: Boolean(metadata.archived), sourceRemoved: Boolean(metadata.sourceRemoved), historySource: 'codex-sqlite' } })}\n`
+      `${JSON.stringify({ type: 'session_meta', timestamp: sourceUpdatedAt, payload: { id, title: originalTitle, cwd, archived: Boolean(metadata.archived), sourceRemoved: Boolean(metadata.sourceRemoved), historySource: 'codex-sqlite' } })}\n`
     );
     for (const row of db.history
       .prepare('SELECT * FROM thread_turns WHERE thread_id = ? ORDER BY rollout_ordinal, turn_id')
       .iterate(id))
       await append(`${JSON.stringify({ type: 'thread_turn', payload: row })}\n`);
     const messages: string[] = [];
+    let userTitle = '';
+    let assistantTitle: string | undefined;
     const references: HostAttachmentReference[] = [];
     let firstEventAt: string | undefined;
     let lastEventAt: string | undefined;
@@ -330,6 +334,8 @@ export async function exportHostSqliteThread(
       const text = hostVisibleMessage(
         role === 'assistant' ? String(payload.text ?? '') : conversationText(payload.content)
       );
+      if (role === 'user' && !userTitle) userTitle = hostConversationTitle(text);
+      if (role === 'assistant' && !assistantTitle) assistantTitle = hostAssistantTitle(text, id);
       if (text) messages.push(`## ${role} · ${timestamp ?? ''}\n\n${text}`);
       const content = role === 'assistant' ? [{ type: 'output_text', text }] : payload.content;
       const line = JSON.stringify({
@@ -385,15 +391,22 @@ export async function exportHostSqliteThread(
     await file.close();
     file = undefined;
     const sha256 = hash.digest('hex');
+    const transcript = messages.join('\n\n');
+    const title = !needsHostTitleRepair(originalTitle, id)
+      ? originalTitle
+      : userTitle ||
+        assistantTitle ||
+        `${metadata.sourceRemoved ? '恢复归档 ·' : 'Codex 会话'} ${id}`;
     return {
       source: {
         source: 'codex',
         sourceId: id,
         title,
+        titleProjectionVersion: 1,
         kind: 'conversation',
         sourceUrl: `codex://threads/${id}`,
         sourceUpdatedAt,
-        markdown: `# ${title}\n\n来源：Codex 会话 ${id}${metadata.sourceRemoved ? '（来源会话已移除，保留恢复归档）' : metadata.archived ? '（已归档）' : ''}\n\n${messages.length ? messages.join('\n\n') : '该会话暂无可整理的用户或助手消息。完整原始记录仍保留在资料库中。'}`,
+        markdown: `# ${title}\n\n来源：Codex 会话 ${id}${metadata.sourceRemoved ? '（来源会话已移除，保留恢复归档）' : metadata.archived ? '（已归档）' : ''}\n\n${transcript || '该会话暂无可整理的用户或助手消息。完整原始记录仍保留在资料库中。'}`,
         sourceVersion: {
           kind: 'codex-sqlite',
           sha256,

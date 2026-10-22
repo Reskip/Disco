@@ -13,7 +13,7 @@ import json
 import math
 import re
 
-OVERVIEW_VERSION = "structured-overview-v1"
+OVERVIEW_VERSION = "structured-overview-v2"
 DETAIL_FIELDS = 80
 NARRATIVE_KEYS = {"text", "content", "body", "markdown", "description", "notes", "note", "summary", "abstract", "question", "answer", "message", "prompt", "preference", "preferences", "preferred", "decision", "reason", "instructions", "lesson", "comment", "commentary", "transcript", "explanation", "rule", "rules", "policy", "purpose", "rationale", "definition", "requirement", "requirements", "recommendation", "recommendations", "remarks"}
 NARRATIVE_CHINESE = re.compile("描述|备注|说明|原因|偏好|决定|结论|经验|内容|回答|问题|要求|背景|报告|约束|规则|策略|定义|建议|目的|依据")
@@ -41,7 +41,7 @@ def document_body(markdown):
 
 def source_section(source, body):
     title = md(source["title"])
-    return f"# 来源 {source['id']}：{title}\n\n来源：[{title}](/knowledge?entry={source['id']})\n\n{body}"
+    return f"# {title or '未命名资料'}\n\n来源：[{title or '原始资料'}](/knowledge?entry={source['id']})\n\n{body}"
 
 
 def field_table(stats, total):

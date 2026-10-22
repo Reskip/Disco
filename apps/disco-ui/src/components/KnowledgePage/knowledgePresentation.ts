@@ -67,6 +67,26 @@ export function formatDate(value: string): string {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN');
 }
 
+export function hasSummaryFailure(entry: KnowledgeEntry): boolean {
+  return entry.kind === 'note'
+    ? entry.generation?.state === 'failed'
+    : !entry.summaryDisposition && Boolean(entry.summaryMessage);
+}
+
+export const PROCESSING_LABELS = {
+  index_error: '索引失败',
+  parse_error: '正文解析失败',
+  metadata_only: '仅文件信息可检索',
+  summary_error: '整理失败',
+};
+
+export const PROCESSING_DESCRIPTIONS = {
+  index_error: '原始内容仍可阅读和下载，后台会自动重试建立索引。',
+  parse_error: '原件已保留。打开资料可查看解析失败原因，仍可下载原件或人工整理。',
+  metadata_only: '这些原件目前只可按文件信息检索，尚未识别正文或图片内容。原件仍可下载。',
+  summary_error: '自动整理尚未成功，后台会重试。也可以选择资料，人工整理成笔记。',
+};
+
 export function formatSummaryProgress(progress?: KnowledgeSummaryProgress): string | undefined {
   if (!progress) return undefined;
   const total = Math.max(0, Math.floor(progress.total));

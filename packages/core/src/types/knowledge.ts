@@ -10,6 +10,11 @@ export type KnowledgeIndexStatus = 'pending' | 'indexed' | 'error';
 export type KnowledgeParseStatus = 'pending' | 'parsed' | 'unsupported' | 'error';
 export type KnowledgeMaterialType = 'conversation' | 'image' | 'document' | 'file' | 'note';
 export type KnowledgeNoteType = 'knowledge' | 'summary' | 'overview';
+export type KnowledgeProcessingFilter =
+  | 'index_error'
+  | 'parse_error'
+  | 'metadata_only'
+  | 'summary_error';
 export interface KnowledgeOrganization {
   topic: string;
   summary?: string;
@@ -88,6 +93,8 @@ export interface KnowledgeEntry {
   summaryReason?: string;
   /** Distinguishes a locally computed file inventory from model-based synthesis. */
   summaryMode?: 'structured_overview' | 'model';
+  /** Local overview renderer/classifier version; old automatic drafts can be rebuilt. */
+  summaryFormatVersion?: number;
   /** Superseded import copies remain readable/exportable, outside the normal catalog. */
   historical?: boolean;
   sourceUpdatedAt?: string;
@@ -135,6 +142,7 @@ export interface KnowledgeSourceInput {
   organization?: KnowledgeOrganization;
   generation?: KnowledgeGeneration;
   summaryMode?: 'structured_overview' | 'model';
+  summaryFormatVersion?: number;
   /** Server-only: automatic drafts remain writable until a human edits them. */
   automated?: boolean;
   /** Server-only commit guard for summaries generated from these exact source versions. */
@@ -151,6 +159,7 @@ export interface KnowledgeListOptions {
   reviewState?: KnowledgeOrganization['state'];
   includeHistory?: boolean;
   noteType?: KnowledgeNoteType;
+  processing?: KnowledgeProcessingFilter;
   sort?: 'updated' | 'curated';
   offset?: number;
   limit?: number;
@@ -171,6 +180,15 @@ export interface KnowledgeOverview {
   noteTopics?: Array<{ topic: string; count: number }>;
   counts: Record<KnowledgeOrganization['level'], number>;
   materials: Record<KnowledgeMaterialType, number>;
+  issues?: {
+    sources: {
+      indexErrors: number;
+      parseErrors: number;
+      metadataOnly: number;
+      summaryErrors: number;
+    };
+    notes: { indexErrors: number; summaryErrors: number };
+  };
 }
 
 export interface KnowledgeLibraryStatus {

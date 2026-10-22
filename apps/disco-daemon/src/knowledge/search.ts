@@ -1,4 +1,5 @@
 import type { KnowledgeEntry, KnowledgeEntryDetail } from '@disco/core/types';
+import { needsHostTitleRepair } from './sources.js';
 
 const stopWords = new Set([
   '什么',
@@ -39,7 +40,7 @@ interface Terms {
 function* tokens(text: string): Generator<string> {
   for (const match of text
     .toLocaleLowerCase()
-    .matchAll(/\p{Script=Han}+|[a-z0-9]+(?:[_.:/-][a-z0-9]+)*/gu)) {
+    .matchAll(/\p{Script=Han}+|[a-z0-9_$]+(?:[_.:/\\-]+[a-z0-9_$]+)*/gu)) {
     const token = match[0];
     if (/^\p{Script=Han}/u.test(token)) {
       let previous = '';
@@ -53,7 +54,8 @@ function* tokens(text: string): Generator<string> {
       if (count > 2 && count <= 12) yield token;
     } else {
       yield token;
-      for (const part of token.split(/[_.:/-]+/)) if (part.length > 1 && part !== token) yield part;
+      for (const part of token.split(/[_.:/\\-]+/))
+        if (part.length > 1 && part !== token) yield part;
     }
   }
 }
@@ -85,21 +87,81 @@ export function searchTerms(query: string): string[] {
   const normalized = query.trim().toLocaleLowerCase();
   // A lone technical identifier is an exact lookup; common underscore or path
   // components must not manufacture unrelated keyword matches.
-  if (/^[a-z0-9]+(?:[_.:/-]+[a-z0-9]+)+$/.test(normalized)) return [normalized];
-  return [...terms(normalized).counts.keys()].filter(
-    (term) => !stopWords.has(term) && (term.length > 1 || normalized.length === 1)
+  if (/^[a-z0-9]+(?:[_.:/-]+[a-z0-9]+)+$/.test(normalized) && isExactLookup(query))
+    return [normalized];
+  const anchors = technicalAnchors(query);
+  return [...new Set([...terms(normalized).counts.keys(), ...anchors])].filter((term) => {
+    if (stopWords.has(term) || (term.length <= 1 && normalized.length !== 1)) return false;
+    // Components of an explicit symbol are not independent evidence for it.
+    return !anchors.some((anchor) => anchor !== term && anchor.includes(term));
+  });
+}
+
+/** Strong code evidence only: ordinary brands, acronyms and model numbers stay semantic. */
+export function technicalAnchors(query: string): string[] {
+  const result = new Set<string>();
+  for (const match of query.matchAll(/[a-zA-Z_$][a-zA-Z0-9_$]*(?:[_.:/\\-]+[a-zA-Z0-9_$]+)*/g)) {
+    const token = match[0];
+    const error =
+      /[a-zA-Z0-9_$]+(?:Error|Exception)$/.test(token) ||
+      /^[a-z_$][a-z0-9_$]{2,}(?:error|exception)$/i.test(token);
+    const symbol = /^[a-zA-Z_$][a-zA-Z0-9_$]*_[a-zA-Z0-9_$]+$/.test(token);
+    const module = /^[a-z][a-z0-9_-]*:[a-z0-9_./-]+$/i.test(token) && !/^https?:/i.test(token);
+    const file =
+      /\.(?:[cm]?[jt]sx?|py|rs|go|java|sql|json|toml|ya?ml|csv|tsx?|md|log|sh|ps1)$/i.test(token);
+    const path =
+      !/^https?:/i.test(token) &&
+      (/\\/.test(token) ||
+        (/\//.test(token) &&
+          (file ||
+            /(?:路径|目录|文件|\bpath\b|\bdirectory\b)/i.test(query) ||
+            /^(?:src|apps|packages|scripts|node_modules|dist|data|etc|usr|var)\//i.test(token))));
+    const namedFunction =
+      /[a-z][A-Z]/.test(token) && /(?:函数|方法|字段|变量|参数|调用|类名)/.test(query);
+    if (error || symbol || module || path || file || namedFunction) result.add(token.toLowerCase());
+  }
+  return [...result];
+}
+
+const literal = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const anchorPattern = (anchor: string) =>
+  new RegExp(`(?<![a-z0-9_$])${literal(anchor)}(?![a-z0-9_$])`, 'giu');
+
+/** Multiple symbols can be compared across separate sources; never require their intersection. */
+export function hasTechnicalEvidence(text: string, query: string): boolean {
+  const anchors = technicalAnchors(query);
+  return !anchors.length || anchors.some((anchor) => anchorPattern(anchor).test(text));
+}
+
+/** Mask only a proven generated archive header; offsets and original bytes remain untouched. */
+export function searchableBody(detail: KnowledgeEntryDetail): string {
+  const { entry, markdown } = detail;
+  if (
+    entry.humanEdited ||
+    entry.kind !== 'conversation' ||
+    !['codex', 'disco'].includes(entry.source)
+  )
+    return markdown;
+  const provider = entry.source === 'codex' ? 'Codex' : 'Disco';
+  const sourceId = entry.sourceId.split(':variant:')[0]!;
+  const header = new RegExp(
+    `^\uFEFF?# [^\\r\\n]+\\r?\\n\\r?\\n来源：${provider} 会话 ${literal(sourceId)}(?:（(?:来源会话已移除，保留恢复归档|已归档)）)?\\r?\\n\\r?\\n`
   );
+  return markdown.replace(header, (prefix) => prefix.replace(/[^\r\n]/g, ' '));
 }
 
 /** Error names, paths, and codes ask for exact evidence, not a semantic approximation. */
 export function isExactLookup(query: string): boolean {
   const value = query.trim();
+  if (value.includes('/') && !technicalAnchors(value).length) return false;
   return /^[a-z0-9_.:/-]+$/i.test(value) && /[a-z][A-Z]|[_.:/-]|[A-Z]{2}|\d/.test(value);
 }
 
 function metadata(entry: KnowledgeEntry): string {
   return [
-    entry.title,
+    entry.source === 'codex' && needsHostTitleRepair(entry.title, entry.sourceId)
+      ? undefined
+      : entry.title,
     entry.organization?.topic,
     entry.organization?.summary,
     ...(entry.organization?.tags ?? []),
@@ -158,7 +220,7 @@ export class KnowledgeKeywordIndex {
             return {
               signature: `${detail.entry.updatedAt}\n${detail.entry.sizeBytes}\n${metadata(detail.entry)}`,
               contentHash: detail.contentHash,
-              body: await bodyTerms(detail.markdown),
+              body: await bodyTerms(searchableBody(detail)),
               metadata: terms(metadata(detail.entry)),
             };
           })().finally(() => this.preparing.delete(key));
@@ -196,6 +258,7 @@ export class KnowledgeKeywordIndex {
     limit: number
   ): Promise<KeywordHit[]> {
     const queryTerms = searchTerms(query);
+    const anchors = technicalAnchors(query);
     if (!queryTerms.length) return [];
     const documents = await this.prepare(owner, entries, liveIds, load);
     const averageLength =
@@ -211,6 +274,7 @@ export class KnowledgeKeywordIndex {
     );
     const results: KeywordHit[] = [];
     for (const { id, value } of documents) {
+      if (anchors.length && !anchors.some((anchor) => value.body.counts.has(anchor))) continue;
       let score = 0;
       let matched = 0;
       for (const term of queryTerms) {
@@ -242,22 +306,39 @@ export interface KnowledgeMatch {
   contentHash: string;
 }
 
-export function keywordPosition(text: string, query: string): number | undefined {
-  const literal = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+interface KeywordEvidence {
+  position?: number;
+  matched: number;
+  localMatched: number;
+  phrase: boolean;
+}
+
+function keywordEvidence(text: string, query: string, windowSize = 800): KeywordEvidence {
+  const queryTerms = searchTerms(query);
+  const anchors = technicalAnchors(query);
   const phrase = query.trim()
     ? new RegExp(literal(query.trim()), 'iu').exec(text)?.index
     : undefined;
-  if (phrase !== undefined) return phrase;
   // Prefer the densest local group of query terms over the first generic word.
-  const windows = new Map<number, { position: number; terms: Set<string> }>();
-  for (const term of searchTerms(query)) {
-    for (const occurrence of text.matchAll(new RegExp(literal(term), 'giu'))) {
+  const windows = new Map<number, { position: number; terms: Set<string>; anchor: boolean }>();
+  const matched = new Set<string>();
+  const width = Math.max(1, Math.floor(windowSize / 2));
+  for (const term of queryTerms) {
+    const isAnchor = anchors.includes(term);
+    const expression = isAnchor ? anchorPattern(term) : new RegExp(literal(term), 'giu');
+    for (const occurrence of text.matchAll(expression)) {
+      matched.add(term);
       const offset = occurrence.index;
-      const bucket = Math.floor(offset / 800);
+      const bucket = Math.floor(offset / width);
       for (const key of [bucket, bucket - 1]) {
-        const window = windows.get(key) ?? { position: offset, terms: new Set<string>() };
+        const window = windows.get(key) ?? {
+          position: offset,
+          terms: new Set<string>(),
+          anchor: false,
+        };
         window.position = Math.min(window.position, offset);
         window.terms.add(term);
+        window.anchor ||= isAnchor;
         windows.set(key, window);
       }
     }
@@ -265,6 +346,7 @@ export function keywordPosition(text: string, query: string): number | undefined
   let best: number | undefined;
   let maximum = 0;
   for (const window of windows.values()) {
+    if (anchors.length && !window.anchor) continue;
     if (
       window.terms.size > maximum ||
       (window.terms.size === maximum && (best === undefined || window.position < best))
@@ -273,12 +355,52 @@ export function keywordPosition(text: string, query: string): number | undefined
       best = window.position;
     }
   }
-  return best;
+  return {
+    position: phrase ?? best,
+    matched: matched.size,
+    localMatched: phrase === undefined ? maximum : queryTerms.length,
+    phrase: phrase !== undefined,
+  };
+}
+
+export function keywordPosition(text: string, query: string): number | undefined {
+  return keywordEvidence(text, query).position;
+}
+
+export function knowledgeSearchEvidence(
+  detail: KnowledgeEntryDetail,
+  query: string,
+  windowSize = 800
+) {
+  const body = searchableBody(detail);
+  const lexical = keywordEvidence(body, query, windowSize);
+  const fields = metadata(detail.entry);
+  const fieldMatches = searchTerms(query).filter((term) =>
+    new RegExp(literal(term), 'iu').test(fields)
+  ).length;
+  const metadataPhrase = Boolean(
+    query.trim() && new RegExp(literal(query.trim()), 'iu').test(fields)
+  );
+  return {
+    ...lexical,
+    fieldMatches,
+    metadata: fields,
+    metadataPhrase,
+    technical: hasTechnicalEvidence(body, query),
+    // Metadata can help rank real body evidence, but cannot substitute for it.
+    score:
+      (lexical.phrase ? 15 : 0) +
+      lexical.localMatched * 3 +
+      lexical.matched +
+      Math.min(fieldMatches, 3) * 1.5 +
+      (metadataPhrase ? 4 : 0),
+    keywordWeight: 0.2 + (0.8 * lexical.localMatched) / Math.max(1, searchTerms(query).length),
+  };
 }
 
 export function hasKeywordMatch(detail: KnowledgeEntryDetail, query: string): boolean {
-  const text = `${metadata(detail.entry)}\n${detail.markdown}`.toLocaleLowerCase();
-  return searchTerms(query).some((term) => text.includes(term));
+  const evidence = knowledgeSearchEvidence(detail, query);
+  return evidence.technical && evidence.matched > 0;
 }
 
 /** A provider excerpt is evidence only if its exact bytes still occur in this owner's current source. */
@@ -294,7 +416,13 @@ export function searchExcerpt(
   method: KnowledgeMatch['method'],
   semantic?: { position: number; length: number }
 ): { excerpt: string; match: KnowledgeMatch } {
-  const position = semantic?.position ?? keywordPosition(detail.markdown, query) ?? 0;
+  const lexical = knowledgeSearchEvidence(detail, query);
+  const preferLiteral =
+    technicalAnchors(query).length > 0 ||
+    lexical.localMatched >= 2 ||
+    searchTerms(query).length === 1;
+  const position =
+    (preferLiteral ? lexical.position : undefined) ?? semantic?.position ?? lexical.position ?? 0;
   const start = Math.max(0, position - 120);
   const end = Math.min(
     detail.markdown.length,
@@ -308,13 +436,15 @@ export function searchExcerpt(
 
 export function fuseSearchRanks(
   semantic: string[],
-  keyword: string[]
+  keyword: string[],
+  keywordWeights?: ReadonlyMap<string, number>
 ): Array<{ id: string; score: number }> {
   const scores = new Map<string, number>();
-  for (const ranking of [semantic, keyword]) {
+  for (const [source, ranking] of [semantic, keyword].entries()) {
     const unique = [...new Set(ranking)];
     unique.forEach((id, index) => {
-      scores.set(id, (scores.get(id) ?? 0) + 1 / (60 + index + 1));
+      const weight = source === 1 ? (keywordWeights?.get(id) ?? 1) : 1;
+      scores.set(id, (scores.get(id) ?? 0) + weight / (60 + index + 1));
     });
   }
   return [...scores]

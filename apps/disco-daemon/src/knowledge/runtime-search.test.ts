@@ -108,7 +108,7 @@ describe('knowledge runtime retrieval evidence and scope', () => {
       { id: manual.entry.id, excerpt: manual.markdown, score: 1 },
     ]);
     const result = await runtime.search(owner, {
-      query: '启动报错 ERR_MODULE_NOT_FOUND',
+      query: '启动报错',
       source: 'codex',
       entryIds: [manual.entry.id, codex.entry.id],
     });
@@ -135,10 +135,17 @@ describe('knowledge runtime retrieval evidence and scope', () => {
     const result = await runtime.search(owner, { query: 'ResourceBusyError' });
     expect(result.results.map((hit) => hit.entry.id)).toEqual([relevant.entry.id]);
     expect(result.results[0].match?.method).toBe('keyword');
+    const mixed = await runtime.search(owner, { query: '如何解决 ResourceBusyError' });
+    expect(mixed.results.map((hit) => hit.entry.id)).toEqual([relevant.entry.id]);
+    expect(mixed.results[0].excerpt).toContain('ResourceBusyError');
+    expect(
+      (await runtime.search(owner, { query: '如何解决 UnseenStorageQuotaError' })).results
+    ).toEqual([]);
+    expect(search).not.toHaveBeenCalled();
   });
 
   it('does not treat the metadata of an unparsed attachment as semantic content evidence', async () => {
-    const image = (await save('image', '原件已保存，正文暂不能检索。', {
+    const image = (await save('image', '# 旅行照片.jpg\n原件已保存，正文暂不能检索。', {
       kind: 'document',
       title: '旅行照片.jpg',
     }))!;
@@ -147,6 +154,26 @@ describe('knowledge runtime retrieval evidence and scope', () => {
     expect((await runtime.search(owner, { query: '重试连接' })).results).toEqual([]);
     expect((await runtime.search(owner, { query: '旅行照片' })).results[0].entry.id).toBe(
       image.entry.id
+    );
+  });
+
+  it('does not quote an archive wrapper or a title-only match as evidence from conversation contents', async () => {
+    const wrapper = '# Codex 会话 host-id\n\n来源：Codex 会话 host-id\n\n';
+    const archived = (await save('placeholder', `${wrapper}照片按年份存储。`, {
+      source: 'codex',
+      sourceId: 'host-id',
+      kind: 'conversation',
+      title: 'Codex 会话 host-id',
+    }))!;
+    provider(async () => [{ id: archived.entry.id, excerpt: wrapper }]);
+    expect((await runtime.search(owner, { query: '上传切换会话' })).results).toEqual([]);
+    await save('misleading-title', '正文仅讨论照片备份。', {
+      source: 'codex',
+      kind: 'conversation',
+      title: '如何解决 ResourceBusyError',
+    });
+    expect((await runtime.search(owner, { query: '如何解决 ResourceBusyError' })).results).toEqual(
+      []
     );
   });
 

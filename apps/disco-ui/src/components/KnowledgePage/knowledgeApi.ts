@@ -111,6 +111,7 @@ type CatalogFilters = Pick<
   | 'includeHistory'
   | 'noteType'
   | 'sort'
+  | 'processing'
 >;
 
 function listParams(query: string, source: string, offset: number, filters?: CatalogFilters) {

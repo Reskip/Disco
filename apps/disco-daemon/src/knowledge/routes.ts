@@ -128,6 +128,11 @@ function listOptions(query: Request['query']): KnowledgeListOptions {
     ),
     level: choice(query.level, ['source', 'summary', 'knowledge'] as const, '知识层级'),
     noteType: choice(query.noteType, ['knowledge', 'summary', 'overview'] as const, '笔记类型'),
+    processing: choice(
+      query.processing,
+      ['index_error', 'parse_error', 'metadata_only', 'summary_error'] as const,
+      '处理状态'
+    ),
     sort: choice(query.sort, ['updated', 'curated'] as const, '排序方式'),
     topic: scalar(query.topic),
     reviewState: choice(query.reviewState, ['draft', 'reviewed'] as const, '确认状态'),

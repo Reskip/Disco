@@ -204,6 +204,33 @@ class StaticHTML(HTMLParser):
         if not self.excluded() and "head" not in names: self.text.append(data)
 
 
+TOPIC_TERMS = {
+    '健康与运动': r'跑步|马拉松|健身|心率|训练计划|运动恢复|\b(?:marathon|jogging|fitness|running route)\b',
+    '旅行与生活': r'铁路|车站|旅游|旅行|行程|酒店|景点|\b(?:railway|railroad|itinerary|hotel)\b',
+    '硬件与设备': r'显卡|主板|内存条|处理器|相机|硬盘|天线|电路|\b(?:GPU|CPU|NAS|PCB)\b',
+    '软件与系统': r'知识库|程序开发|软件|数据库|服务部署|网页开发|\b(?:API|SQLite|React|Codex|Disco|OpenViking)\b',
+    '学习与研究': r'论文|课题|实验研究|数学|物理|课程|\b(?:research|thesis|mathematics)\b',
+    '工作与项目': r'项目管理|工作计划|会议纪要|用户访谈|需求评审',
+    '创作与设计': r'平面设计|插画|海报|视觉设计|配色|\b(?:illustration|typography)\b',
+    '财务与消费': r'财务|账单|预算|购物|采购|消费记录|\b(?:invoice|budget|expense)\b',
+}
+
+
+def content_topic(title, body='', fallback='其他'):
+    """Conservative content labels; HTML/JSON extensions never determine a topic."""
+    for text in (title, body):
+        scores = {topic: len(set(match.group().lower() for match in re.finditer(pattern, text, re.I)))
+                  for topic, pattern in TOPIC_TERMS.items()}
+        highest = max(scores.values(), default=0)
+        winners = [topic for topic, score in scores.items() if score == highest and score]
+        if len(winners) == 1:
+            return winners[0]
+        # Prefer a specific exercise subject to its surrounding route/hotel context.
+        if highest and set(winners) <= {'健康与运动', '旅行与生活'}:
+            return '健康与运动'
+    return fallback
+
+
 def inspect_html(text):
     parser = StaticHTML()
     parser.feed(text)
@@ -217,7 +244,7 @@ def inspect_html(text):
     # Static articles remain complete narrative inputs even when bundled scripts
     # are large. A script-heavy app shell has an honest local overview instead.
     application = parser.script_chars > max(2000, len(body)*5) and (parser.tags['canvas'] or parser.tags['svg'] or len(body)<400) and not parser.tags['article']
-    return {"overview": overview, "abstract": description, "narrative": "" if application or not body else body, "topic": "软件与系统", "tags": ["HTML", "结构化资料"]}
+    return {"overview": overview, "abstract": description, "narrative": "" if application or not body else body, "topic": content_topic(title, body), "tags": ["HTML", "结构化资料"]}
 
 
 def prepare_summary_sources(sources):
@@ -243,6 +270,10 @@ def prepare_summary_sources(sources):
             except (ValueError, csv.Error, RecursionError):
                 pass
         if report:
+            # File names can add a clear topic, but never inspect script payloads
+            # or overwrite an HTML page's own meaningful title classification.
+            if format not in {'html', 'htm'} or report['topic'] == '其他':
+                report['topic'] = content_topic(source['title'], fallback=report['topic'])
             # HTML overview already contains its whole static narrative.
             content = report['overview']
             if report['narrative'] and format not in {'html', 'htm'}:

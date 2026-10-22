@@ -52,11 +52,13 @@ import {
 import { canSummarize, organization, retryDate } from './organization.js';
 import {
   fuseSearchRanks,
-  hasKeywordMatch,
   isExactLookup,
   KnowledgeKeywordIndex,
   type KnowledgeMatch,
+  knowledgeSearchEvidence,
+  searchableBody,
   searchExcerpt,
+  technicalAnchors,
   verifiedSemanticPosition,
 } from './search.js';
 import {
@@ -318,7 +320,7 @@ export class KnowledgeRuntime {
     );
     if (!entries.length) return { results: [], engine: 'local' };
     const allowed = new Set(entries.map((entry) => entry.id));
-    const exact = isExactLookup(input.query);
+    const exact = isExactLookup(input.query) || technicalAnchors(input.query).length > 0;
     const keywordWork = this.keywordIndex.search(
       ownerKey(owner),
       entries,
@@ -353,6 +355,7 @@ export class KnowledgeRuntime {
     const candidates = new Map<string, KnowledgeSearchResult['results'][number]>();
     const validSemantic = new Set<string>();
     const validKeyword = new Set<string>();
+    const keywordWeights = new Map<string, number>();
     for (const id of new Set([...semanticById.keys(), ...keywordIds])) {
       const detail = await this.library.get(owner, id);
       if (
@@ -361,9 +364,18 @@ export class KnowledgeRuntime {
         (input.source && detail.entry.source !== input.source)
       )
         continue;
+      const evidence = knowledgeSearchEvidence(detail, input.query);
+      if (!evidence.technical) continue;
       const hit = semanticById.get(id);
-      const position = hit ? verifiedSemanticPosition(detail.markdown, hit.excerpt) : undefined;
-      const lexical = keywordIds.has(id) && hasKeywordMatch(detail, input.query);
+      let position = hit ? verifiedSemanticPosition(detail.markdown, hit.excerpt) : undefined;
+      if (
+        position !== undefined &&
+        !searchableBody(detail)
+          .slice(position, position + hit!.excerpt.length)
+          .trim()
+      )
+        position = undefined;
+      const lexical = keywordIds.has(id) && evidence.matched > 0;
       // An unparsed image/archive has only filename metadata; it cannot provide
       // semantic evidence about its actual contents.
       if (detail.entry.kind === 'document' && detail.entry.parseStatus !== 'parsed' && !lexical)
@@ -372,7 +384,10 @@ export class KnowledgeRuntime {
       // changed human note can still be returned by current keyword evidence.
       if (position === undefined && !lexical) continue;
       if (position !== undefined) validSemantic.add(id);
-      if (lexical) validKeyword.add(id);
+      if (lexical) {
+        validKeyword.add(id);
+        keywordWeights.set(id, evidence.keywordWeight);
+      }
       candidates.set(id, {
         entry: detail.entry,
         ...searchExcerpt(
@@ -385,7 +400,8 @@ export class KnowledgeRuntime {
     }
     const results = fuseSearchRanks(
       semantic.map((hit) => hit.id).filter((id) => validSemantic.has(id)),
-      keyword.map((hit) => hit.id).filter((id) => validKeyword.has(id))
+      keyword.map((hit) => hit.id).filter((id) => validKeyword.has(id)),
+      keywordWeights
     )
       .slice(0, limit)
       .map(({ id, score }) => ({ ...candidates.get(id)!, score }));
@@ -1155,6 +1171,20 @@ export class KnowledgeRuntime {
       }
     } else {
       if (!this.archiveReady.has(ownerKey(owner))) return;
+      const outdatedOverviews = new Set(
+        entries
+          .filter(
+            (entry) =>
+              !entry.historical &&
+              !entry.humanEdited &&
+              entry.summaryMode === 'structured_overview' &&
+              entry.summaryFormatVersion !== 1 &&
+              organization(entry).level === 'summary' &&
+              organization(entry).state === 'draft'
+          )
+          .map((entry) => entry.derivedFrom?.entryId)
+          .filter((id): id is string => Boolean(id))
+      );
       // Independent owner/source readiness avoids a permanent all-users/all-files barrier.
       const eligible = entries
         .filter(
@@ -1166,6 +1196,7 @@ export class KnowledgeRuntime {
         )
         .sort(
           (a, b) =>
+            Number(outdatedOverviews.has(b.id)) - Number(outdatedOverviews.has(a.id)) ||
             (a.summaryAttemptedAt ?? '').localeCompare(b.summaryAttemptedAt ?? '') ||
             Number(isStructuredSummaryCandidate(b)) - Number(isStructuredSummaryCandidate(a)) ||
             Number(b.kind === 'conversation') - Number(a.kind === 'conversation') ||
@@ -1175,7 +1206,11 @@ export class KnowledgeRuntime {
         );
       for (const entry of eligible) {
         const source = await this.library.get(owner, entry.id);
-        if (source && source.entry.summaryContentHash !== source.contentHash) {
+        if (
+          source &&
+          (source.entry.summaryContentHash !== source.contentHash ||
+            (outdatedOverviews.has(entry.id) && source.entry.summaryDisposition !== 'archive_only'))
+        ) {
           inputs.push(source);
           break;
         }
@@ -1327,6 +1362,7 @@ export class KnowledgeRuntime {
           contentHash: item.contentHash,
         })),
         summaryMode: summary.summaryMode ?? 'model',
+        summaryFormatVersion: summary.summaryMode === 'structured_overview' ? 1 : undefined,
         derivedFrom: target
           ? undefined
           : { entryId: first.entry.id, contentHash: first.contentHash },

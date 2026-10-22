@@ -70,6 +70,58 @@ describe('portable knowledge library', () => {
     expect(await library.get(owner, image.entry.id)).not.toBeNull();
   });
 
+  it('filters processing problems before paging and separates original and note issue counts', async () => {
+    const image = (await library.upsertSource(owner, {
+      ...source,
+      sourceId: 'metadata-image',
+      kind: 'document',
+      title: 'image.png',
+    }))!;
+    const damaged = (await library.upsertSource(owner, {
+      ...source,
+      sourceId: 'damaged-pdf',
+      kind: 'document',
+      title: 'bad.pdf',
+    }))!;
+    const failed = (await library.upsertSource(owner, { ...source, sourceId: 'summary-failed' }))!;
+    const done = (await library.upsertSource(owner, { ...source, sourceId: 'summary-done' }))!;
+    const note = (await library.upsertSource(owner, {
+      ...source,
+      sourceId: 'failed-note',
+      kind: 'note',
+      automated: true,
+      generation: { state: 'failed', message: '稍后重试' },
+    }))!;
+    await library.markParsed(owner, image.entry.id, 'unsupported');
+    await library.markParsed(owner, damaged.entry.id, 'error', '原始 PDF 损坏');
+    await library.markSummaryFailed(owner, failed.entry.id, failed.contentHash, '模型超时');
+    await library.markSummaryFailed(owner, done.entry.id, done.contentHash, '旧失败');
+    await library.markSummarized(owner, done.entry.id, done.contentHash);
+    await library.markIndexed(owner, note.entry.id, note.contentHash, '索引暂不可用');
+    const catalog = await library.catalog(owner, { processing: 'summary_error', limit: 1 });
+    expect(catalog.total).toBe(2);
+    expect(catalog.entries).toHaveLength(1);
+    expect(catalog.overview.issues).toEqual({
+      sources: { indexErrors: 0, parseErrors: 1, metadataOnly: 1, summaryErrors: 1 },
+      notes: { indexErrors: 1, summaryErrors: 1 },
+    });
+    expect(catalog.status.processing?.summary.failed).toBe(2);
+    expect(
+      (await library.list(owner, { level: 'source', processing: 'summary_error' })).entries.map(
+        (e) => e.id
+      )
+    ).toEqual([failed.entry.id]);
+    expect(
+      (await library.list(owner, { processing: 'parse_error' })).entries.map((e) => e.id)
+    ).toEqual([damaged.entry.id]);
+    expect(
+      (await library.list(owner, { processing: 'metadata_only' })).entries.map((e) => e.id)
+    ).toEqual([image.entry.id]);
+    expect((await library.catalog(otherUser, { processing: 'summary_error' })).total).toBe(0);
+    await library.markHistorical(owner, damaged.entry.id);
+    expect((await library.catalog(owner)).overview.issues?.sources.parseErrors).toBe(0);
+  });
+
   it('filters all note categories before pagination and prioritizes maintained knowledge', async () => {
     const knowledge = (await library.upsertSource(owner, {
       ...source,
@@ -203,6 +255,57 @@ describe('portable knowledge library', () => {
     expect(catalog.entries[0].snippet).toContain('后台继续');
     expect(catalog.status.total).toBe(2);
     expect((await library.catalog(owner, { query: 'ERR_MODULE_NOT_FOUND' })).entries).toEqual([]);
+  });
+
+  it('shows dense catalog body evidence, excludes generated conversation labels, and identifies metadata-only matches', async () => {
+    await library.upsertSource(owner, {
+      ...source,
+      source: 'codex',
+      sourceId: 'empty-host',
+      title: 'Codex 会话 empty-host',
+      markdown: '# Codex 会话 empty-host\n\n来源：Codex 会话 empty-host\n\n照片按年份存储。',
+    });
+    const target = (await library.upsertSource(owner, {
+      ...source,
+      source: 'codex',
+      sourceId: 'target-host',
+      title: '修复记录',
+      markdown:
+        '# 修复记录\n\n来源：Codex 会话 target-host\n\n' +
+        '无关的开始。'.repeat(400) +
+        '上传时切换会话，传输在后台继续。',
+    }))!;
+    const titleOnly = (await library.upsertSource(owner, {
+      ...source,
+      sourceId: 'title-only',
+      title: '上传切换会话',
+      markdown: '正文讨论硬件设计。',
+    }))!;
+    const catalog = await library.catalog(owner, { query: '上传切换会话' });
+    expect(catalog.total).toBe(2);
+    expect(catalog.entries[0].id).toBe(target.entry.id);
+    expect(catalog.entries[0].snippet).toContain('传输在后台继续');
+    expect(catalog.entries.find((e) => e.id === titleOnly.entry.id)?.snippet).toContain(
+      '资料信息匹配：上传切换会话'
+    );
+    await library.upsertSource(owner, {
+      ...source,
+      sourceId: 'named-error',
+      title: 'ResourceBusyError',
+      markdown: '并无错误码原文。',
+    });
+    expect((await library.catalog(owner, { query: '如何解决 ResourceBusyError' })).total).toBe(0);
+    const actual = (await library.upsertSource(owner, {
+      ...source,
+      sourceId: 'actual-error',
+      title: '真实错误',
+      markdown: '执行时报 ResourceBusyError，应等待文件锁。',
+    }))!;
+    expect(
+      (await library.catalog(owner, { query: '如何解决 ResourceBusyError' })).entries.map(
+        (e) => e.id
+      )
+    ).toEqual([actual.entry.id]);
   });
 
   it('streams and validates raw archives without losing the old revision', async () => {

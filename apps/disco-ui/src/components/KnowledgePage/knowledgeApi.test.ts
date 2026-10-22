@@ -79,6 +79,7 @@ describe('knowledge HTTP client', () => {
       kind: 'note',
       noteType: 'overview',
       sort: 'curated',
+      processing: 'index_error',
     });
     const url = new URL(vi.mocked(authenticatedFetch).mock.calls[0][0] as string);
     expect(Object.fromEntries(url.searchParams)).toEqual({
@@ -88,6 +89,7 @@ describe('knowledge HTTP client', () => {
       kind: 'note',
       noteType: 'overview',
       sort: 'curated',
+      processing: 'index_error',
     });
     expect(authenticatedFetch).toHaveBeenCalledTimes(1);
   });

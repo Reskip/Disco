@@ -45,10 +45,13 @@ import {
   errorMessage,
   formatDate,
   GENERATION_LABELS,
+  hasSummaryFailure,
   INDEX_LABELS,
   LEVEL_LABELS,
   MATERIAL_LABELS,
   PARSE_LABELS,
+  PROCESSING_DESCRIPTIONS,
+  PROCESSING_LABELS,
   SOURCE_LABELS,
 } from './knowledgePresentation';
 
@@ -84,6 +87,7 @@ export function KnowledgePage({
     'all'
   );
   const [reviewState, setReviewState] = useState<'all' | 'draft' | 'reviewed'>('all');
+  const [processing, setProcessing] = useState<'all' | keyof typeof PROCESSING_LABELS>('all');
   const [topic, setTopic] = useState('all');
   const [includeHistory, setIncludeHistory] = useState(false);
   const [overview, setOverview] = useState<KnowledgeOverview | null>(null);
@@ -162,6 +166,7 @@ export function KnowledgePage({
               includeHistory,
             }),
         ...(topic !== 'all' ? { topic } : {}),
+        ...(processing !== 'all' ? { processing } : {}),
       };
       try {
         const catalog = await knowledgeApi.catalog(
@@ -204,6 +209,7 @@ export function KnowledgePage({
     noteType,
     material,
     reviewState,
+    processing,
     topic,
     includeHistory,
   ]);
@@ -240,6 +246,7 @@ export function KnowledgePage({
     !editing &&
     detail &&
     (detail.entry.summaryProgress ||
+      hasSummaryFailure(detail.entry) ||
       (detail.entry.generation &&
         ['queued', 'running', 'failed'].includes(detail.entry.generation.state)))
       ? detail.entry.id
@@ -459,6 +466,9 @@ export function KnowledgePage({
     setView(value);
     setOffset(0);
     setResult(null);
+    if (value === 'notes' && (processing === 'parse_error' || processing === 'metadata_only')) {
+      setProcessing('all');
+    }
     if (
       value === 'notes' &&
       overview?.noteTopics &&
@@ -472,6 +482,7 @@ export function KnowledgePage({
     query ||
       source !== 'all' ||
       topic !== 'all' ||
+      processing !== 'all' ||
       (view === 'notes' ? noteType !== 'all' || reviewState !== 'all' : material !== 'all')
   );
   const clearFilters = () => {
@@ -482,8 +493,18 @@ export function KnowledgePage({
     setNoteType('all');
     setMaterial('all');
     setReviewState('all');
+    setProcessing('all');
     setIncludeHistory(false);
     setOffset(0);
+  };
+  const showProcessing = (
+    nextView: 'notes' | 'sources',
+    nextProcessing: keyof typeof PROCESSING_LABELS
+  ) => {
+    clearFilters();
+    setView(nextView);
+    setProcessing(nextProcessing);
+    setResult(null);
   };
   const openEntry = (id: string) => {
     setCreating(false);
@@ -531,6 +552,7 @@ export function KnowledgePage({
       setTopic('all');
       setNoteType('all');
       setReviewState('all');
+      setProcessing('all');
       setSearch('');
       setQuery('');
       setRevision((value) => value + 1);
@@ -624,7 +646,14 @@ export function KnowledgePage({
               changeView('sources');
             }}
           />
-          {status && <KnowledgeProgress status={status} mobile={mobile} />}
+          {status && (
+            <KnowledgeProgress
+              status={status}
+              mobile={mobile}
+              issues={overview?.issues}
+              onShowProcessing={showProcessing}
+            />
+          )}
           <Segmented
             block={mobile}
             aria-label="知识库视图"
@@ -743,7 +772,32 @@ export function KnowledgePage({
                 ]}
               />
             )}
+            <Select
+              aria-label="处理状态"
+              value={processing}
+              onChange={(value) => {
+                setProcessing(value);
+                setOffset(0);
+              }}
+              style={filterStyle}
+              options={[
+                { value: 'all', label: '全部处理状态' },
+                ...Object.entries(PROCESSING_LABELS)
+                  .filter(
+                    ([value]) =>
+                      view === 'sources' || value === 'index_error' || value === 'summary_error'
+                  )
+                  .map(([value, label]) => ({ value, label })),
+              ]}
+            />
           </Flex>
+          {processing !== 'all' && (
+            <Typography.Text type="secondary">
+              {view === 'notes' && processing === 'summary_error'
+                ? '打开草稿可查看失败原因与整理来源，也可以直接编辑并保存人工结论。'
+                : PROCESSING_DESCRIPTIONS[processing]}
+            </Typography.Text>
+          )}
           {error && (
             <Alert type="warning" showIcon title={error} description="连接恢复后会自动重试。" />
           )}
@@ -921,6 +975,9 @@ export function KnowledgePage({
                               >
                                 {GENERATION_LABELS[entry.generation.state]}
                               </Tag>
+                            )}
+                            {entry.kind !== 'note' && hasSummaryFailure(entry) && (
+                              <Tag color="warning">整理失败，后台重试</Tag>
                             )}
                             <Tag color={entry.indexStatus === 'error' ? 'error' : undefined}>
                               {entry.indexStatus === 'indexed' &&

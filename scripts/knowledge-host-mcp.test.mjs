@@ -31,23 +31,102 @@ test('host bridge uses a scoped bearer token and does not accept remote services
   assert.deepEqual(JSON.parse(call[1].body), { query: '历史', entryIds: ['doc-1'], limit: 8 });
 });
 
-test('read pagination reconstructs the whole archived document', async () => {
-  const original = `# 资料\n${'中文内容与原始换行\n'.repeat(5000)}`;
-  const client = createKnowledgeHostClient(
-    { token: 'secret' },
-    async () =>
-      new Response(JSON.stringify({ entry: { id: 'doc', updatedAt: 'v1' }, markdown: original }))
-  );
+test('read uses bounded server pages, preserves sources, and pins subsequent pages', async () => {
+  const original = `# 资料\n${'中文内容🙂与原始换行\n'.repeat(5000)}`;
+  const sources = [{ id: 'source-1', title: '原始来源', available: true }];
+  const responseSizes = [];
+  let calls = 0;
+  const client = createKnowledgeHostClient({ token: 'secret' }, async (url) => {
+    assert.equal(url.pathname, '/knowledge/entries/doc');
+    assert.equal(url.searchParams.get('limit'), '7000');
+    assert.equal(url.searchParams.get('contentHash'), calls++ ? 'version-1' : null);
+    const offset = Number(url.searchParams.get('offset'));
+    let end = Math.min(offset + 7000, original.length);
+    if (/[\uDC00-\uDFFF]/.test(original[end] ?? '')) end++;
+    const body = JSON.stringify({
+      entry: { id: 'doc', updatedAt: 'v1' },
+      markdown: original.slice(offset, end),
+      contentHash: 'version-1',
+      sources,
+      page: {
+        offset,
+        nextOffset: end < original.length ? end : null,
+        totalChars: original.length,
+        hasMore: end < original.length,
+      },
+    });
+    responseSizes.push(Buffer.byteLength(body));
+    return new Response(body);
+  });
   let offset = 0;
   let assembled = '';
+  let contentHash;
   while (true) {
-    const result = await client.call('disco_knowledge_read', { id: 'doc', offset, limit: 7000 });
+    const result = await client.call('disco_knowledge_read', {
+      id: 'doc',
+      offset,
+      limit: 7000,
+      contentHash,
+    });
+    assert.equal(result.contentHash, 'version-1');
+    assert.deepEqual(result.sources, sources);
+    assert.equal(result.totalCharacters, original.length);
+    assert.equal(result.markdown.isWellFormed(), true);
+    contentHash = result.contentHash;
     assembled += result.markdown;
-    if (!result.hasMore) break;
+    if (!result.hasMore) {
+      assert.equal(result.nextOffset, null);
+      break;
+    }
     assert.ok(result.nextOffset > offset);
     offset = result.nextOffset;
   }
   assert.equal(assembled, original);
+  assert.ok(responseSizes.length > 2);
+  assert.ok(responseSizes.every((size) => size < 24000));
+});
+
+test('read rejects stale content, unpaged responses and invalid requests', async () => {
+  const client = createKnowledgeHostClient({ token: 'secret' }, async (url) => {
+    assert.equal(url.searchParams.get('contentHash'), 'old-version');
+    return new Response('private changed content', { status: 409 });
+  });
+  await assert.rejects(
+    client.call('disco_knowledge_read', { id: 'doc', offset: 300, contentHash: 'old-version' }),
+    /资料已被修改/
+  );
+  let calls = 0;
+  const legacy = createKnowledgeHostClient({ token: 'secret' }, async () => {
+    calls++;
+    return new Response(JSON.stringify({ entry: { id: 'doc' }, markdown: 'whole archive' }));
+  });
+  await assert.rejects(legacy.call('disco_knowledge_read', { id: 'doc', limit: 3 }), /分页格式/);
+  await assert.rejects(legacy.call('disco_knowledge_read', { id: 'doc', offset: -1 }), /分页参数/);
+  await assert.rejects(
+    legacy.call('disco_knowledge_read', { id: 'doc', contentHash: '' }),
+    /内容版本/
+  );
+  assert.equal(calls, 1);
+});
+
+test('read preserves server-adjusted UTF-16 positions and handles the end of an archive', async () => {
+  let page = { offset: 1, nextOffset: 3, totalChars: 4, hasMore: true };
+  let markdown = '🙂';
+  const client = createKnowledgeHostClient(
+    { token: 'secret' },
+    async () =>
+      new Response(JSON.stringify({ entry: { id: 'doc' }, contentHash: 'v1', markdown, page }))
+  );
+  const emoji = await client.call('disco_knowledge_read', { id: 'doc', offset: 2, limit: 1 });
+  assert.equal(emoji.offset, 1);
+  assert.equal(emoji.markdown, '🙂');
+  assert.equal(emoji.nextOffset, 3);
+  page = { offset: 4, nextOffset: null, totalChars: 4, hasMore: false };
+  markdown = '';
+  const end = await client.call('disco_knowledge_read', { id: 'doc', offset: 99 });
+  assert.equal(end.offset, 4);
+  assert.equal(end.hasMore, false);
+  assert.equal(end.nextOffset, null);
 });
 
 test('update requires a revision and identifiers cannot escape API paths', async () => {

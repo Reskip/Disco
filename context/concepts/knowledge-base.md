@@ -87,6 +87,15 @@ text search. The page displays separate archive, index and organization progress
 last sync time, current work, parsing status and per-entry retry diagnostics;
 queued or failed provider work is not reported as completed.
 
+Directory filtering supports `processing=index_error|parse_error|metadata_only|
+summary_error` before pagination. The overview provides separate original/note
+issue counts; clicking a count opens the corresponding filtered collection.
+`metadata_only` means the original is retained and its name/type/source are
+searchable, not that its image or binary contents were understood. A source's
+summary error is current only while it has no completed summary disposition;
+a note uses its explicit failed generation state. These filters never move raw
+materials into the knowledge-note collection or hide their download links.
+
 ## Executor trust boundary
 
 Knowledge files belong inside their owner's existing tenant-aware

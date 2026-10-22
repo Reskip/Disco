@@ -395,6 +395,119 @@ describe('knowledge background synchronization', () => {
     expect(summarizeContent).toHaveBeenCalledTimes(3);
   });
 
+  it('refreshes outdated automatic overviews once and preserves human or confirmed notes', async () => {
+    await runtime.runOnce(false);
+    const fixtures = [];
+    for (const label of ['draft', 'human', 'reviewed', 'deleted']) {
+      const input = (await runtime.library.upsertSource(owner, {
+        source: 'manual',
+        sourceId: `overview-source-${label}`,
+        kind: 'document',
+        title: `${label}.json`,
+        markdown: '[{"latitude":1,"longitude":2}]',
+      }))!;
+      await runtime.library.markParsed(owner, input.entry.id, 'parsed');
+      await runtime.library.markIndexed(owner, input.entry.id);
+      await runtime.library.markSummarized(owner, input.entry.id, input.contentHash);
+      const note = (await runtime.library.upsertSource(owner, {
+        source: 'manual',
+        sourceId: `summary:${input.entry.id}`,
+        kind: 'note',
+        title: label,
+        markdown: '旧概览完整内容',
+        automated: true,
+        summaryMode: 'structured_overview',
+        derivedFrom: { entryId: input.entry.id, contentHash: input.contentHash },
+        organization: {
+          topic: '软件与系统',
+          level: 'summary',
+          state: label === 'reviewed' ? 'reviewed' : 'draft',
+          sourceEntryIds: [input.entry.id],
+        },
+        generation: { state: 'complete' },
+      }))!;
+      if (label === 'human') await runtime.library.edit(owner, note.entry.id, '人工整理保留');
+      if (label === 'deleted') await runtime.library.remove(owner, note.entry.id);
+      fixtures.push({ label, input, note });
+    }
+    const summarizeContent = vi.fn().mockResolvedValue({
+      title: '铁路数据概览',
+      topic: '旅行与生活',
+      abstract: '本地结构说明',
+      overview: '新的可读来源标题',
+      summaryMode: 'structured_overview',
+    });
+    Object.defineProperty(runtime, 'engine', { value: { summarizeContent } });
+    await runtime.runSummaryOnce();
+    expect(summarizeContent).toHaveBeenCalledTimes(1);
+    const draft = fixtures.find((item) => item.label === 'draft')!;
+    const fresh = (await runtime.library.get(owner, draft.note.entry.id))!;
+    expect(fresh.entry.summaryFormatVersion).toBe(1);
+    expect(fresh.entry.organization?.topic).toBe('旅行与生活');
+    expect(fresh.markdown).toContain('新的可读来源标题');
+    for (const item of fixtures) {
+      expect((await runtime.library.get(owner, item.input.entry.id))?.contentHash).toBe(
+        item.input.contentHash
+      );
+      if (item.label === 'human')
+        expect((await runtime.library.get(owner, item.note.entry.id))?.markdown).toBe(
+          '人工整理保留'
+        );
+      if (item.label === 'reviewed')
+        expect((await runtime.library.get(owner, item.note.entry.id))?.markdown).toBe(
+          '旧概览完整内容'
+        );
+      if (item.label === 'deleted')
+        expect(await runtime.library.get(owner, item.note.entry.id)).toBeNull();
+    }
+    await runtime.runSummaryOnce();
+    expect(summarizeContent).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not repeatedly refresh an old overview after its current source is archive-only', async () => {
+    await runtime.runOnce(false);
+    const source = (await runtime.library.upsertSource(owner, {
+      source: 'manual',
+      sourceId: 'overview-now-archive-only',
+      kind: 'document',
+      title: '连通检查.json',
+      markdown: '{"message":"连接正常，无需操作"}',
+    }))!;
+    await runtime.library.markParsed(owner, source.entry.id, 'parsed');
+    await runtime.library.markIndexed(owner, source.entry.id);
+    await runtime.library.markSummarized(owner, source.entry.id, source.contentHash);
+    const note = (await runtime.library.upsertSource(owner, {
+      source: 'manual',
+      sourceId: `summary:${source.entry.id}`,
+      kind: 'note',
+      title: '旧资料概览',
+      markdown: '旧概览原文保留',
+      automated: true,
+      summaryMode: 'structured_overview',
+      derivedFrom: { entryId: source.entry.id, contentHash: source.contentHash },
+      organization: { topic: '其他', level: 'summary', state: 'draft' },
+      generation: { state: 'complete' },
+    }))!;
+    const summarizeContent = vi.fn().mockResolvedValue({
+      archiveOnly: true,
+      reason: '只有连通检查，原始资料已归档。',
+    });
+    Object.defineProperty(runtime, 'engine', { value: { summarizeContent } });
+    await runtime.runSummaryOnce();
+    expect(summarizeContent).toHaveBeenCalledTimes(1);
+    expect((await runtime.library.get(owner, source.entry.id))?.entry).toMatchObject({
+      summaryDisposition: 'archive_only',
+      summaryContentHash: source.contentHash,
+    });
+    (runtime as unknown as { lastSummaryAt: number }).lastSummaryAt = 0;
+    await runtime.runSummaryOnce();
+    expect(summarizeContent).toHaveBeenCalledTimes(1);
+    expect((await runtime.library.get(owner, note.entry.id))?.markdown).toBe(note.markdown);
+    expect((await runtime.library.get(owner, source.entry.id))?.contentHash).toBe(
+      source.contentHash
+    );
+  });
+
   it('prioritizes explicit synthesis across owners before unattended historical summaries', async () => {
     const session = await createSession(primary, '后台历史');
     await append(session, 0, '后台需要整理的资料');

@@ -10,6 +10,18 @@ def source(text, format='json', **extra):
 
 
 class LocalOverviewTests(unittest.TestCase):
+    def test_topics_describe_the_content_instead_of_the_file_format(self):
+        cases = [('酒店至植物园跑步轨迹', '健康与运动'), ('铁路覆盖图', '旅行与生活'),
+                 ('知识库索引状态', '软件与系统'), ('一个页面', '其他')]
+        for title, topic in cases:
+            with self.subTest(title=title):
+                html = f'<title>{title}</title><canvas></canvas><p>完整正文</p><script>' + 'sqlite railway marathon;'*2000 + '</script>'
+                result = prepare_summary_sources([source(html, 'html')])['deterministic']
+                self.assertEqual(result['topic'], topic)
+                self.assertIn('HTML', result['tags'])
+        running = prepare_summary_sources([source('[{"latitude":1,"longitude":2}]', title='跑步记录.json')])['deterministic']
+        self.assertEqual(running['topic'], '健康与运动')
+
     def test_readable_source_headings_keep_internal_ids_only_in_links_and_metadata(self):
         original = '[{"lat":1,"lng":2}]'
         sources = [source(original, title='吉林轨迹站点.json'), source('id,value\n1,2\n', 'csv', id='kb_'+'b'*64, title='里程统计.csv')]

@@ -4,6 +4,33 @@ import { describe, expect, it } from 'vitest';
 import { KnowledgeProgress } from './KnowledgeProgress';
 
 describe('knowledge processing progress', () => {
+  it('keeps body parsing failures visible on mobile even when metadata indexing is complete', () => {
+    render(
+      <KnowledgeProgress
+        mobile
+        status={{
+          total: 10,
+          conversations: 0,
+          documents: 10,
+          notes: 0,
+          humanEdited: 0,
+          pendingIndex: 0,
+          deleted: 0,
+          totalBytes: 100,
+          processing: {
+            index: { indexed: 10, pending: 0, failed: 0, unsupported: 5 },
+            summary: { completed: 3, pending: 0, failed: 0 },
+          },
+        }}
+        issues={{
+          sources: { indexErrors: 0, parseErrors: 2, metadataOnly: 5, summaryErrors: 0 },
+          notes: { indexErrors: 0, summaryErrors: 0 },
+        }}
+      />
+    );
+    expect(screen.getByRole('button', { name: /2 项异常/ })).toBeInTheDocument();
+  });
+
   it('shows an active model wait without marking the queued entry as completed', () => {
     render(
       <KnowledgeProgress

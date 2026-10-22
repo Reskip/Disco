@@ -5,8 +5,11 @@ import {
   fuseSearchRanks,
   isExactLookup,
   KnowledgeKeywordIndex,
+  knowledgeSearchEvidence,
+  searchableBody,
   searchExcerpt,
   searchTerms,
+  technicalAnchors,
   verifiedSemanticPosition,
 } from './search';
 
@@ -36,6 +39,101 @@ function document(
 }
 
 describe('knowledge retrieval acceptance', () => {
+  it('anchors mixed code queries without requiring every compared symbol or treating brands as code', async () => {
+    expect(technicalAnchors('如何解决 ResourceBusyError')).toEqual(['resourcebusyerror']);
+    expect(technicalAnchors('如何解决 resourcebusyerror')).toEqual(['resourcebusyerror']);
+    expect(technicalAnchors('node:sqlite 报错')).toEqual(['node:sqlite']);
+    expect(technicalAnchors('Codex OpenAI GPU 2026 GPT-6-Astra GPT-6-Sol 对比')).toEqual([]);
+    expect(technicalAnchors('Codex/ChatGPT 和 GPT-6-Sol/GPT-6-Astra 对比')).toEqual([]);
+    expect(isExactLookup('Codex/ChatGPT')).toBe(false);
+    expect(isExactLookup('GPT-6-Sol/GPT-6-Astra')).toBe(false);
+    expect(searchTerms('Codex/ChatGPT')).toEqual(expect.arrayContaining(['codex', 'chatgpt']));
+    expect(technicalAnchors('src/main.ts 启动失败')).toEqual(['src/main.ts']);
+    expect(searchTerms('如何解决 ERR_MODULE_NOT_FOUND')).not.toContain('module');
+    const error = document('error', '故障', '触发 ResourceBusyError，等待后可恢复。');
+    const module = document('module', '内建模块', '启动时 ERR_MODULE_NOT_FOUND 来自 node:sqlite。');
+    const other = document('other', '错误解决', '如何解决上传报错，记录原因。');
+    const values = [error, module, other];
+    const index = new KnowledgeKeywordIndex();
+    const run = (query: string) =>
+      index.search(
+        'owner',
+        values.map((v) => v.entry),
+        new Set(values.map((v) => v.entry.id)),
+        query,
+        async (id) => values.find((v) => v.entry.id === id) ?? null,
+        20
+      );
+    expect((await run('如何解决 ResourceBusyError')).map((hit) => hit.id)).toEqual(['error']);
+    expect(
+      new Set(
+        (await run('ResourceBusyError 与 ERR_MODULE_NOT_FOUND 有何不同')).map((hit) => hit.id)
+      )
+    ).toEqual(new Set(['error', 'module']));
+    expect(await run('如何解决 UnseenStorageQuotaError')).toEqual([]);
+    expect(
+      knowledgeSearchEvidence(
+        document('prefix', '近似词', 'ResourceBusyErrorExtra'),
+        '如何解决 ResourceBusyError'
+      ).technical
+    ).toBe(false);
+  });
+
+  it('masks only a matching automatic conversation header while preserving offsets and human material', () => {
+    const text =
+      '# Codex 会话 host-id\n\n来源：Codex 会话 host-id\n\n## user · 2026-10-23T00:00:00Z\n\n照片按年份存储。';
+    const detail = document('host', 'Codex 会话 host-id', text);
+    Object.assign(detail.entry, {
+      source: 'codex',
+      sourceId: 'host-id',
+      kind: 'conversation',
+      humanEdited: false,
+    });
+    expect(searchableBody(detail).length).toBe(text.length);
+    expect(knowledgeSearchEvidence(detail, '上传切换会话').matched).toBe(0);
+    expect(knowledgeSearchEvidence(detail, '照片').position).toBe(text.indexOf('照片'));
+    const windows = { ...detail, markdown: `\uFEFF${text.replaceAll('\n', '\r\n')}` };
+    expect(searchableBody(windows).length).toBe(windows.markdown.length);
+    expect(knowledgeSearchEvidence(windows, '会话').matched).toBe(0);
+    expect(knowledgeSearchEvidence(windows, '照片').position).toBe(
+      windows.markdown.indexOf('照片')
+    );
+    const human = { ...detail, entry: { ...detail.entry, humanEdited: true } };
+    expect(searchableBody(human)).toBe(text);
+    const unrelated = { ...detail, entry: { ...detail.entry, sourceId: 'another-id' } };
+    expect(searchableBody(unrelated)).toBe(text);
+    const file = document(
+      'image',
+      '照片.jpg',
+      '# 照片.jpg\n\n[原始文件：照片.jpg](original.jpg)\n原件已保存'
+    );
+    Object.assign(file.entry, { kind: 'document', source: 'codex', humanEdited: false });
+    expect(searchableBody(file)).toBe(file.markdown);
+    expect(knowledgeSearchEvidence(file, '照片.jpg').matched).toBeGreaterThan(0);
+  });
+
+  it('ranks locally concentrated Chinese evidence above scattered terms and labels metadata-only evidence', () => {
+    const scattered = document(
+      'scattered',
+      '资料',
+      `上传。${'无关正文。'.repeat(500)}切换。${'无关正文。'.repeat(500)}会话。`
+    );
+    const dense = document(
+      'dense',
+      '资料',
+      `${'无关正文。'.repeat(500)}上传时切换会话，传输仍继续。`
+    );
+    const query = '上传切换会话';
+    const good = knowledgeSearchEvidence(dense, query, 220);
+    expect(good.score).toBeGreaterThan(knowledgeSearchEvidence(scattered, query, 220).score);
+    expect(dense.markdown.slice(good.position, good.position! + 100)).toContain('上传时切换会话');
+    const titleOnly = knowledgeSearchEvidence(
+      document('title', '上传切换会话', '纯硬件内容'),
+      query
+    );
+    expect(titleOnly.matched).toBe(0);
+    expect(titleOnly.fieldMatches).toBeGreaterThan(0);
+  });
   it('distinguishes exact technical identifiers from natural-language questions', () => {
     for (const query of ['ResourceBusyError', 'ERR_MODULE_NOT_FOUND', 'node:sqlite', 'C548'])
       expect(isExactLookup(query)).toBe(true);

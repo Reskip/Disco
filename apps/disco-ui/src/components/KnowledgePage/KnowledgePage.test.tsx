@@ -436,6 +436,55 @@ describe('knowledge library management', () => {
     expect(screen.queryByText('未分类原件 (100)')).not.toBeInTheDocument();
   });
 
+  it('opens each processing issue in its matching view without losing selected sources', async () => {
+    vi.mocked(knowledgeApi.catalog).mockResolvedValue({
+      ...CATALOG,
+      overview: {
+        ...CATALOG.overview,
+        issues: {
+          sources: { indexErrors: 1, parseErrors: 2, metadataOnly: 5, summaryErrors: 3 },
+          notes: { indexErrors: 1, summaryErrors: 2 },
+        },
+      },
+    });
+    renderPage();
+    fireEvent.click(await screen.findByRole('checkbox', { name: '选择 产品讨论' }));
+    fireEvent.change(screen.getByRole('textbox', { name: '搜索知识库' }), {
+      target: { value: '临时筛选' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /后台处理/ }));
+    for (const [label, processing, view] of [
+      ['2 份正文解析失败', 'parse_error', 'sources'],
+      ['其中 5 份仅文件信息', 'metadata_only', 'sources'],
+      ['原始资料 1 份索引失败', 'index_error', 'sources'],
+      ['原始资料 3 份整理失败', 'summary_error', 'sources'],
+      ['笔记 1 篇索引失败', 'index_error', 'notes'],
+      ['笔记 2 篇整理失败', 'summary_error', 'notes'],
+    ]) {
+      fireEvent.click(await screen.findByRole('button', { name: label, exact: true }));
+      await waitFor(() =>
+        expect(knowledgeApi.catalog).toHaveBeenLastCalledWith(
+          '',
+          'all',
+          0,
+          expect.any(AbortSignal),
+          view === 'sources'
+            ? { level: 'source', includeHistory: false, processing }
+            : { kind: 'note', sort: 'curated', processing }
+        )
+      );
+      expect(screen.getByText('已选 1 份')).toBeInTheDocument();
+      expect(screen.getByRole('textbox', { name: '搜索知识库' })).toHaveValue('');
+    }
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: '处理状态' }));
+    expect(
+      screen.queryByText('正文解析失败', { selector: '.ant-select-item-option-content' })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText('仅文件信息可检索', { selector: '.ant-select-item-option-content' })
+    ).not.toBeInTheDocument();
+  });
+
   it('shows matching content during search instead of hiding it behind a general summary', async () => {
     vi.mocked(knowledgeApi.catalog).mockResolvedValue({
       ...CATALOG,
@@ -706,6 +755,34 @@ describe('knowledge library management', () => {
     expect(drawer.queryByText('资料概览')).not.toBeInTheDocument();
   });
 
+  it('shows a source synthesis failure and clears it after the background retry completes', async () => {
+    const failed: KnowledgeEntryDetail = {
+      ...DETAIL,
+      entry: {
+        ...DETAIL.entry,
+        summaryMessage: '模型暂时不可用，稍后重试。',
+        summaryRetryAt: '2026-10-23T00:00:00Z',
+      },
+    };
+    vi.mocked(knowledgeApi.detail)
+      .mockResolvedValueOnce(failed)
+      .mockResolvedValue({
+        ...failed,
+        entry: { ...failed.entry, summaryDisposition: 'summarized' },
+      });
+    renderPage('entry-a');
+    expect(await screen.findByText('自动整理尚未成功，原文已保留')).toBeInTheDocument();
+    expect(screen.getByText('模型暂时不可用，稍后重试。')).toBeInTheDocument();
+    expect(screen.getByText(/下次重试/)).toBeInTheDocument();
+    fireEvent(document, new Event('visibilitychange'));
+    await waitFor(() =>
+      expect(screen.queryByText('自动整理尚未成功，原文已保留')).not.toBeInTheDocument()
+    );
+    expect(knowledgeApi.detail).toHaveBeenCalledTimes(2);
+    fireEvent(document, new Event('visibilitychange'));
+    expect(knowledgeApi.detail).toHaveBeenCalledTimes(2);
+  });
+
   it('updates an active source summary phase and stops polling once source processing completes', async () => {
     vi.mocked(knowledgeApi.detail)
       .mockResolvedValueOnce({
@@ -952,6 +1029,10 @@ describe('knowledge library management', () => {
     });
     renderPage('entry-a');
     const next = await screen.findByRole('button', { name: '下一段' });
+    fireEvent.click(screen.getByRole('button', { name: '下载 Markdown 归档' }));
+    await waitFor(() =>
+      expect(knowledgeApi.downloadMarkdown).toHaveBeenCalledWith('entry-a', '产品讨论')
+    );
     expect(screen.queryByText('最后一段原文', { exact: true })).not.toBeInTheDocument();
     fireEvent.click(next);
     expect(await screen.findByText('最后一段原文', { exact: true })).toBeInTheDocument();

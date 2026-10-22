@@ -4,6 +4,7 @@ import type {
   KnowledgeMaterialType,
   KnowledgeNoteType,
   KnowledgeOrganization,
+  KnowledgeProcessingFilter,
 } from '@disco/core/types';
 
 /** Format classification is independent of extraction/index success. */
@@ -73,4 +74,17 @@ export function retryDate(attempts: number, minimumMs = 0): string {
   return new Date(
     Date.now() + Math.max(minimumMs, Math.min(30 * 60_000, 30_000 * 2 ** Math.min(attempts - 1, 6)))
   ).toISOString();
+}
+
+export function hasProcessingIssue(
+  entry: KnowledgeEntry,
+  issue: KnowledgeProcessingFilter
+): boolean {
+  if (issue === 'index_error') return entry.indexStatus === 'error';
+  if (issue === 'parse_error') return entry.kind !== 'note' && entry.parseStatus === 'error';
+  if (issue === 'metadata_only')
+    return entry.kind !== 'note' && entry.parseStatus === 'unsupported';
+  return entry.kind === 'note'
+    ? entry.generation?.state === 'failed'
+    : !entry.summaryDisposition && Boolean(entry.summaryMessage);
 }

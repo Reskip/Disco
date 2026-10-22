@@ -269,6 +269,8 @@ describe('knowledge routes over authenticated HTTP', () => {
       (await (await request('/catalog?noteType=knowledge&sort=curated')).json()).entries[0].id
     ).toBe(note.entry.id);
     expect((await request('/entries?noteType=not-valid')).status).toBe(400);
+    expect((await request('/catalog?processing=metadata_only')).status).toBe(200);
+    expect((await request('/entries?processing=not-valid')).status).toBe(400);
     expect((await request('/entries?sort=not-valid')).status).toBe(400);
     expect(
       (

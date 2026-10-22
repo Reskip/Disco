@@ -1,5 +1,9 @@
-import type { KnowledgeLibraryStatus } from '@disco/core/types';
-import { Alert, Card, Collapse, Flex, Progress, Space, Typography, theme } from 'antd';
+import type {
+  KnowledgeLibraryStatus,
+  KnowledgeOverview,
+  KnowledgeProcessingFilter,
+} from '@disco/core/types';
+import { Alert, Button, Card, Collapse, Flex, Progress, Space, Typography, theme } from 'antd';
 import { formatDate, formatSummaryProgress } from './knowledgePresentation';
 
 function completionPercent(completed: number, total: number): number {
@@ -10,9 +14,13 @@ function completionPercent(completed: number, total: number): number {
 export function KnowledgeProgress({
   status,
   mobile = false,
+  issues,
+  onShowProcessing,
 }: {
   status: KnowledgeLibraryStatus;
   mobile?: boolean;
+  issues?: KnowledgeOverview['issues'];
+  onShowProcessing?: (view: 'sources' | 'notes', processing: KnowledgeProcessingFilter) => void;
 }) {
   const { token } = theme.useToken();
   const index = status.processing?.index;
@@ -20,6 +28,23 @@ export function KnowledgeProgress({
   const indexed = index?.indexed ?? Math.max(0, status.total - status.pendingIndex);
   const indexTotal = indexed + (index?.pending ?? status.pendingIndex) + (index?.failed ?? 0);
   const summaryTotal = (summary?.completed ?? 0) + (summary?.pending ?? 0) + (summary?.failed ?? 0);
+  const processingLink = (
+    view: 'sources' | 'notes',
+    processing: KnowledgeProcessingFilter,
+    label: string
+  ) =>
+    onShowProcessing ? (
+      <Button
+        type="link"
+        size="small"
+        onClick={() => onShowProcessing(view, processing)}
+        style={{ padding: 0, height: 'auto', whiteSpace: 'normal', textAlign: 'left' }}
+      >
+        {label}
+      </Button>
+    ) : (
+      <Typography.Text type="secondary">{label}</Typography.Text>
+    );
   const content = (
     <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
       <Flex gap={token.marginLG} wrap>
@@ -49,11 +74,33 @@ export function KnowledgeProgress({
             status={index?.failed ? 'exception' : undefined}
             aria-label="检索索引进度"
           />
-          <Typography.Text type={index?.failed ? 'warning' : 'secondary'}>
-            待处理 {index?.pending ?? status.pendingIndex}
-            {index?.failed ? ` · ${index.failed} 份失败，后台重试` : ''}
-            {index?.unsupported ? ` · 其中 ${index.unsupported} 份仅文件信息` : ''}
-          </Typography.Text>
+          <Flex wrap gap={token.marginXS} align="center">
+            <Typography.Text type={index?.failed ? 'warning' : 'secondary'}>
+              待处理 {index?.pending ?? status.pendingIndex}
+              {!issues && index?.failed ? ` · ${index.failed} 份失败，后台重试` : ''}
+              {!issues && index?.unsupported ? ` · 其中 ${index.unsupported} 份仅文件信息` : ''}
+            </Typography.Text>
+            {!!issues?.sources.indexErrors &&
+              processingLink(
+                'sources',
+                'index_error',
+                `原始资料 ${issues.sources.indexErrors} 份索引失败`
+              )}
+            {!!issues?.notes.indexErrors &&
+              processingLink('notes', 'index_error', `笔记 ${issues.notes.indexErrors} 篇索引失败`)}
+            {!!issues?.sources.parseErrors &&
+              processingLink(
+                'sources',
+                'parse_error',
+                `${issues.sources.parseErrors} 份正文解析失败`
+              )}
+            {!!issues?.sources.metadataOnly &&
+              processingLink(
+                'sources',
+                'metadata_only',
+                `其中 ${issues.sources.metadataOnly} 份仅文件信息`
+              )}
+          </Flex>
           {(index?.message || index?.active) && (
             <Typography.Text type="secondary">
               {index.message || `正在索引：${index.active}`}
@@ -70,11 +117,25 @@ export function KnowledgeProgress({
             status={summary?.failed ? 'exception' : undefined}
             aria-label="知识整理进度"
           />
-          <Typography.Text type={summary?.failed ? 'warning' : 'secondary'}>
-            笔记 {status.notes} 篇 · 待整理 {summary?.pending ?? 0}
-            {summary?.archivedOnly ? ` · ${summary.archivedOnly} 份仅归档` : ''}
-            {summary?.failed ? ` · ${summary.failed} 份失败，后台重试` : ''}
-          </Typography.Text>
+          <Flex wrap gap={token.marginXS} align="center">
+            <Typography.Text type={summary?.failed ? 'warning' : 'secondary'}>
+              笔记 {status.notes} 篇 · 待整理 {summary?.pending ?? 0}
+              {summary?.archivedOnly ? ` · ${summary.archivedOnly} 份仅归档` : ''}
+              {!issues && summary?.failed ? ` · ${summary.failed} 份失败，后台重试` : ''}
+            </Typography.Text>
+            {!!issues?.sources.summaryErrors &&
+              processingLink(
+                'sources',
+                'summary_error',
+                `原始资料 ${issues.sources.summaryErrors} 份整理失败`
+              )}
+            {!!issues?.notes.summaryErrors &&
+              processingLink(
+                'notes',
+                'summary_error',
+                `笔记 ${issues.notes.summaryErrors} 篇整理失败`
+              )}
+          </Flex>
           <Typography.Text type="secondary" style={{ overflowWrap: 'anywhere' }}>
             {summary?.progress
               ? `${summary.active ? `${summary.active} · ` : ''}${formatSummaryProgress(summary.progress)}`
@@ -92,7 +153,7 @@ export function KnowledgeProgress({
       )}
     </Space>
   );
-  const failed = (index?.failed ?? 0) + (summary?.failed ?? 0);
+  const failed = (index?.failed ?? 0) + (summary?.failed ?? 0) + (issues?.sources.parseErrors ?? 0);
   const engineUnavailable = status.engine && status.engine.status !== 'ready';
   return mobile ? (
     <Collapse

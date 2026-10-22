@@ -28,8 +28,15 @@ import type {
   KnowledgeSourceInput,
   KnowledgeSummaryProgress,
 } from '@disco/core/types';
-import { canSummarize, materialType, noteType, organization, retryDate } from './organization.js';
-import { searchTerms } from './search.js';
+import {
+  canSummarize,
+  hasProcessingIssue,
+  materialType,
+  noteType,
+  organization,
+  retryDate,
+} from './organization.js';
+import { knowledgeSearchEvidence } from './search.js';
 import type { HostAttachmentReference } from './sources.js';
 
 interface StoredEntry extends KnowledgeEntry {
@@ -668,6 +675,8 @@ export class KnowledgeLibrary {
         JSON.stringify(entry.sourceVersion) === JSON.stringify(sourceVersion) &&
         (input.titleProjectionVersion === undefined ||
           entry.titleProjectionVersion === input.titleProjectionVersion) &&
+        (input.summaryFormatVersion === undefined ||
+          entry.summaryFormatVersion === input.summaryFormatVersion) &&
         JSON.stringify(entry.organization) === JSON.stringify(grouping) &&
         JSON.stringify(entry.generation) === JSON.stringify(input.generation ?? entry.generation) &&
         JSON.stringify(attachments) === JSON.stringify(entry.attachments ?? [])
@@ -708,6 +717,7 @@ export class KnowledgeLibrary {
         derivedFrom,
         summaryContentHash: entry?.summaryContentHash,
         summaryMode: input.summaryMode ?? entry?.summaryMode,
+        summaryFormatVersion: input.summaryFormatVersion ?? entry?.summaryFormatVersion,
         sourceVersion,
         titleProjectionVersion: input.titleProjectionVersion ?? entry?.titleProjectionVersion,
         parseStatus: entry?.parseStatus,
@@ -831,8 +841,7 @@ export class KnowledgeLibrary {
     state: OwnerState,
     options: KnowledgeListOptions
   ): Promise<KnowledgeListResult> {
-    const query = options.query?.trim().toLocaleLowerCase();
-    const terms = query ? searchTerms(query) : [];
+    const query = options.query?.trim();
     const relevance = new Map<string, number>();
     const results: KnowledgeEntry[] = [];
     for (const entry of state.entries) {
@@ -840,6 +849,7 @@ export class KnowledgeLibrary {
       if (
         (options.kind && entry.kind !== options.kind) ||
         (options.noteType && noteType(entry) !== options.noteType) ||
+        (options.processing && !hasProcessingIssue(entry, options.processing)) ||
         (options.source && entry.source !== options.source) ||
         (options.materialType && materialType(entry) !== options.materialType) ||
         (options.level && organization(entry).level !== options.level) ||
@@ -853,29 +863,16 @@ export class KnowledgeLibrary {
         const detail = await this.refreshEntry(base, entry);
         if (!detail) continue;
         result = detail.entry;
-        const body = detail.markdown.toLocaleLowerCase();
-        const metadata =
-          `${entry.title} ${organization(entry).topic} ${organization(entry).summary ?? ''} ${(organization(entry).tags ?? []).join(' ')}`.toLocaleLowerCase();
-        const match = body.indexOf(query);
-        const positions = terms.map((term) => body.indexOf(term));
-        const bodyMatches = positions.filter((position) => position >= 0).length;
-        const metadataMatches = terms.filter((term) => metadata.includes(term)).length;
-        if (match < 0 && !metadata.includes(query) && !bodyMatches && !metadataMatches) continue;
-        relevance.set(
-          entry.id,
-          (metadata.includes(query) ? 20 : 0) +
-            (match >= 0 ? 10 : 0) +
-            metadataMatches * 2 +
-            bodyMatches
-        );
-        const firstMatch =
-          match >= 0
-            ? match
-            : (positions.filter((position) => position >= 0).sort((a, b) => a - b)[0] ?? 0);
-        result.snippet = detail.markdown.slice(
-          Math.max(0, firstMatch - 60),
-          Math.max(0, firstMatch - 60) + 280
-        );
+        const evidence = knowledgeSearchEvidence(detail, query, 220);
+        if (!evidence.technical || (!evidence.matched && !evidence.fieldMatches)) continue;
+        relevance.set(entry.id, evidence.score);
+        result.snippet =
+          evidence.position === undefined
+            ? `资料信息匹配：${evidence.metadata.replace(/\n/g, ' · ')}`.slice(0, 280)
+            : detail.markdown.slice(
+                Math.max(0, evidence.position - 60),
+                Math.max(0, evidence.position - 60) + 280
+              );
       }
       results.push(result);
     }
@@ -940,9 +937,8 @@ export class KnowledgeLibrary {
               (canSummarize(entry) && entry.summaryContentHash === entry.contentHash) ||
               (!entry.derivedFrom && entry.generation?.state === 'complete')
           ).length,
-          failed: state.entries.filter(
-            (entry) => entry.summaryMessage || entry.generation?.state === 'failed'
-          ).length,
+          failed: state.entries.filter((entry) => hasProcessingIssue(entry, 'summary_error'))
+            .length,
         },
       },
       deleted: state.tombstones.length,
@@ -978,6 +974,10 @@ export class KnowledgeLibrary {
       topics: [],
       counts: { source: 0, summary: 0, knowledge: 0 },
       materials: { conversation: 0, document: 0, image: 0, file: 0, note: 0 },
+      issues: {
+        sources: { indexErrors: 0, parseErrors: 0, metadataOnly: 0, summaryErrors: 0 },
+        notes: { indexErrors: 0, summaryErrors: 0 },
+      },
     };
     const topics = new Map<string, number>();
     const noteTopics = new Map<string, number>();
@@ -986,6 +986,11 @@ export class KnowledgeLibrary {
       const group = organization(entry);
       result.counts[group.level]++;
       result.materials[materialType(entry)]++;
+      const issues = entry.kind === 'note' ? result.issues!.notes : result.issues!.sources;
+      if (hasProcessingIssue(entry, 'index_error')) issues.indexErrors++;
+      if (hasProcessingIssue(entry, 'summary_error')) issues.summaryErrors++;
+      if (hasProcessingIssue(entry, 'parse_error')) result.issues!.sources.parseErrors++;
+      if (hasProcessingIssue(entry, 'metadata_only')) result.issues!.sources.metadataOnly++;
       topics.set(group.topic, (topics.get(group.topic) ?? 0) + 1);
       if (entry.kind === 'note')
         noteTopics.set(group.topic, (noteTopics.get(group.topic) ?? 0) + 1);

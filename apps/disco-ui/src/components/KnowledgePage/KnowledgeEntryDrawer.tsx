@@ -37,6 +37,7 @@ import {
   formatDate,
   formatSummaryProgress,
   GENERATION_LABELS,
+  hasSummaryFailure,
   LEVEL_LABELS,
   PARSE_LABELS,
   SOURCE_LABELS,
@@ -422,6 +423,23 @@ export function KnowledgeEntryDrawer({
                 description={formatSummaryProgress(detail.entry.summaryProgress)}
               />
             )}
+            {detail.entry.kind !== 'note' && hasSummaryFailure(detail.entry) && (
+              <Alert
+                type="warning"
+                showIcon
+                title="自动整理尚未成功，原文已保留"
+                description={
+                  <Space orientation="vertical">
+                    <Typography.Text>{detail.entry.summaryMessage}</Typography.Text>
+                    {detail.entry.summaryRetryAt && (
+                      <Typography.Text>
+                        下次重试 {formatDate(detail.entry.summaryRetryAt)}
+                      </Typography.Text>
+                    )}
+                  </Space>
+                }
+              />
+            )}
             {detail.entry.indexStatus === 'error' && (
               <Alert
                 type="warning"
@@ -474,7 +492,7 @@ export function KnowledgeEntryDrawer({
                 loading={downloadingMarkdown}
                 onClick={() => void downloadMarkdown()}
               >
-                下载完整原文
+                下载 Markdown 归档
               </Button>
               {paged && (
                 <Typography.Text type="secondary">长文按段阅读，完整归档不受影响。</Typography.Text>

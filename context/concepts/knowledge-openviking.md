@@ -92,6 +92,14 @@ sources uses the model on the prepared input, returning `summaryMode: model`.
 This preparation never modifies the portable source or claims row-by-row
 knowledge extraction from a structural overview.
 
+Local overview topics use meaningful source/page titles and static text, not the
+file format; HTML/JSON remain format tags. Ambiguous content stays in Other.
+`summaryFormatVersion` tracks the local renderer/classifier. Outdated automatic
+overview drafts are rebuilt locally against current source hashes; confirmed,
+human-edited, deleted and historical notes are excluded. Source files stay
+unchanged. A file edited externally during rebuilding is detected by the same
+library commit guard that protects ordinary human notes.
+
 The helper guards the installed Codex adapter's synchronous Responses stream:
 failed/incomplete or missing completion events cannot become partial successes.
 It accepts a complete JSON object inside a presentation wrapper, but never
@@ -252,9 +260,14 @@ installed MCP SDK; it does not download dependencies on launch. Every source is
 untrusted reference content. A tool description encourages relevant historical
 retrieval, but it alone does not guarantee retrieval on every prompt.
 
-Read pagination returns `offset`, `nextOffset`, `totalCharacters`, and `hasMore`.
-Only the response is paginated: the original archive is not truncated. Search
-excerpts are previews, and the caller follows entry IDs to read source text.
+Read forwards `offset`, `limit`, and optional `contentHash` to the daemon rather
+than downloading the whole archive in the MCP process. It returns `offset`,
+`nextOffset` (null at the end), `totalCharacters`, `hasMore`, `contentHash`, and
+the source references. Positions use UTF-16 units and respect surrogate pairs.
+Subsequent pages should carry the returned hash; a changed document returns a
+conflict so the caller can restart without mixing revisions. The original
+archive is never truncated. Search excerpts are previews, and the caller
+follows entry IDs to read source text.
 Update and delete are marked destructive; auto-generated summaries may not call
 update to overwrite human-authored content.
 

@@ -31,10 +31,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   );
   if (!response.ok) {
     if (response.status === 409) {
-      throw new Error(
-        init?.method === 'PATCH'
-          ? '这份资料已有新修改。请先保存好当前草稿，重新打开资料后再合并修改。'
-          : '这份资料已有新修改，请重新打开后继续阅读。'
+      throw Object.assign(
+        new Error(
+          init?.method === 'PATCH'
+            ? '这份资料已有新修改。请先保存好当前草稿，重新打开资料后再合并修改。'
+            : '这份资料已有新修改，请重新打开后继续阅读。'
+        ),
+        { status: 409 }
       );
     }
     const body = await response.json().catch(() => null);

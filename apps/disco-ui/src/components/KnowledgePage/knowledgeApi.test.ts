@@ -38,6 +38,18 @@ describe('knowledge HTTP client', () => {
     });
   });
 
+  it('preserves the HTTP conflict status for safe search-position recovery', async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValue(new Response('{}', { status: 409 }));
+    await expect(
+      knowledgeApi.detail('entry-a', undefined, {
+        offset: 80_000,
+        limit: 40_000,
+        contentHash: 'old-version',
+      })
+    ).rejects.toMatchObject({ status: 409 });
+    expect(authenticatedFetch).toHaveBeenCalledOnce();
+  });
+
   it('preserves source filtering and pagination without fetching document bodies', async () => {
     vi.mocked(authenticatedFetch).mockResolvedValue(
       new Response('{"entries":[],"total":0}', { status: 200 })

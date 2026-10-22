@@ -6,6 +6,10 @@ The authenticated `/knowledge` API and the `/knowledge` UI page expose one
 portable library per tenant/user. The page is reachable from Home and Settings.
 Ordinary Markdown, complete source JSONL, original attachments, revisions,
 provenance and persistent deletion tombstones are exported together as ZIP64.
+Each export also generates a Chinese README and a Markdown directory grouped
+by note topic and original file type. Its title, attachment and provenance links
+point to files inside the archive, so the export can be browsed without Disco.
+These navigation files do not rewrite or rename any authoritative source.
 Opening a list does not download document bodies or attachments. Chrome can
 stream an export to a user-selected local file; other browsers use a Blob fallback.
 

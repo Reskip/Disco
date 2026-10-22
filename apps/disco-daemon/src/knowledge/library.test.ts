@@ -885,6 +885,50 @@ describe('portable knowledge library', () => {
     expect(spy.mock.calls.every(([, file]) => file.startsWith('.library/'))).toBe(true);
   });
 
+  it('returns transient version-bound snippet offsets only for actual body matches', async () => {
+    const prefix = '普通正文🙂\n'.repeat(8000);
+    const body = `${prefix}检索定位边界\n命中之后的原文。`;
+    const deep = (await library.upsertSource(owner, {
+      ...source,
+      sourceId: 'deep-search',
+      title: '很长的正文',
+      markdown: body,
+    }))!;
+    const metadata = (await library.upsertSource(owner, {
+      ...source,
+      sourceId: 'metadata-search',
+      title: '检索定位边界',
+      markdown: '完全不同的内容',
+    }))!;
+    const first = (await library.upsertSource(owner, {
+      ...source,
+      sourceId: 'first-search',
+      title: '开头内容',
+      markdown: '检索定位边界就在开头',
+    }))!;
+    const matches = await library.catalog(owner, { query: '检索定位边界' });
+    const hit = matches.entries.find((entry) => entry.id === deep.entry.id)!;
+    expect(hit.searchMatch).toEqual({ offset: prefix.length - 60, contentHash: deep.contentHash });
+    expect(hit.snippet).toBe(body.slice(hit.searchMatch!.offset, hit.searchMatch!.offset + 280));
+    expect(matches.entries.find((entry) => entry.id === first.entry.id)?.searchMatch).toEqual({
+      offset: 0,
+      contentHash: first.contentHash,
+    });
+    const titleOnly = matches.entries.find((entry) => entry.id === metadata.entry.id)!;
+    expect(titleOnly.snippet).toContain('资料信息匹配：');
+    expect(titleOnly.searchMatch).toBeUndefined();
+    expect((await library.list(owner)).entries.every((entry) => !entry.searchMatch)).toBe(true);
+    expect((await library.get(owner, deep.entry.id))?.entry.searchMatch).toBeUndefined();
+    const stored = JSON.parse(
+      await readFile(
+        join(library.ownerPath(owner), '.library/entries', `${deep.entry.id}.json`),
+        'utf8'
+      )
+    );
+    expect(stored.searchMatch).toBeUndefined();
+    expect((await library.catalog(otherUser, { query: '检索定位边界' })).entries).toEqual([]);
+  });
+
   it('reports source revisions without rereading unchanged bodies and preserves deleted source names', async () => {
     const first = (await library.upsertSource(owner, source))!;
     const second = (await library.upsertSource(owner, {

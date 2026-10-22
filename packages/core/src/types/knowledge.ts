@@ -110,6 +110,8 @@ export interface KnowledgeEntry {
   sourceUrl?: string;
   attachments?: KnowledgeAttachment[];
   snippet?: string;
+  /** Transient catalog body match: UTF-16 snippet start in this exact content version. */
+  searchMatch?: { offset: number; contentHash: string };
   derivedFrom?: { entryId: string; contentHash: string };
   sourceReferences?: KnowledgeSourceReference[];
   summaryContentHash?: string;

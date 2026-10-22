@@ -12,6 +12,7 @@ import {
   unlink,
 } from 'node:fs/promises';
 import { dirname, extname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
+import { Readable } from 'node:stream';
 import { finished } from 'node:stream/promises';
 import type {
   KnowledgeAttachment,
@@ -28,6 +29,7 @@ import type {
   KnowledgeSourceInput,
   KnowledgeSummaryProgress,
 } from '@disco/core/types';
+import { knowledgeExportGuide } from './export-catalog.js';
 import {
   canSummarize,
   hasProcessingIssue,
@@ -65,7 +67,7 @@ interface OwnerState {
 export interface KnowledgeExportFile {
   path: string;
   size: number;
-  body: ReadStream;
+  body: Readable;
 }
 
 export interface KnowledgeAttachmentInput {
@@ -918,13 +920,16 @@ export class KnowledgeLibrary {
         const evidence = knowledgeSearchEvidence(detail, query, 220);
         if (!evidence.technical || (!evidence.matched && !evidence.fieldMatches)) continue;
         relevance.set(entry.id, evidence.score);
-        result.snippet =
-          evidence.position === undefined
-            ? `资料信息匹配：${evidence.metadata.replace(/\n/g, ' · ')}`.slice(0, 280)
-            : detail.markdown.slice(
-                Math.max(0, evidence.position - 60),
-                Math.max(0, evidence.position - 60) + 280
-              );
+        if (evidence.position === undefined) {
+          result.snippet = `资料信息匹配：${evidence.metadata.replace(/\n/g, ' · ')}`.slice(0, 280);
+        } else {
+          let offset = Math.max(0, evidence.position - 60);
+          if (offset > 0 && /[\uDC00-\uDFFF]/.test(detail.markdown[offset] ?? '')) offset--;
+          let end = Math.min(detail.markdown.length, offset + 280);
+          if (end < detail.markdown.length && /[\uDC00-\uDFFF]/.test(detail.markdown[end])) end++;
+          result.snippet = detail.markdown.slice(offset, end);
+          result.searchMatch = { offset, contentHash: detail.contentHash };
+        }
       }
       results.push(result);
     }
@@ -1645,7 +1650,7 @@ export class KnowledgeLibrary {
     KnowledgeLibrary.queues.set(key, queued);
     await previous.catch(() => undefined);
     let release: (() => Promise<void>) | undefined;
-    let activeStream: ReadStream | undefined;
+    let activeStream: Readable | undefined;
     const abort = () => activeStream?.destroy(new Error('知识库导出已取消。'));
     signal?.addEventListener('abort', abort, { once: true });
     try {
@@ -1653,6 +1658,7 @@ export class KnowledgeLibrary {
       const base = await this.initialize(owner);
       release = await this.lock(base);
       await this.recover(base);
+      const paths: string[] = [];
       for (const directory of [
         '.library',
         'notes',
@@ -1671,16 +1677,35 @@ export class KnowledgeLibrary {
             path.endsWith('.partial')
           )
             continue;
-          const stream = await this.readStream(base, path);
-          if (!stream) continue;
-          activeStream = stream.body;
-          const consumed = finished(activeStream);
-          // The HTTP consumer can abort before requesting the iterator's next item.
-          void consumed.catch(() => undefined);
-          yield { path, ...stream };
-          await consumed;
-          activeStream = undefined;
+          paths.push(path);
         }
+      }
+      const guides = knowledgeExportGuide(
+        (await this.state(base)).entries,
+        new Set(paths),
+        new Date().toISOString()
+      );
+      for (const guide of guides) {
+        signal?.throwIfAborted();
+        const bytes = markdownBytes(guide.markdown);
+        activeStream = Readable.from([bytes]);
+        const consumed = finished(activeStream);
+        void consumed.catch(() => undefined);
+        yield { path: guide.path, size: bytes.length, body: activeStream };
+        await consumed;
+        activeStream = undefined;
+      }
+      for (const path of paths) {
+        signal?.throwIfAborted();
+        const stream = await this.readStream(base, path);
+        if (!stream) continue;
+        activeStream = stream.body;
+        const consumed = finished(activeStream);
+        // The HTTP consumer can abort before requesting the iterator's next item.
+        void consumed.catch(() => undefined);
+        yield { path, ...stream };
+        await consumed;
+        activeStream = undefined;
       }
     } finally {
       signal?.removeEventListener('abort', abort);

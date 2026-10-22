@@ -67,6 +67,13 @@ function boundedReadingDetail(value: KnowledgeEntryDetail): KnowledgeEntryDetail
   };
 }
 
+type ReadingLocation = {
+  offset: number;
+  contentHash?: string;
+  searchMatch?: KnowledgeEntry['searchMatch'];
+  previousOffsets?: Array<[number, number]>;
+};
+
 export function KnowledgePage({
   mobile = false,
   entryId,
@@ -103,9 +110,16 @@ export function KnowledgePage({
   const [error, setError] = useState<string | null>(null);
   const [revision, setRevision] = useState(0);
   const [selectedId, setSelectedId] = useState<string | null>(entryId || null);
-  const [readingHistory, setReadingHistory] = useState<Array<{ id: string; title: string }>>([]);
+  const [readingHistory, setReadingHistory] = useState<
+    Array<{ id: string; title: string; location: ReadingLocation }>
+  >([]);
+  const initialLocationRef = useRef<{ id: string; location: ReadingLocation } | null>(null);
+  const [readingMatch, setReadingMatch] = useState<KnowledgeEntry['searchMatch']>();
+  const [readingNotice, setReadingNotice] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [detail, setDetail] = useState<KnowledgeEntryDetail | null>(null);
+  const detailRef = useRef(detail);
+  detailRef.current = detail;
   const [detailLoading, setDetailLoading] = useState(false);
   const [fullLoading, setFullLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
@@ -132,6 +146,7 @@ export function KnowledgePage({
         JSON.stringify(organization) !== JSON.stringify(entryOrganization(detail.entry)));
 
   useEffect(() => {
+    initialLocationRef.current = null;
     setSelectedId(entryId || null);
     setCreating(false);
     setReadingHistory([]);
@@ -218,27 +233,62 @@ export function KnowledgePage({
     if (!selectedId) return;
     const controller = new AbortController();
     const requestId = ++detailRequestRef.current;
-    previousPageOffsetsRef.current.clear();
+    const location =
+      initialLocationRef.current?.id === selectedId
+        ? initialLocationRef.current.location
+        : undefined;
+    previousPageOffsetsRef.current = new Map(location?.previousOffsets);
     setDetail(null);
     setDetailLoading(true);
     setDetailError(null);
     setEditing(false);
     setFullLoading(false);
-    void knowledgeApi.detail(selectedId, controller.signal, { offset: 0, limit: 40_000 }).then(
-      (value) => {
+    setReadingMatch(location?.searchMatch);
+    setReadingNotice(null);
+    const load = async () => {
+      try {
+        let value: KnowledgeEntryDetail;
+        let changed = false;
+        try {
+          value = await knowledgeApi.detail(selectedId, controller.signal, {
+            offset: location?.offset ?? 0,
+            limit: 40_000,
+            ...(location?.contentHash ? { contentHash: location.contentHash } : {}),
+          });
+        } catch (cause) {
+          if (
+            !location?.contentHash ||
+            !(cause instanceof Error) ||
+            !('status' in cause) ||
+            cause.status !== 409 ||
+            controller.signal.aborted
+          ) {
+            throw cause;
+          }
+          value = await knowledgeApi.detail(selectedId, controller.signal, {
+            offset: 0,
+            limit: 40_000,
+          });
+          changed = true;
+        }
         if (controller.signal.aborted || requestId !== detailRequestRef.current) return;
+        if (changed) {
+          previousPageOffsetsRef.current.clear();
+          setReadingMatch(undefined);
+          setReadingNotice('这份资料已有更新，已从头打开最新版本。');
+        }
         setDetail(value);
         setTitle(value.entry.title);
         setMarkdown(value.markdown);
         setOrganization(entryOrganization(value.entry));
         setDetailLoading(false);
-      },
-      (cause: unknown) => {
+      } catch (cause) {
         if (controller.signal.aborted || requestId !== detailRequestRef.current) return;
         setDetailError(errorMessage(cause));
         setDetailLoading(false);
       }
-    );
+    };
+    void load();
     return () => controller.abort();
   }, [selectedId]);
 
@@ -265,6 +315,17 @@ export function KnowledgePage({
           limit: 40_000,
         });
         if (controller.signal.aborted || editingRef.current) return;
+        const previous = detailRef.current;
+        if (previous?.entry.id !== generatingId) return;
+        if (previous.contentHash !== value.contentHash) {
+          previousPageOffsetsRef.current.clear();
+          setReadingMatch(undefined);
+          setReadingNotice('资料正文已更新，当前显示最新内容。');
+          initialLocationRef.current = {
+            id: value.entry.id,
+            location: { offset: value.page?.offset ?? 0, contentHash: value.contentHash },
+          };
+        }
         setDetail(value);
         setTitle(value.entry.title);
         setMarkdown(value.markdown);
@@ -295,6 +356,9 @@ export function KnowledgePage({
       setDetail(null);
       setDetailError(null);
       setReadingHistory([]);
+      setReadingMatch(undefined);
+      setReadingNotice(null);
+      initialLocationRef.current = null;
     };
     if (dirty) {
       modal.confirm({
@@ -331,7 +395,7 @@ export function KnowledgePage({
     }
   };
 
-  const loadDetailPage = async (pageOffset: number) => {
+  const loadDetailPage = async (pageOffset: number, fromStart = false) => {
     if (!detail || detailLoading || fullLoading) return;
     const requestId = ++detailRequestRef.current;
     setDetailLoading(true);
@@ -347,6 +411,10 @@ export function KnowledgePage({
         previousPageOffsetsRef.current.set(value.page.offset, detail.page?.offset ?? 0);
       }
       setDetail(value);
+      if (fromStart) {
+        setReadingMatch(undefined);
+        setReadingNotice(null);
+      }
     } catch (cause) {
       if (requestId === detailRequestRef.current) setDetailError(errorMessage(cause));
     } finally {
@@ -506,7 +574,14 @@ export function KnowledgePage({
     setProcessing(nextProcessing);
     setResult(null);
   };
-  const openEntry = (id: string) => {
+  const openEntry = (id: string, match?: KnowledgeEntry['searchMatch']) => {
+    initialLocationRef.current = {
+      id,
+      location:
+        match && Number.isFinite(match.offset) && match.offset >= 0 && match.contentHash
+          ? { offset: match.offset, contentHash: match.contentHash, searchMatch: match }
+          : { offset: 0 },
+    };
     setCreating(false);
     setReadingHistory([]);
     setSelectedId(id);
@@ -515,8 +590,18 @@ export function KnowledgePage({
     if (!detail || editingRef.current || saving || id === detail.entry.id) return;
     setReadingHistory((history) => [
       ...history,
-      { id: detail.entry.id, title: detail.entry.title },
+      {
+        id: detail.entry.id,
+        title: detail.entry.title,
+        location: {
+          offset: detail.page?.offset ?? 0,
+          contentHash: detail.contentHash,
+          searchMatch: readingMatch,
+          previousOffsets: [...previousPageOffsetsRef.current],
+        },
+      },
     ]);
+    initialLocationRef.current = { id, location: { offset: 0 } };
     setCreating(false);
     setSelectedId(id);
   };
@@ -524,6 +609,7 @@ export function KnowledgePage({
     const previous = readingHistory.at(-1);
     if (!previous || editingRef.current || saving) return;
     setReadingHistory((history) => history.slice(0, -1));
+    initialLocationRef.current = { id: previous.id, location: previous.location };
     setCreating(false);
     setSelectedId(previous.id);
   };
@@ -921,7 +1007,9 @@ export function KnowledgePage({
                         <div style={{ flex: 1, minWidth: 0 }}>
                           <Button
                             type="link"
-                            onClick={() => openEntry(entry.id)}
+                            onClick={() =>
+                              openEntry(entry.id, query ? entry.searchMatch : undefined)
+                            }
                             style={{
                               padding: 0,
                               maxWidth: '100%',
@@ -1036,7 +1124,18 @@ export function KnowledgePage({
         closeDetail={closeDetail}
         startEditing={startEditing}
         loadDetailPage={loadDetailPage}
-        previousPageOffset={previousPageOffsetsRef.current.get(detail?.page?.offset ?? 0) ?? 0}
+        previousPageOffset={
+          previousPageOffsetsRef.current.get(detail?.page?.offset ?? 0) ??
+          Math.max(0, (detail?.page?.offset ?? 0) - 40_000)
+        }
+        readingNotice={readingNotice}
+        searchLocated={Boolean(
+          readingMatch &&
+            detail?.contentHash === readingMatch.contentHash &&
+            (detail.page?.offset ?? 0) <= readingMatch.offset &&
+            readingMatch.offset < (detail.page?.offset ?? 0) + detail.markdown.length
+        )}
+        readFromStart={() => void loadDetailPage(0, true)}
         setTitle={setTitle}
         setMarkdown={setMarkdown}
         setOrganization={setOrganization}

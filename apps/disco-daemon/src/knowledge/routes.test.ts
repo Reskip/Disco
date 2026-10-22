@@ -220,6 +220,36 @@ describe('knowledge routes over authenticated HTTP', () => {
     ).toBe(409);
   });
 
+  it('opens a catalog body match at its exact version-bound reading window', async () => {
+    const prefix = `${'ab🙂\n'.repeat(10000)}甲乙丙`;
+    const original = `${prefix}精准回溯\n${'后续内容🙂\n'.repeat(80)}`;
+    const record = await create('长篇定位资料', original);
+    const results = await (
+      await request(`/catalog?query=${encodeURIComponent('精准回溯')}`)
+    ).json();
+    const hit = results.entries.find((entry: { id: string }) => entry.id === record.entry.id);
+    expect(hit.searchMatch).toEqual({
+      offset: prefix.length - 61,
+      contentHash: record.contentHash,
+    });
+    expect(hit.snippet).not.toMatch(/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/);
+    const suffix = new URLSearchParams({
+      offset: String(hit.searchMatch.offset),
+      limit: '40000',
+      contentHash: hit.searchMatch.contentHash,
+    });
+    const response = await request(`/entries/${record.entry.id}?${suffix}`);
+    expect(response.status).toBe(200);
+    const detail = (await response.json()) as KnowledgeEntryDetail;
+    expect(detail.page?.offset).toBe(hit.searchMatch.offset);
+    expect(detail.markdown.startsWith(hit.snippet)).toBe(true);
+    expect(detail.markdown).toContain('精准回溯');
+    expect(detail.markdown.length).toBeLessThan(original.length);
+    expect((await request(`/entries/${record.entry.id}?${suffix}`, {}, 'beta')).status).toBe(404);
+    await runtime.library.edit(owner, record.entry.id, '新版已改变定位内容');
+    expect((await request(`/entries/${record.entry.id}?${suffix}`)).status).toBe(409);
+  });
+
   it('filters organized notes and preserves verified source links through editing', async () => {
     const source = await create('测试来源', '# 原始资料\n实际结论');
     const arranged = await request('/organize', {
@@ -440,6 +470,12 @@ describe('knowledge routes over authenticated HTTP', () => {
     expect(response.status).toBe(200);
     expect(response.headers.get('Content-Type')).toContain('application/zip');
     const files = unzipArchive(Buffer.from(await response.arrayBuffer()));
+    expect(files.has('README.md')).toBe(true);
+    expect(files.has('资料目录.md')).toBe(true);
+    expect(files.get('README.md')?.toString('utf8')).toContain('资料目录');
+    const catalog = files.get('资料目录.md')!.toString('utf8');
+    expect(catalog).toContain(`[导出全文](${encodeURI(detail.entry.relativePath)})`);
+    expect(catalog).toContain(`[文件.bin](${encodeURI(attachment.relativePath!)})`);
     expect(
       files
         .get(detail.entry.relativePath)

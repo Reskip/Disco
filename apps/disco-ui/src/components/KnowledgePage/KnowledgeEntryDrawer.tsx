@@ -61,6 +61,9 @@ export function KnowledgeEntryDrawer({
   startEditing,
   loadDetailPage,
   previousPageOffset,
+  readingNotice,
+  searchLocated,
+  readFromStart,
   setTitle,
   setMarkdown,
   setOrganization,
@@ -87,6 +90,9 @@ export function KnowledgeEntryDrawer({
   startEditing: () => Promise<void>;
   loadDetailPage: (offset: number) => Promise<void>;
   previousPageOffset: number;
+  readingNotice: string | null;
+  searchLocated: boolean;
+  readFromStart: () => void;
   setTitle: (value: string) => void;
   setMarkdown: (value: string) => void;
   setOrganization: (value: KnowledgeOrganization) => void;
@@ -115,7 +121,7 @@ export function KnowledgeEntryDrawer({
     }
     if (!readingEntryId) return;
     if (previousReadingRef.current?.id !== readingEntryId) {
-      detailTopRef.current?.scrollIntoView?.({ block: 'start' });
+      (readingOffset > 0 ? readingRef : detailTopRef).current?.scrollIntoView?.({ block: 'start' });
     } else if (previousReadingRef.current.offset !== readingOffset) {
       readingRef.current?.scrollIntoView?.({ block: 'start' });
     }
@@ -575,6 +581,33 @@ export function KnowledgeEntryDrawer({
               </Card>
             )}
             <div ref={readingRef}>
+              {readingNotice && (
+                <Alert
+                  type="info"
+                  showIcon
+                  title={readingNotice}
+                  style={{ marginBottom: token.marginSM }}
+                />
+              )}
+              {searchLocated && (
+                <Flex
+                  gap={token.marginSM}
+                  align="center"
+                  wrap
+                  style={{ marginBottom: token.marginSM }}
+                >
+                  <Typography.Text type="secondary">已定位搜索命中</Typography.Text>
+                  {readingOffset > 0 && (
+                    <Button
+                      size="small"
+                      disabled={detailLoading || fullLoading}
+                      onClick={readFromStart}
+                    >
+                      从头阅读
+                    </Button>
+                  )}
+                </Flex>
+              )}
               {detail.entry.kind === 'note' && !paged ? (
                 <KnowledgeNoteContent markdown={detail.markdown} />
               ) : (

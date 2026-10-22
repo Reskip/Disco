@@ -1129,6 +1129,191 @@ describe('knowledge library management', () => {
     expect(screen.queryByText(/人工补充/)).not.toBeInTheDocument();
   });
 
+  it('opens a deep search match with bounded reading, restores source-return position and edits the full body', async () => {
+    const matchedEntry = {
+      ...DETAIL.entry,
+      kind: 'note' as const,
+      searchMatch: { offset: 80_000, contentHash: DETAIL.contentHash },
+    };
+    const fullText = `${'开头原文'.padEnd(80_000, '文')}命中尾部`;
+    const complete: KnowledgeEntryDetail = {
+      ...DETAIL,
+      entry: matchedEntry,
+      markdown: fullText,
+      sources: [
+        { id: 'other-source', title: '整理原文', available: true, revisionStatus: 'current' },
+      ],
+    };
+    vi.mocked(knowledgeApi.catalog).mockResolvedValue({ ...CATALOG, entries: [matchedEntry] });
+    vi.mocked(knowledgeApi.detail).mockImplementation(async (id, _signal, page) => {
+      if (id === 'other-source') {
+        return { ...DETAIL, entry: { ...DETAIL.entry, id }, markdown: '来源正文' };
+      }
+      if (!page) return complete;
+      return {
+        ...complete,
+        markdown: fullText.slice(page.offset, page.offset + 40_000),
+        page: {
+          offset: page.offset,
+          totalChars: fullText.length,
+          nextOffset: page.offset + 40_000 < fullText.length ? page.offset + 40_000 : null,
+          hasMore: page.offset + 40_000 < fullText.length,
+        },
+      };
+    });
+    renderPage();
+    fireEvent.change(screen.getByRole('textbox', { name: '搜索知识库' }), {
+      target: { value: '命中尾部' },
+    });
+    await waitFor(() =>
+      expect(vi.mocked(knowledgeApi.catalog).mock.calls.at(-1)?.[0]).toBe('命中尾部')
+    );
+    fireEvent.click(await screen.findByRole('button', { name: '产品讨论' }));
+    expect(await screen.findByText('命中尾部', { exact: true })).toBeInTheDocument();
+    expect(screen.getByText('已定位搜索命中')).toBeInTheDocument();
+    expect(knowledgeApi.detail).toHaveBeenLastCalledWith('entry-a', expect.any(AbortSignal), {
+      offset: 80_000,
+      limit: 40_000,
+      contentHash: DETAIL.contentHash,
+    });
+    expect(vi.mocked(knowledgeApi.detail).mock.calls.every((call) => call[2])).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: '整理原文' }));
+    await screen.findByText('来源正文');
+    fireEvent.click(screen.getByRole('button', { name: '返回上一份资料：产品讨论' }));
+    await screen.findByText('命中尾部', { exact: true });
+    expect(knowledgeApi.detail).toHaveBeenLastCalledWith('entry-a', expect.any(AbortSignal), {
+      offset: 80_000,
+      limit: 40_000,
+      contentHash: DETAIL.contentHash,
+    });
+    fireEvent.click(screen.getByRole('button', { name: '从头阅读' }));
+    await waitFor(() => expect(screen.queryByText('已定位搜索命中')).not.toBeInTheDocument());
+    expect(screen.getByText(/^开头原文/)).toBeInTheDocument();
+    expect(screen.queryByText('命中尾部', { exact: true })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '编辑' }));
+    expect(await screen.findByRole('textbox', { name: 'Markdown 正文' })).toHaveValue(fullText);
+    expect(knowledgeApi.detail).toHaveBeenLastCalledWith('entry-a');
+    expect(knowledgeApi.save).not.toHaveBeenCalled();
+  });
+
+  it('clears stale search locations and page boundaries only when a background poll changes the body hash', async () => {
+    let contentHash = DETAIL.contentHash;
+    let completed = 0;
+    const entry = {
+      ...DETAIL.entry,
+      kind: 'note' as const,
+      generation: { state: 'running' as const },
+      searchMatch: { offset: 39_999, contentHash },
+    };
+    vi.mocked(knowledgeApi.catalog).mockResolvedValue({ ...CATALOG, entries: [entry] });
+    vi.mocked(knowledgeApi.detail).mockImplementation(async (_id, _signal, page) => {
+      const offset = page?.offset ?? 0;
+      return {
+        ...DETAIL,
+        entry: {
+          ...entry,
+          generation: {
+            state: 'running',
+            progress: { phase: 'processing', stage: 'map', completed, total: 3 },
+          },
+        },
+        contentHash,
+        markdown: `${contentHash === DETAIL.contentHash ? '原文' : '最新正文'}-${offset}`,
+        page: { offset, totalChars: 150_000, nextOffset: offset + 39_999, hasMore: true },
+      };
+    });
+    renderPage();
+    fireEvent.change(screen.getByRole('textbox', { name: '搜索知识库' }), {
+      target: { value: '位置' },
+    });
+    await waitFor(() =>
+      expect(vi.mocked(knowledgeApi.catalog).mock.calls.at(-1)?.[0]).toBe('位置')
+    );
+    fireEvent.click(await screen.findByRole('button', { name: '产品讨论' }));
+    await screen.findByText('已定位搜索命中');
+    completed = 1;
+    fireEvent(document, new Event('visibilitychange'));
+    await screen.findByText(/已完成 1\/3 段/);
+    expect(screen.getByText('已定位搜索命中')).toBeInTheDocument();
+    expect(screen.queryByText('资料正文已更新，当前显示最新内容。')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '下一段' }));
+    await screen.findByText('原文-79998');
+    contentHash = 'new-body-hash';
+    fireEvent(document, new Event('visibilitychange'));
+    await screen.findByText('最新正文-79998');
+    expect(screen.getByText('资料正文已更新，当前显示最新内容。')).toBeInTheDocument();
+    expect(screen.queryByText('已定位搜索命中')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '上一段' }));
+    await screen.findByText('最新正文-39998');
+    expect(knowledgeApi.detail).toHaveBeenLastCalledWith('entry-a', undefined, {
+      offset: 39_998,
+      limit: 40_000,
+      contentHash: 'new-body-hash',
+    });
+  });
+
+  it.each([409, 503])(
+    'handles search location status %s without hiding non-conflict errors',
+    async (status) => {
+      const entry = {
+        ...DETAIL.entry,
+        searchMatch: { offset: 80_000, contentHash: 'old-version' },
+      };
+      vi.mocked(knowledgeApi.catalog).mockResolvedValue({ ...CATALOG, entries: [entry] });
+      vi.mocked(knowledgeApi.detail)
+        .mockRejectedValueOnce(Object.assign(new Error('定点读取失败'), { status }))
+        .mockResolvedValue({ ...DETAIL, contentHash: 'new-version', markdown: '最新版本开头' });
+      renderPage();
+      fireEvent.change(screen.getByRole('textbox', { name: '搜索知识库' }), {
+        target: { value: '定位' },
+      });
+      await waitFor(() =>
+        expect(vi.mocked(knowledgeApi.catalog).mock.calls.at(-1)?.[0]).toBe('定位')
+      );
+      fireEvent.click(await screen.findByRole('button', { name: '产品讨论' }));
+      if (status === 409) {
+        await screen.findByText('最新版本开头');
+        expect(screen.getByText('这份资料已有更新，已从头打开最新版本。')).toBeInTheDocument();
+        expect(knowledgeApi.detail).toHaveBeenLastCalledWith('entry-a', expect.any(AbortSignal), {
+          offset: 0,
+          limit: 40_000,
+        });
+        expect(knowledgeApi.detail).toHaveBeenCalledTimes(2);
+      } else {
+        await screen.findByText('定点读取失败');
+        expect(knowledgeApi.detail).toHaveBeenCalledTimes(1);
+        expect(screen.queryByText('最新版本开头')).not.toBeInTheDocument();
+      }
+      expect(screen.queryByText('已定位搜索命中')).not.toBeInTheDocument();
+    }
+  );
+
+  it.each([false, true])(
+    'distinguishes metadata matches from a valid zero-offset body match: %s',
+    async (bodyMatch) => {
+      const entry = {
+        ...DETAIL.entry,
+        ...(bodyMatch ? { searchMatch: { offset: 0, contentHash: DETAIL.contentHash } } : {}),
+      };
+      vi.mocked(knowledgeApi.catalog).mockResolvedValue({ ...CATALOG, entries: [entry] });
+      renderPage();
+      fireEvent.change(screen.getByRole('textbox', { name: '搜索知识库' }), {
+        target: { value: '产品' },
+      });
+      await waitFor(() =>
+        expect(vi.mocked(knowledgeApi.catalog).mock.calls.at(-1)?.[0]).toBe('产品')
+      );
+      fireEvent.click(await screen.findByRole('button', { name: '产品讨论' }));
+      await screen.findByText(/原始记录/);
+      expect(knowledgeApi.detail).toHaveBeenLastCalledWith('entry-a', expect.any(AbortSignal), {
+        offset: 0,
+        limit: 40_000,
+        ...(bodyMatch ? { contentHash: DETAIL.contentHash } : {}),
+      });
+      expect(Boolean(screen.queryByText('已定位搜索命中'))).toBe(bodyMatch);
+    }
+  );
+
   it('keeps the readable segment and offers no partial editor when the complete load fails', async () => {
     vi.mocked(knowledgeApi.detail)
       .mockResolvedValueOnce({
@@ -1161,11 +1346,15 @@ describe('knowledge library management', () => {
     expect(knowledgeApi.save).not.toHaveBeenCalled();
   });
 
-  it('returns to the actual prior segment boundary after emoji-safe offsets', async () => {
-    vi.mocked(knowledgeApi.detail).mockImplementation(async (_id, _signal, page) => {
+  it('returns to the actual prior segment boundary after emoji-safe offsets and a source round trip', async () => {
+    vi.mocked(knowledgeApi.detail).mockImplementation(async (id, _signal, page) => {
+      if (id === 'boundary-source') {
+        return { ...DETAIL, entry: { ...DETAIL.entry, id }, markdown: '边界来源正文' };
+      }
       const offset = page?.offset ?? 0;
       return {
         ...DETAIL,
+        sources: [{ id: 'boundary-source', title: '边界来源', available: true }],
         markdown: offset === 0 ? '第一段' : offset === 39_999 ? '第二段🙂' : '第三段🙂',
         page: {
           offset,
@@ -1180,6 +1369,10 @@ describe('knowledge library management', () => {
     expect(await screen.findByText('第二段🙂')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '下一段' }));
     expect(await screen.findByText('第三段🙂')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '边界来源' }));
+    await screen.findByText('边界来源正文');
+    fireEvent.click(screen.getByRole('button', { name: '返回上一份资料：产品讨论' }));
+    await screen.findByText('第三段🙂');
     fireEvent.click(screen.getByRole('button', { name: '上一段' }));
     expect(await screen.findByText('第二段🙂')).toBeInTheDocument();
     expect(knowledgeApi.detail).toHaveBeenLastCalledWith('entry-a', undefined, {

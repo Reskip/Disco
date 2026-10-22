@@ -12,4 +12,5 @@ export interface HomePageProps {
   onSessionClick: (sessionId: string) => void;
   onNewSession: () => void;
   onCreateTeammate?: (input: WorkspaceTeammateCreateInput) => Promise<void>;
+  onOpenKnowledge?: () => void;
 }

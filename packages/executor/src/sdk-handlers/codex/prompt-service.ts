@@ -116,6 +116,10 @@ import {
 } from './generated-artifact-publication.js';
 import { buildCodexHttpsTransportConfig } from './https-transport.js';
 import {
+  buildDiscoKnowledgeAccessBoundary,
+  buildDiscoKnowledgeInstruction,
+} from './knowledge-access-boundary.js';
+import {
   codexSubscriptionAuthUserMessage,
   isCodexSubscriptionAuthError,
 } from './provider-auth-error.js';
@@ -207,7 +211,7 @@ export function buildDiscoRuntimeAccessBoundary(userWorkspaceRoot: string): stri
 当前用户目录：\`${currentUserRoot}\`
 用户目录根：\`${usersRoot}\`
 
-可以访问当前用户目录内的全部内容，也可以访问其他普通本机目录。不要访问用户目录根下属于其他 Disco 用户的目录；以最终解析后的路径为准。
+可以访问当前用户目录内的全部内容，也可以访问其他普通本机目录。不要访问用户目录根下属于其他 Disco 用户的目录；以最终解析后的路径为准。${buildDiscoKnowledgeAccessBoundary()}
 
 本规则仅用于当前运行，不要写入智能体的人格、记忆或技能。`;
 }
@@ -220,6 +224,8 @@ export function buildDiscoManagedLifecycleInstruction(
 安装、更新或自生成技能时，使用本次运行提供的 Disco 托管技能方法；不要直接写入技能目录或 Codex Runtime Home。${options.agentSession ? '默认目标是当前智能体。' : '默认目标是当前用户的 Disco 共享技能。'}
 
 ${options.agentSession ? `使用 Disco 托管记忆方法；不要通过 Shell 直接修改长期记忆文件。\n\n${buildAgentLearningInstruction()}` : '独立会话不保存人格或长期记忆。'}
+
+${buildDiscoKnowledgeInstruction()}
 
 交付文件须调用 Disco 托管文件发布方法并成功返回；只写文件名或路径不算交付。
 

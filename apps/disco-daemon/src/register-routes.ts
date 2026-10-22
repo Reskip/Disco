@@ -104,6 +104,7 @@ import {
   publicHealthDb,
 } from './health/payload.js';
 import { registerHealthProbeRoutes } from './health/routes.js';
+import { registerKnowledgeRoutes } from './knowledge/routes.js';
 import { resolveForUserIdWithGate } from './oauth-auth-helpers.js';
 import {
   deliverPermissionDecision,
@@ -2297,6 +2298,8 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     authentication: app.service('authentication'),
     multiTenancy,
   });
+
+  await registerKnowledgeRoutes({ app, db, config, authenticateBrowser: uploadAuthMiddleware });
 
   // biome-ignore lint/suspicious/noExplicitAny: Express route method not on FeathersJS Application type
   (app as any).post(

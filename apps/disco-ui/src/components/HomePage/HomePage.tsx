@@ -1,4 +1,4 @@
-import { MessageOutlined, PlusOutlined, RobotOutlined } from '@ant-design/icons';
+import { BookOutlined, MessageOutlined, PlusOutlined, RobotOutlined } from '@ant-design/icons';
 import { Button, Layout, Typography, theme } from 'antd';
 import { memo, useState } from 'react';
 import { useLocale } from '../../contexts/LocaleContext';
@@ -77,6 +77,11 @@ export const HomePage = memo(function HomePage(props: HomePageProps) {
                   gap: 8,
                 }}
               >
+                {props.onOpenKnowledge && (
+                  <Button icon={<BookOutlined />} onClick={props.onOpenKnowledge}>
+                    知识库
+                  </Button>
+                )}
                 {!props.mobileMinimal && (
                   <Button
                     className="disco-home-action-button"

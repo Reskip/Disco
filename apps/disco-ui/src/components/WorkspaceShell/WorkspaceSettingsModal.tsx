@@ -116,6 +116,7 @@ export interface WorkspaceSettingsModalProps {
   onDeleteUser?: (userId: string) => void | Promise<void>;
   initialTab?: string | null;
   initialArchivedSessionId?: string | null;
+  onOpenKnowledge?: () => void;
 }
 
 const ROLE_LABELS: Record<UserRole, string> = {
@@ -148,6 +149,7 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
   onDeleteUser,
   initialTab,
   initialArchivedSessionId,
+  onOpenKnowledge,
 }) => {
   const { token } = antdTheme.useToken();
   const { locale, setLocale } = useLocale();
@@ -1242,6 +1244,7 @@ export const WorkspaceSettingsModal: React.FC<WorkspaceSettingsModalProps> = ({
                     currentUser={currentUser}
                     client={client}
                     onUpdateUser={onUpdateUser}
+                    onOpenKnowledge={onOpenKnowledge}
                   />
                 </div>
               ),

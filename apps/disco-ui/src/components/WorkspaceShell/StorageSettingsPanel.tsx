@@ -1,3 +1,4 @@
+import { BookOutlined } from '@ant-design/icons';
 import { resolveIntermediateRetentionDays } from '@disco/core/types';
 import type { DiscoClient, UpdateUserInput, User } from '@disco-live/client';
 import { Alert, Button, Form, Select, Space, Typography } from 'antd';
@@ -7,10 +8,12 @@ export function StorageSettingsPanel({
   currentUser,
   client,
   onUpdateUser,
+  onOpenKnowledge,
 }: {
   currentUser?: User | null;
   client?: DiscoClient | null;
   onUpdateUser?: (userId: string, updates: UpdateUserInput) => void | Promise<void>;
+  onOpenKnowledge?: () => void;
 }) {
   const [days, setDays] = useState(resolveIntermediateRetentionDays(currentUser?.preferences));
   const [saving, setSaving] = useState(false);
@@ -54,6 +57,17 @@ export function StorageSettingsPanel({
           聊天中展示的图片和预览、可下载附件、上传文件及可编辑源文件长期保留。
         </Typography.Paragraph>
       </div>
+      {onOpenKnowledge && (
+        <div>
+          <Typography.Title level={5}>知识库</Typography.Title>
+          <Typography.Paragraph type="secondary">
+            管理独立保留的会话归档、资料与笔记，查看同步状态或删除知识库记录。
+          </Typography.Paragraph>
+          <Button icon={<BookOutlined />} onClick={onOpenKnowledge}>
+            打开知识库
+          </Button>
+        </div>
+      )}
       <Form layout="vertical">
         <Form.Item
           label="临时文件与缓存保留时间"

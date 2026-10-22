@@ -63,6 +63,7 @@ describe('bundled UI root deep links', () => {
   it('serves the SPA shell for root-mounted conversation and settings URLs', () => {
     expect(isBundledUiDeepLink('/s/01a032b42bbd70228b32e90f/')).toBe(true);
     expect(isBundledUiDeepLink('/settings/profile/')).toBe(true);
+    expect(isBundledUiDeepLink('/knowledge/')).toBe(true);
   });
 
   it('does not swallow daemon API and transport routes', () => {
@@ -70,5 +71,6 @@ describe('bundled UI root deep links', () => {
     expect(isBundledUiDeepLink('/tasks/123')).toBe(false);
     expect(isBundledUiDeepLink('/socket.io/')).toBe(false);
     expect(isBundledUiDeepLink('/health')).toBe(false);
+    expect(isBundledUiDeepLink('/knowledge/entries')).toBe(false);
   });
 });

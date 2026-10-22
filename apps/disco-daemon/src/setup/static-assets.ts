@@ -53,6 +53,7 @@ const ROOT_MOUNTED_UI_PREFIXES = new Set([
 export function isBundledUiDeepLink(pathname: string): boolean {
   const normalized = pathname.replace(/^\/+|\/+$/g, '');
   if (!normalized) return false;
+  if (normalized === 'knowledge') return true;
   const [prefix] = normalized.split('/');
   return ROOT_MOUNTED_UI_PREFIXES.has(prefix);
 }

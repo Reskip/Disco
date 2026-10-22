@@ -27,6 +27,7 @@ import type { Id, Paginated, Session, SessionID, Task, TenantContext } from '@di
 import { isTerminalTaskStatus, SessionStatus } from '@disco/core/types';
 import type { Application, SessionsServiceImpl, TasksServiceImpl } from './declarations.js';
 import { containAllTrackedExecutors } from './executor-tracking.js';
+import type { KnowledgeRuntime } from './knowledge/runtime.js';
 import { SchedulerService } from './services/scheduler.js';
 import { SessionQueueWorker } from './services/session-queue-worker.js';
 import { TaskRuntimeReconciler } from './services/task-runtime-reconciler.js';
@@ -651,6 +652,9 @@ export async function startup(ctx: StartupContext): Promise<void> {
       : undefined;
   storageMaintenance?.start();
 
+  const knowledgeRuntime = app.get('knowledgeRuntime') as KnowledgeRuntime | undefined;
+  if (ctx.taskRuntimePolicy === 'standalone') knowledgeRuntime?.start();
+
   // 8. Graceful shutdown handler
   const shutdown = async (signal: string) => {
     console.log(`\n⏳ Received ${signal}, shutting down gracefully...`);
@@ -673,6 +677,7 @@ export async function startup(ctx: StartupContext): Promise<void> {
       // still safe; stop only prevents the next local scan.
       sessionQueueWorker?.stop();
       await storageMaintenance?.stop();
+      await knowledgeRuntime?.stop();
 
       if (shouldContainLocalExecutorsOnShutdown(ctx.taskRuntimePolicy)) {
         // Preserve the historical standalone shutdown contract.

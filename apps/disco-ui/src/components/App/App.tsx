@@ -16,7 +16,7 @@ import type {
 import { isAgenticToolName, PermissionScope as Scope } from '@disco-live/client';
 import { Button, Layout, Spin, theme, Upload } from 'antd';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useLocation } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { AppActionsProvider } from '../../contexts/AppActionsContext';
 import { useAppNavigation } from '../../hooks/useAppNavigation';
 import { MOBILE_WORKSPACE_QUERY, useMediaQuery } from '../../hooks/useMediaQuery';
@@ -29,6 +29,7 @@ import { useThemedMessage } from '../../utils/message';
 import { resolveQuickStartMcpServerIds } from '../../utils/resolveQuickStartMcpServerIds';
 import { getUserDefaultConfigurationSource } from '../AgenticToolConfigurationPicker/useAgenticConfigurationSources';
 import { HomePage } from '../HomePage';
+import { KnowledgePage } from '../KnowledgePage/KnowledgePage';
 import { SessionPanel } from '../SessionPanel';
 import {
   WorkspaceAgentEditModal,
@@ -124,6 +125,8 @@ export const App: React.FC<AppProps> = ({
   const { showError, showInfo, showSuccess } = useThemedMessage();
   const navigation = useAppNavigation();
   const location = useLocation();
+  const navigate = useNavigate();
+  const knowledgeRoute = /^\/knowledge\/?$/iu.test(location.pathname);
   const mobileLayout = useMediaQuery(MOBILE_WORKSPACE_QUERY);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] = useState<string | null>(null);
@@ -317,6 +320,16 @@ export const App: React.FC<AppProps> = ({
     onUserSettingsClose?.();
     dismissMobileLayer('settings');
   }, [dismissMobileLayer, onSettingsClose, onUserSettingsClose]);
+
+  const openKnowledge = useCallback(() => {
+    mobileLayerRef.current = { sidebar: false, settings: false, agent: false };
+    setMobileSidebarOpen(false);
+    setSettingsOpen(false);
+    onSettingsClose?.();
+    onUserSettingsClose?.();
+    clearMobileLayerMarker();
+    navigate('/knowledge');
+  }, [clearMobileLayerMarker, navigate, onSettingsClose, onUserSettingsClose]);
 
   const openSettings = useCallback(() => {
     mobileLayerRef.current = { sidebar: false, settings: true, agent: false };
@@ -706,9 +719,17 @@ export const App: React.FC<AppProps> = ({
               </div>
             </div>
           )}
+          {knowledgeRoute && (
+            <KnowledgePage
+              key={user?.user_id}
+              mobile={mobileLayout}
+              entryId={new URLSearchParams(location.search).get('entry')}
+              onGoHome={navigation.goHome}
+            />
+          )}
           <div
-            hidden={Boolean(sessionRouteFragment)}
-            aria-hidden={Boolean(sessionRouteFragment)}
+            hidden={Boolean(sessionRouteFragment) || knowledgeRoute}
+            aria-hidden={Boolean(sessionRouteFragment) || knowledgeRoute}
             style={{ minWidth: 0, height: '100%' }}
           >
             <HomePage
@@ -721,6 +742,7 @@ export const App: React.FC<AppProps> = ({
               onNewSession={startStandaloneConversation}
               onCreateTeammate={mobileLayout ? undefined : createTeammate}
               mobileMinimal={mobileLayout}
+              onOpenKnowledge={openKnowledge}
             />
           </div>
         </main>
@@ -747,6 +769,7 @@ export const App: React.FC<AppProps> = ({
           onUpdateUser={onUpdateUser}
           onDeleteUser={onDeleteUser}
           onLogout={onLogout}
+          onOpenKnowledge={openKnowledge}
         />
         {!mobileLayout && (
           <WorkspaceAgentEditModal

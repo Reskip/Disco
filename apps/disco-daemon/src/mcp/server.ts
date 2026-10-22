@@ -44,18 +44,19 @@ import {
   toolDispatcherProxy,
 } from './register-tool-proxy.js';
 import { tenantScopedToolProxy } from './tenant-scope.js';
-import { observedToolRegistrationProxy } from './tool-observability.js';
 import { validateVerifiedSessionToken, verifySessionToken } from './tokens.js';
+import { observedToolRegistrationProxy } from './tool-observability.js';
 import {
-  ToolRegistry,
   type ToolAudience,
   type ToolDomainGovernance,
   type ToolGovernanceOverride,
+  ToolRegistry,
 } from './tool-registry.js';
 import { registerFileTools } from './tools/files.js';
+import { registerKnowledgeTools } from './tools/knowledge.js';
 import { registerMcpServerTools } from './tools/mcp-servers.js';
-import { registerMessageTools } from './tools/messages.js';
 import { registerMemoryTools } from './tools/memories.js';
+import { registerMessageTools } from './tools/messages.js';
 import { registerSearchTools } from './tools/search.js';
 import { registerSessionTools } from './tools/sessions.js';
 import { registerSkillTools } from './tools/skills.js';
@@ -229,6 +230,17 @@ type DomainToolRegistrar = ToolDomainGovernance & {
 };
 
 export const DISCO_AGENT_TOOL_DOMAINS: DomainToolRegistrar[] = [
+  {
+    domain: 'knowledge',
+    description: '当前用户的跨会话资料、知识、经验和完整原文',
+    provider: 'disco-mcp',
+    audiences: ['standalone', 'agent'],
+    ownership: 'current-user',
+    outputKinds: ['text'],
+    lifecycle: 'runtime',
+    dependencies: ['local-knowledge-library'],
+    register: registerKnowledgeTools,
+  },
   {
     domain: 'sessions',
     description: 'Current-user conversations, tasks, messages, models, and continuation controls',

@@ -258,7 +258,13 @@ describe('knowledge routes over authenticated HTTP', () => {
       await request(`/entries/${note.entry.id}`)
     ).json()) as KnowledgeEntryDetail;
     expect(detail.sources).toEqual([
-      { id: source.entry.id, title: '测试来源', kind: 'note', available: true },
+      {
+        id: source.entry.id,
+        title: '测试来源',
+        kind: 'note',
+        available: true,
+        revisionStatus: 'current',
+      },
     ]);
     expect(detail.entry.organization?.sourceEntryIds).toEqual([source.entry.id]);
     const list = await (
@@ -283,6 +289,36 @@ describe('knowledge routes over authenticated HTTP', () => {
     ).toBe(404);
     const overview = await (await request('/overview')).json();
     expect(overview.topics).toContainEqual({ topic: '验收专题', count: 1 });
+    expect(
+      (
+        await request(`/entries/${source.entry.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            markdown: '更新后的原始结论',
+            title: '新版来源标题',
+            expectedUpdatedAt: source.entry.updatedAt,
+          }),
+        })
+      ).status
+    ).toBe(200);
+    const changed = (await (
+      await request(`/entries/${note.entry.id}`)
+    ).json()) as KnowledgeEntryDetail;
+    expect(changed.sources?.[0]).toMatchObject({
+      title: '新版来源标题',
+      revisionStatus: 'changed',
+    });
+    expect(changed.markdown).toBe(detail.markdown);
+    expect((await request(`/entries/${source.entry.id}`, { method: 'DELETE' })).status).toBe(200);
+    const removed = (await (
+      await request(`/entries/${note.entry.id}`)
+    ).json()) as KnowledgeEntryDetail;
+    expect(removed.sources?.[0]).toMatchObject({
+      title: '测试来源',
+      available: false,
+      revisionStatus: 'deleted',
+    });
+    expect(removed.markdown).toBe(detail.markdown);
   });
 
   it('serves the browser shell but rejects anonymous, forced-password and executor API access', async () => {

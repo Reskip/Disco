@@ -66,6 +66,15 @@ export interface KnowledgeAttachment {
   sizeBytes?: number;
 }
 
+/** The exact readable source version used when a note was created or generated. */
+export interface KnowledgeSourceReference {
+  id: string;
+  title: string;
+  contentHash: string;
+}
+
+export type KnowledgeSourceRevisionStatus = 'current' | 'changed' | 'deleted' | 'unknown';
+
 export interface KnowledgeEntry {
   id: string;
   title: string;
@@ -102,6 +111,7 @@ export interface KnowledgeEntry {
   attachments?: KnowledgeAttachment[];
   snippet?: string;
   derivedFrom?: { entryId: string; contentHash: string };
+  sourceReferences?: KnowledgeSourceReference[];
   summaryContentHash?: string;
   sourceVersion?: KnowledgeSourceVersion;
   titleProjectionVersion?: number;
@@ -118,7 +128,14 @@ export interface KnowledgeEntryDetail {
   markdown: string;
   /** Used to prevent an indexing job from marking a newer edit as indexed. */
   contentHash: string;
-  sources?: Array<{ id: string; title: string; kind?: KnowledgeKind; available: boolean }>;
+  sources?: Array<{
+    id: string;
+    title: string;
+    kind?: KnowledgeKind;
+    available: boolean;
+    /** Older servers may omit this field; missing provenance is never assumed current. */
+    revisionStatus?: KnowledgeSourceRevisionStatus;
+  }>;
 }
 
 export interface KnowledgeUploadResult extends KnowledgeEntryDetail {
@@ -137,6 +154,7 @@ export interface KnowledgeSourceInput {
   sourceUrl?: string;
   attachments?: KnowledgeAttachment[];
   derivedFrom?: { entryId: string; contentHash: string };
+  sourceReferences?: KnowledgeSourceReference[];
   sourceVersion?: KnowledgeSourceVersion;
   titleProjectionVersion?: number;
   organization?: KnowledgeOrganization;

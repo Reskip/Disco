@@ -774,6 +774,7 @@ export function KnowledgePage({
             )}
             <Select
               aria-label="处理状态"
+              popupMatchSelectWidth={mobile ? 220 : undefined}
               value={processing}
               onChange={(value) => {
                 setProcessing(value);

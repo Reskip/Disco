@@ -72,6 +72,12 @@ link back to the selected sources, and source availability is checked in the sam
 owner library. Editing a queued/generated note takes ownership away from the
 worker. Saving uses optimistic revision checks; background results and later
 source changes must never overwrite the human title, Markdown or classification.
+New synthesis notes store each source's identifier, title and readable-content
+hash. The detail view distinguishes current, changed, deleted and unrecorded
+source versions; editing a note does not silently mark changed sources current.
+Legacy single-source notes use their recorded source hash, while old multi-source
+notes without a reliable baseline show an unrecorded version. Deleted sources
+retain their recorded title. Source access always stays within the same owner.
 Old divergent archive versions are retained but excluded from ordinary lists,
 automatic organization and current progress counts.
 

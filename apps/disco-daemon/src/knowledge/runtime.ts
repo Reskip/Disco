@@ -1109,6 +1109,15 @@ export class KnowledgeRuntime {
       kind: 'note',
       title,
       automated: automatic,
+      expectedSources: entries.map((item) => ({
+        id: item.entry.id,
+        contentHash: item.contentHash,
+      })),
+      sourceReferences: entries.map((item) => ({
+        id: item.entry.id,
+        title: item.entry.title,
+        contentHash: item.contentHash,
+      })),
       organization: {
         topic: input.topic?.trim() || '未分类',
         level: 'knowledge',
@@ -1359,6 +1368,11 @@ export class KnowledgeRuntime {
         automated: true,
         expectedSources: inputs.map((item) => ({
           id: item.entry.id,
+          contentHash: item.contentHash,
+        })),
+        sourceReferences: inputs.map((item) => ({
+          id: item.entry.id,
+          title: item.entry.title,
           contentHash: item.contentHash,
         })),
         summaryMode: summary.summaryMode ?? 'model',

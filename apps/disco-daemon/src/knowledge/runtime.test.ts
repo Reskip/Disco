@@ -725,6 +725,96 @@ describe('knowledge background synchronization', () => {
     expect(result?.entry.generation?.state).toBe('complete');
   });
 
+  it('captures manual source versions and refreshes automatic multi-source baselines only on generation', async () => {
+    await runtime.runOnce(false);
+    const first = (await runtime.library.upsertSource(owner, {
+      source: 'manual',
+      sourceId: 'reference-first',
+      kind: 'note',
+      title: '第一份资料',
+      markdown: '第一份结论',
+    }))!;
+    const secondInput = {
+      source: 'disco' as const,
+      sourceId: 'reference-second',
+      kind: 'conversation' as const,
+      title: '第二份资料',
+      markdown: '第二份结论',
+    };
+    const second = (await runtime.library.upsertSource(owner, secondInput))!;
+    const ids = [first.entry.id, second.entry.id];
+    const summarizeContent = vi
+      .fn()
+      .mockResolvedValue({ abstract: '综合结论', overview: '依据最新两份来源整理。' });
+    Object.defineProperty(runtime, 'engine', { value: { summarizeContent } });
+    const manual = await runtime.organize(owner, {
+      entryIds: ids,
+      mode: 'manual',
+      title: '手工专题',
+    });
+    const automatic = await runtime.organize(owner, {
+      entryIds: ids,
+      mode: 'automatic',
+      title: '自动专题',
+    });
+    expect(manual.entry.sourceReferences?.map((item) => item.contentHash)).toEqual([
+      first.contentHash,
+      second.contentHash,
+    ]);
+    expect(automatic.entry.sourceReferences).toEqual(manual.entry.sourceReferences);
+    const changed = (await runtime.library.upsertSource(owner, {
+      ...secondInput,
+      markdown: '新的第二份结论',
+    }))!;
+    await runtime.runSummaryOnce();
+    expect(summarizeContent).toHaveBeenCalledTimes(1);
+    const complete = (await runtime.library.get(owner, automatic.entry.id))!;
+    expect(complete.entry.sourceReferences?.map((item) => item.contentHash)).toEqual([
+      first.contentHash,
+      changed.contentHash,
+    ]);
+    expect(complete.sources?.map((item) => item.revisionStatus)).toEqual(['current', 'current']);
+    const untouched = (await runtime.library.get(owner, manual.entry.id))!;
+    expect(untouched.markdown).toBe(manual.markdown);
+    expect(untouched.entry.sourceReferences).toEqual(manual.entry.sourceReferences);
+    expect(untouched.sources?.map((item) => item.revisionStatus)).toEqual(['current', 'changed']);
+  });
+
+  it.each(['changed', 'deleted'] as const)(
+    'does not create a manual template when its source was %s after reading',
+    async (outcome) => {
+      const record = (await runtime.library.upsertSource(owner, {
+        source: 'manual',
+        sourceId: 'organize-race',
+        kind: 'note',
+        title: '原始资料',
+        markdown: '原始结论',
+      }))!;
+      const upsert = runtime.library.upsertSource.bind(runtime.library);
+      vi.spyOn(runtime.library, 'upsertSource').mockImplementationOnce(
+        async (targetOwner, input) => {
+          expect(input.expectedSources).toEqual([
+            { id: record.entry.id, contentHash: record.contentHash },
+          ]);
+          if (outcome === 'changed')
+            await runtime.library.edit(owner, record.entry.id, '来源已被修改');
+          else await runtime.library.remove(owner, record.entry.id);
+          return upsert(targetOwner, input);
+        }
+      );
+      await expect(
+        runtime.organize(owner, {
+          entryIds: [record.entry.id],
+          mode: 'manual',
+          title: '不应生成的旧模板',
+        })
+      ).rejects.toThrow('无法建立整理笔记');
+      expect(
+        (await runtime.library.snapshot(owner)).some((item) => item.title === '不应生成的旧模板')
+      ).toBe(false);
+    }
+  );
+
   it('rejects cross-user source selection for manual synthesis', async () => {
     const privateSource = (await runtime.library.upsertSource(otherOwner, {
       source: 'manual',

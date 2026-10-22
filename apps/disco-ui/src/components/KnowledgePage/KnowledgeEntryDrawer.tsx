@@ -124,38 +124,65 @@ export function KnowledgeEntryDrawer({
   const metadata = entryOrganization(detail?.entry);
   const generation = detail?.entry.generation;
   const sources = detail?.sources;
+  const changedSources = sources?.some((source) => source.revisionStatus === 'changed');
+  const unknownSources = sources?.some(
+    (source) => source.available && (!source.revisionStatus || source.revisionStatus === 'unknown')
+  );
   const sourcesCard = sources?.length ? (
     <Card size="small" title="整理来源">
       <Space orientation="vertical" size="small" style={{ width: '100%' }}>
-        {sources.map((source) =>
-          source.available ? (
-            <Button
-              key={source.id}
-              type="link"
-              icon={<LinkOutlined />}
-              {...(editing
-                ? {
-                    href: `/knowledge?entry=${encodeURIComponent(source.id)}`,
-                    target: '_blank',
-                    rel: 'noreferrer',
-                  }
-                : { onClick: () => openEntry(source.id) })}
-              style={{
-                paddingInline: 0,
-                height: 'auto',
-                maxWidth: '100%',
-                whiteSpace: 'normal',
-                textAlign: 'left',
-                overflowWrap: 'anywhere',
-              }}
-            >
-              {source.title}
-            </Button>
-          ) : (
-            <Typography.Text key={source.id} type="secondary">
-              {source.title}（原始归档已删除）
-            </Typography.Text>
-          )
+        {sources.map((source) => {
+          const revision = source.revisionStatus || (source.available ? 'unknown' : 'deleted');
+          return (
+            <Flex key={source.id} gap={token.marginXS} align="center" wrap>
+              {source.available ? (
+                <Button
+                  type="link"
+                  icon={<LinkOutlined />}
+                  {...(editing
+                    ? {
+                        href: `/knowledge?entry=${encodeURIComponent(source.id)}`,
+                        target: '_blank',
+                        rel: 'noreferrer',
+                      }
+                    : { onClick: () => openEntry(source.id) })}
+                  style={{
+                    paddingInline: 0,
+                    height: 'auto',
+                    maxWidth: '100%',
+                    whiteSpace: 'normal',
+                    textAlign: 'left',
+                    overflowWrap: 'anywhere',
+                  }}
+                >
+                  {source.title}
+                </Button>
+              ) : (
+                <Typography.Text type="secondary" style={{ overflowWrap: 'anywhere' }}>
+                  {source.title}
+                </Typography.Text>
+              )}
+              {revision !== 'current' && (
+                <Tag color={revision === 'changed' ? 'warning' : undefined}>
+                  {revision === 'changed'
+                    ? '已更新'
+                    : revision === 'deleted'
+                      ? '已删除'
+                      : '版本未记录'}
+                </Tag>
+              )}
+            </Flex>
+          );
+        })}
+        {changedSources && (
+          <Typography.Text type="secondary">
+            来源在整理后已有更新，当前笔记内容保持不变，请核对最新原文。
+          </Typography.Text>
+        )}
+        {unknownSources && (
+          <Typography.Text type="secondary">
+            部分来源未记录整理时的版本，无法判断此后是否更新。
+          </Typography.Text>
         )}
         {editing && (
           <Typography.Text type="secondary">来源在新页面打开，当前编辑内容会保留。</Typography.Text>
@@ -498,17 +525,6 @@ export function KnowledgeEntryDrawer({
                 <Typography.Text type="secondary">长文按段阅读，完整归档不受影响。</Typography.Text>
               )}
             </Flex>
-            <div ref={readingRef}>
-              {detail.entry.kind === 'note' && !paged ? (
-                <KnowledgeNoteContent markdown={detail.markdown} />
-              ) : (
-                <Typography.Paragraph
-                  style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: 0 }}
-                >
-                  {detail.markdown || '（正文为空）'}
-                </Typography.Paragraph>
-              )}
-            </div>
             {!!detail.entry.attachments?.length && (
               <Card size="small" title="关联附件">
                 <List
@@ -558,6 +574,17 @@ export function KnowledgeEntryDrawer({
                 />
               </Card>
             )}
+            <div ref={readingRef}>
+              {detail.entry.kind === 'note' && !paged ? (
+                <KnowledgeNoteContent markdown={detail.markdown} />
+              ) : (
+                <Typography.Paragraph
+                  style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: 0 }}
+                >
+                  {detail.markdown || '（正文为空）'}
+                </Typography.Paragraph>
+              )}
+            </div>
             <Button danger icon={<DeleteOutlined />} onClick={() => removeEntry(detail.entry)}>
               删除知识库记录
             </Button>

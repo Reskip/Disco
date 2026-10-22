@@ -432,12 +432,24 @@ export class KnowledgeLibrary {
     const tombstones = await this.deletedEntries(base);
     const deleted = new Set(tombstones.map((item) => item.id));
     const entries: StoredEntry[] = [];
-    for (const file of await this.files(base, '.library/entries')) {
-      if (!file.endsWith('.json')) continue;
-      const value = await this.read(base, file);
-      if (!value) continue;
-      const entry = this.validateEntry(JSON.parse(value.toString('utf8')) as StoredEntry);
-      if (!deleted.has(entry.id)) entries.push(entry);
+    const files = (await this.files(base, '.library/entries')).filter((file) =>
+      file.endsWith('.json')
+    );
+    // Bound filesystem work without caching away external edits or bypassing safe reads.
+    for (let offset = 0; offset < files.length; offset += 8) {
+      const batch = await Promise.allSettled(
+        files.slice(offset, offset + 8).map(async (file) => {
+          const value = await this.read(base, file);
+          return value
+            ? this.validateEntry(JSON.parse(value.toString('utf8')) as StoredEntry)
+            : null;
+        })
+      );
+      // Every in-flight read must settle before an error releases the owner lock.
+      for (const result of batch) {
+        if (result.status === 'rejected') throw result.reason;
+        if (result.value && !deleted.has(result.value.id)) entries.push(result.value);
+      }
     }
     const reconciliation = await this.read(base, '.library/reconciled.json');
     return {
@@ -642,6 +654,9 @@ export class KnowledgeLibrary {
       if (entry) {
         current = await this.refreshEntry(base, entry);
         if (!current) return null;
+        // A human-owned note is one coherent artifact: protect its readable text,
+        // provenance, metadata and raw generation record together.
+        if (entry.kind === 'note' && entry.humanEdited && input.automated) return current;
       }
       const markdown = markdownText(input.markdown);
       const contentHash = digest(markdown);
@@ -651,6 +666,9 @@ export class KnowledgeLibrary {
           ? entry.derivedFrom
           : (input.derivedFrom ?? entry?.derivedFrom);
       const sourceVersion = input.sourceVersion ?? entry?.sourceVersion;
+      const sourceReferences = entry?.humanEdited
+        ? entry.sourceReferences
+        : (input.sourceReferences ?? entry?.sourceReferences);
       const grouping = entry?.humanEdited
         ? entry.organization
         : (input.organization ?? entry?.organization);
@@ -672,6 +690,7 @@ export class KnowledgeLibrary {
         entry.sourceUpdatedAt === input.sourceUpdatedAt &&
         entry.sourceUrl === input.sourceUrl &&
         JSON.stringify(entry.derivedFrom) === JSON.stringify(derivedFrom) &&
+        JSON.stringify(entry.sourceReferences) === JSON.stringify(sourceReferences) &&
         JSON.stringify(entry.sourceVersion) === JSON.stringify(sourceVersion) &&
         (input.titleProjectionVersion === undefined ||
           entry.titleProjectionVersion === input.titleProjectionVersion) &&
@@ -715,6 +734,7 @@ export class KnowledgeLibrary {
         sourceUrl: input.sourceUrl,
         attachments: attachments.length ? attachments : undefined,
         derivedFrom,
+        sourceReferences,
         summaryContentHash: entry?.summaryContentHash,
         summaryMode: input.summaryMode ?? entry?.summaryMode,
         summaryFormatVersion: input.summaryFormatVersion ?? entry?.summaryFormatVersion,
@@ -758,16 +778,43 @@ export class KnowledgeLibrary {
       const entry = await this.metadata(base, id);
       const detail = entry ? await this.refreshEntry(base, entry) : null;
       if (!detail) return null;
-      const ids = organization(detail.entry).sourceEntryIds ?? [];
+      const references = new Map(
+        (detail.entry.sourceReferences ?? []).map((item) => [item.id, item])
+      );
+      const derived = detail.entry.derivedFrom;
+      const ids = new Set([
+        ...references.keys(),
+        ...(organization(detail.entry).sourceEntryIds ?? []),
+        ...(derived ? [derived.entryId] : []),
+      ]);
       detail.sources = [];
       const deleted = new Set((await this.deletedEntries(base)).map((item) => item.id));
       for (const sourceId of ids) {
-        const source = deleted.has(sourceId) ? null : await this.metadata(base, sourceId);
+        const reference = references.get(sourceId);
+        let source = deleted.has(sourceId) ? null : await this.metadata(base, sourceId);
+        if (source) {
+          // Only changed sources need their full Markdown read and hashed. This
+          // also notices direct file edits before the next background reconcile.
+          const info = await this.markdownStat(base, source);
+          if (!info) source = null;
+          else if (!this.sameStamp(source, info) && !(await this.refreshEntry(base, source)))
+            source = null;
+        }
+        const baseline =
+          reference?.contentHash ??
+          (derived?.entryId === sourceId ? derived.contentHash : undefined);
         detail.sources.push({
           id: sourceId,
-          title: source?.title ?? '原始资料已删除',
+          title: source?.title ?? reference?.title ?? '原始资料已删除',
           kind: source?.kind,
           available: Boolean(source),
+          revisionStatus: !source
+            ? 'deleted'
+            : !baseline
+              ? 'unknown'
+              : baseline === source.contentHash
+                ? 'current'
+                : 'changed',
         });
       }
       return detail;
@@ -804,7 +851,12 @@ export class KnowledgeLibrary {
       entry.summaryMessage = undefined;
       entry.summaryRetryAt = undefined;
       if (title !== undefined) entry.title = title.trim();
-      entry.organization = grouping ?? { ...organization(entry), state: 'reviewed' };
+      entry.organization = grouping
+        ? {
+            ...grouping,
+            sourceEntryIds: grouping.sourceEntryIds ?? organization(entry).sourceEntryIds,
+          }
+        : { ...organization(entry), state: 'reviewed' };
       if (body !== current.markdown) entry.organization.summary = undefined;
       if (entry.generation) entry.generation = { state: 'complete', message: '已由用户接管编辑' };
       entry.indexStatus = 'pending';

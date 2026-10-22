@@ -137,6 +137,11 @@ describe('knowledge library management', () => {
       '/s/session-a/'
     );
     expect(knowledgeApi.downloadAttachment).not.toHaveBeenCalled();
+    expect(
+      screen
+        .getByRole('button', { name: '原始附件.pdf' })
+        .compareDocumentPosition(screen.getByText(/原始记录/)) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: '原始附件.pdf' }));
     await waitFor(() =>
       expect(knowledgeApi.downloadAttachment).toHaveBeenCalledWith(
@@ -713,6 +718,69 @@ describe('knowledge library management', () => {
     expect(screen.queryByRole('button', { name: /返回上一份资料/ })).not.toBeInTheDocument();
     expect(screen.getByRole('link', { name: '最初资料' })).toHaveAttribute('target', '_blank');
     expect(editor).toHaveValue('尚未保存的人工总结');
+    expect(knowledgeApi.save).not.toHaveBeenCalled();
+  });
+
+  it('shows source revision evidence without rewriting maintained notes or inventing old baselines', async () => {
+    const maintained: KnowledgeEntryDetail = {
+      ...DETAIL,
+      entry: { ...DETAIL.entry, id: 'note-version', kind: 'note', humanEdited: true },
+      markdown: '人工保留的结论，不随来源更新而改写。',
+      sources: [
+        {
+          id: 'source-current',
+          title: '版本一致的原文',
+          available: true,
+          revisionStatus: 'current',
+        },
+        {
+          id: 'source-changed',
+          title: '更新后的原文名',
+          available: true,
+          revisionStatus: 'changed',
+        },
+        {
+          id: 'source-deleted',
+          title: '删除前的资料名',
+          available: false,
+          revisionStatus: 'deleted',
+        },
+        {
+          id: 'source-unknown',
+          title: '没有版本基线的原文',
+          available: true,
+          revisionStatus: 'unknown',
+        },
+        { id: 'source-legacy', title: '旧接口原文', available: true },
+      ],
+    };
+    vi.mocked(knowledgeApi.detail).mockResolvedValue(maintained);
+    renderPage('note-version');
+    await screen.findByText(maintained.markdown);
+    expect(screen.getByText('已更新')).toBeInTheDocument();
+    expect(screen.getByText('已删除')).toBeInTheDocument();
+    expect(screen.getByText('删除前的资料名')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '删除前的资料名' })).not.toBeInTheDocument();
+    expect(screen.getAllByText('版本未记录')).toHaveLength(2);
+    expect(screen.getByRole('button', { name: '版本一致的原文' }).parentElement).toHaveTextContent(
+      /^版本一致的原文$/
+    );
+    expect(
+      screen.getByText('来源在整理后已有更新，当前笔记内容保持不变，请核对最新原文。')
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText('部分来源未记录整理时的版本，无法判断此后是否更新。')
+    ).toBeInTheDocument();
+    expect(knowledgeApi.save).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: '编辑' }));
+    const editor = await screen.findByRole('textbox', { name: 'Markdown 正文' });
+    expect(editor).toHaveValue(maintained.markdown);
+    fireEvent.change(editor, { target: { value: '继续人工核对的内容' } });
+    expect(screen.getByRole('link', { name: '更新后的原文名' })).toHaveAttribute(
+      'target',
+      '_blank'
+    );
+    expect(editor).toHaveValue('继续人工核对的内容');
     expect(knowledgeApi.save).not.toHaveBeenCalled();
   });
 

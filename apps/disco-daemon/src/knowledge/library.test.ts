@@ -885,6 +885,185 @@ describe('portable knowledge library', () => {
     expect(spy.mock.calls.every(([, file]) => file.startsWith('.library/'))).toBe(true);
   });
 
+  it('reports source revisions without rereading unchanged bodies and preserves deleted source names', async () => {
+    const first = (await library.upsertSource(owner, source))!;
+    const second = (await library.upsertSource(owner, {
+      ...source,
+      sourceId: 'source-second',
+      title: '第二份原始标题',
+      markdown: '第二份原文',
+    }))!;
+    const refs = [first, second].map((item) => ({
+      id: item.entry.id,
+      title: item.entry.title,
+      contentHash: item.contentHash,
+    }));
+    const note = (await library.upsertSource(owner, {
+      source: 'manual',
+      sourceId: 'multi-source-note',
+      kind: 'note',
+      title: '专题',
+      markdown: '保留建立时的结论',
+      sourceReferences: refs,
+    }))!;
+    expect(
+      (await library.get(owner, note.entry.id))?.sources?.map((item) => item.revisionStatus)
+    ).toEqual(['current', 'current']);
+    const internal = library as unknown as {
+      read: (base: string, file: string) => Promise<Buffer | null>;
+    };
+    const spy = vi.spyOn(internal, 'read');
+    await library.get(owner, note.entry.id);
+    expect(
+      spy.mock.calls.some(([, file]) =>
+        [first.entry.relativePath, second.entry.relativePath].includes(file)
+      )
+    ).toBe(false);
+    const sourcePath = join(library.ownerPath(owner), first.entry.relativePath);
+    await writeFile(sourcePath, '\uFEFF外部编辑的新资料');
+    const changed = (await library.get(owner, note.entry.id))!;
+    expect(changed.sources).toEqual([
+      expect.objectContaining({ id: first.entry.id, available: true, revisionStatus: 'changed' }),
+      expect.objectContaining({ id: second.entry.id, available: true, revisionStatus: 'current' }),
+    ]);
+    expect(changed.markdown).toBe(note.markdown);
+    expect(changed.entry.sourceReferences).toEqual(refs);
+    await library.remove(owner, second.entry.id);
+    expect((await library.get(owner, note.entry.id))?.sources?.[1]).toMatchObject({
+      title: '第二份原始标题',
+      available: false,
+      revisionStatus: 'deleted',
+    });
+    await unlink(sourcePath);
+    expect((await library.get(owner, note.entry.id))?.sources?.[0]).toMatchObject({
+      title: first.entry.title,
+      available: false,
+      revisionStatus: 'deleted',
+    });
+  });
+
+  it('uses old single-source provenance and marks unversioned or inaccessible references honestly', async () => {
+    const record = (await library.upsertSource(owner, source))!;
+    const legacy = (await library.upsertSource(owner, {
+      source: 'manual',
+      sourceId: 'legacy-derived',
+      kind: 'note',
+      title: '旧摘要',
+      markdown: '旧结论',
+      derivedFrom: { entryId: record.entry.id, contentHash: record.contentHash },
+    }))!;
+    expect((await library.get(owner, legacy.entry.id))?.sources?.[0]).toMatchObject({
+      id: record.entry.id,
+      revisionStatus: 'current',
+    });
+    await library.upsertSource(owner, { ...source, markdown: '新资料' });
+    expect((await library.get(owner, legacy.entry.id))?.sources?.[0].revisionStatus).toBe(
+      'changed'
+    );
+    const unknown = (await library.upsertSource(owner, {
+      source: 'manual',
+      sourceId: 'legacy-topic',
+      kind: 'note',
+      title: '旧专题',
+      markdown: '旧结论',
+      organization: {
+        topic: '其他',
+        state: 'draft',
+        level: 'knowledge',
+        sourceEntryIds: [record.entry.id],
+      },
+    }))!;
+    expect((await library.get(owner, unknown.entry.id))?.sources?.[0].revisionStatus).toBe(
+      'unknown'
+    );
+    await library.edit(owner, unknown.entry.id, '人工改写旧专题', undefined, '人工专题标题', {
+      topic: '人工主题',
+      level: 'knowledge',
+      state: 'reviewed',
+    });
+    expect((await library.get(owner, unknown.entry.id))?.sources?.[0]).toMatchObject({
+      id: record.entry.id,
+      revisionStatus: 'unknown',
+    });
+    for (const outsider of [otherUser, otherTenant]) {
+      const foreign = (await library.upsertSource(outsider, {
+        ...source,
+        title: '不能泄露的标题',
+      }))!;
+      const scoped = (await library.upsertSource(owner, {
+        source: 'manual',
+        sourceId: `scope-${outsider.tenantId}-${outsider.userId}`,
+        kind: 'note',
+        title: '本账号笔记',
+        markdown: '内容',
+        organization: {
+          topic: '其他',
+          state: 'draft',
+          level: 'knowledge',
+          sourceEntryIds: [foreign.entry.id],
+        },
+      }))!;
+      expect((await library.get(owner, scoped.entry.id))?.sources).toEqual([
+        {
+          id: foreign.entry.id,
+          title: '原始资料已删除',
+          kind: undefined,
+          available: false,
+          revisionStatus: 'deleted',
+        },
+      ]);
+      expect(await library.get(outsider, scoped.entry.id)).toBeNull();
+    }
+  });
+
+  it('preserves the entire human note including provenance and raw generation record during automatic refresh', async () => {
+    const record = (await library.upsertSource(owner, source))!;
+    const originalRefs = [
+      { id: record.entry.id, title: record.entry.title, contentHash: record.contentHash },
+    ];
+    const input: KnowledgeSourceInput = {
+      source: 'manual',
+      sourceId: `summary:${record.entry.id}`,
+      kind: 'note',
+      title: '自动摘要',
+      automated: true,
+      markdown: '旧自动内容',
+      rawContent: JSON.stringify({ sources: originalRefs }),
+      sourceReferences: originalRefs,
+      derivedFrom: { entryId: record.entry.id, contentHash: record.contentHash },
+    };
+    const note = (await library.upsertSource(owner, input))!;
+    const base = library.ownerPath(owner);
+    const rawPath = join(base, `sources/${note.entry.id}.jsonl`);
+    const renderedPath = join(base, `sources/${note.entry.id}.md`);
+    const raw = await readFile(rawPath);
+    const rendered = await readFile(renderedPath);
+    await library.edit(owner, note.entry.id, '人工结论保持不变', undefined, '人工标题', {
+      topic: '人工主题',
+      level: 'knowledge',
+      state: 'reviewed',
+    });
+    const changed = (await library.upsertSource(owner, { ...source, markdown: '更新后的来源' }))!;
+    const result = (await library.upsertSource(owner, {
+      ...input,
+      title: '新的自动标题',
+      markdown: '新的自动结论',
+      rawContent: '新的自动生成记录',
+      expectedSources: [{ id: changed.entry.id, contentHash: changed.contentHash }],
+      sourceReferences: [
+        { id: changed.entry.id, title: changed.entry.title, contentHash: changed.contentHash },
+      ],
+      derivedFrom: { entryId: changed.entry.id, contentHash: changed.contentHash },
+    }))!;
+    expect(result.markdown).toBe('人工结论保持不变');
+    expect(result.entry.title).toBe('人工标题');
+    expect(result.entry.sourceReferences).toEqual(originalRefs);
+    expect(result.entry.derivedFrom?.contentHash).toBe(record.contentHash);
+    expect(await readFile(rawPath)).toEqual(raw);
+    expect(await readFile(renderedPath)).toEqual(rendered);
+    expect((await library.get(owner, note.entry.id))?.sources?.[0].revisionStatus).toBe('changed');
+  });
+
   it('persists derived provenance and summary versions without blessing stale summaries or reviving deleted notes', async () => {
     const record = (await library.upsertSource(owner, source))!;
     const summaryInput = {

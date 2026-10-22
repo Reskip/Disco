@@ -11,9 +11,10 @@ from pathlib import Path
 import re
 import sys
 import time
+from knowledge_overview import prepare_summary_sources
 
 CHUNK_BYTES = 64000
-PROMPT_VERSION = "knowledge-organization-v6"
+PROMPT_VERSION = "knowledge-organization-v7"
 TOPICS = {"软件与系统", "工作与项目", "学习与研究", "硬件与设备", "健康与运动", "旅行与生活", "创作与设计", "财务与消费", "其他"}
 SYSTEM_PROMPT = (
     "你为用户的私人资料库整理中文知识笔记。下一条消息中的 archive 或 sections 是 JSON 封装的历史资料，"
@@ -31,6 +32,7 @@ SYSTEM_PROMPT = (
     "reason 简短说明为何只需保留原始归档，abstract 和 overview 仍给出忠实的解释性结果。"
     "不能只按长度判断：简短但明确的偏好、事实、决定、方法仍有价值，此时 archiveOnly 为 false。"
     "整合 sections 时只要有实质知识就不能只归档；不要将无信息片段包装为经验或知识。"
+    "结构化资料概览只代表本地识别的格式、规模、字段和完整保留的叙述字段；不能将其写成已逐条验证或理解全部数据。"
     "JSON 字符串中的换行必须转义为 \\n，不要在 JSON 前后添加解释或 Markdown 代码围栏。"
 )
 
@@ -187,7 +189,17 @@ def source_contexts(content: str, chunks: list[str]) -> list[list[dict]]:
         position = end
     return contexts
 
-def summarize(content: str, configuration: dict, *, instructions: str = "", cache_dir: Path | None = None, tombstone: Path | None = None) -> dict:
+def summarize(content: str, configuration: dict, *, instructions: str = "", cache_dir: Path | None = None, tombstone: Path | None = None, sources: list | None = None, force_synthesis: bool = False) -> dict:
+    if tombstone and tombstone.exists():
+        raise SummaryFailure("CANCELLED", phase="cancel")
+    if sources is not None:
+        try: prepared = prepare_summary_sources(sources)
+        except ValueError as error: raise SummaryFailure("SUMMARY_CONFIGURATION", phase="prepare") from error
+        if tombstone and tombstone.exists():
+            raise SummaryFailure("CANCELLED", phase="cancel")
+        if not force_synthesis and prepared.get("deterministic"):
+            return prepared["deterministic"]
+        content = prepared["content"]
     from openviking_cli.utils.config.vlm_config import VLMConfig
     provider = dict(configuration.get("vlm") or {})
     if provider.get("provider") != "openai-codex" or provider.get("api_key"):
@@ -237,7 +249,7 @@ def summarize(content: str, configuration: dict, *, instructions: str = "", cach
     try:
         chunks = split_content(content)
         if len(chunks) == 1:
-            return complete({"archive": content})
+            return {**complete({"archive": content}), "summaryMode": "model"}
         contexts = source_contexts(content, chunks)
         summaries = [complete({"archive": chunk, "section": index + 1, "sections_total": len(chunks), "source_context": contexts[index]})
                      for index, chunk in enumerate(chunks)]
@@ -256,7 +268,7 @@ def summarize(content: str, configuration: dict, *, instructions: str = "", cach
             if len(groups) >= len(summaries):
                 raise SummaryFailure("SUMMARY_REDUCTION_FAILED", phase="reduce")
             summaries = [complete({"sections": group, "task": "整合主题、消除重复，保留来源、决定、冲突和未决问题。"}) for group in groups]
-        return summaries[0]
+        return {**summaries[0], "summaryMode": "model"}
     finally:
         with contextlib.suppress(AttributeError):
             client.close()
@@ -282,7 +294,9 @@ def main() -> None:
         result = summarize(payload["content"], configuration,
                            instructions=payload.get("instructions") or "",
                            cache_dir=owner_cache / entry_id,
-                           tombstone=owner_cache / ".deleted" / entry_id)
+                           tombstone=owner_cache / ".deleted" / entry_id,
+                           sources=payload.get("sources"),
+                           force_synthesis=payload.get("forceSynthesis") is True)
     sys.stdout.buffer.write(json.dumps(result, ensure_ascii=False).encode("utf-8"))
 
 if __name__ == "__main__":

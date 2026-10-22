@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { mkdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { resolveDiscoUserWorkspaceDirectory } from '@disco/core';
 import {
   type DiscoConfig,
@@ -52,6 +52,7 @@ import { canSummarize, organization, retryDate } from './organization.js';
 import {
   fuseSearchRanks,
   hasKeywordMatch,
+  isExactLookup,
   KnowledgeKeywordIndex,
   type KnowledgeMatch,
   searchExcerpt,
@@ -135,6 +136,8 @@ export class KnowledgeRuntime {
   private archiveReady = new Set<string>();
   private activeIndex = new Map<string, string>();
   private activeSummary = new Map<string, string>();
+  private keywordWarmups = new Map<string, Promise<void>>();
+  private keywordWarmedAt = new Map<string, number>();
   private stopped = true;
   private archiveAbort = new AbortController();
   private states = new Map<string, NonNullable<KnowledgeLibraryStatus['sync']>>();
@@ -218,6 +221,31 @@ export class KnowledgeRuntime {
 
   observe(owner: KnowledgeOwner): void {
     this.knownOwners.set(ownerKey(owner), owner);
+    this.warmKeywords(owner);
+  }
+
+  private warmKeywords(owner: KnowledgeOwner): void {
+    const key = ownerKey(owner);
+    if (
+      this.stopped ||
+      this.keywordWarmups.has(key) ||
+      Date.now() - (this.keywordWarmedAt.get(key) ?? 0) < 30_000
+    )
+      return;
+    const work = (async () => {
+      const entries = (await this.library.snapshot(owner)).filter((entry) => !entry.historical);
+      await this.keywordIndex.warm(
+        key,
+        entries,
+        new Set(entries.map((entry) => entry.id)),
+        (id) => this.library.get(owner, id),
+        () => !this.stopped
+      );
+      this.keywordWarmedAt.set(key, Date.now());
+    })()
+      .catch(() => undefined)
+      .finally(() => this.keywordWarmups.delete(key));
+    this.keywordWarmups.set(key, work);
   }
 
   async assertWritable(owner: KnowledgeOwner): Promise<void> {
@@ -284,6 +312,7 @@ export class KnowledgeRuntime {
     );
     if (!entries.length) return { results: [], engine: 'local' };
     const allowed = new Set(entries.map((entry) => entry.id));
+    const exact = isExactLookup(input.query);
     const keywordWork = this.keywordIndex.search(
       ownerKey(owner),
       entries,
@@ -293,7 +322,7 @@ export class KnowledgeRuntime {
       40
     );
     const semanticWork = (async () => {
-      if (!this.engine) return [];
+      if (!this.engine || exact) return [];
       try {
         const hits = await this.engine.search(owner, {
           query: input.query,
@@ -329,6 +358,10 @@ export class KnowledgeRuntime {
       const hit = semanticById.get(id);
       const position = hit ? verifiedSemanticPosition(detail.markdown, hit.excerpt) : undefined;
       const lexical = keywordIds.has(id) && hasKeywordMatch(detail, input.query);
+      // An unparsed image/archive has only filename metadata; it cannot provide
+      // semantic evidence about its actual contents.
+      if (detail.entry.kind === 'document' && detail.entry.parseStatus !== 'parsed' && !lexical)
+        continue;
       // Stale or fabricated provider text never becomes a quoted source. A
       // changed human note can still be returned by current keyword evidence.
       if (position === undefined && !lexical) continue;
@@ -437,7 +470,14 @@ export class KnowledgeRuntime {
     this.indexTimer = undefined;
     this.summaryTimer = undefined;
     this.engine?.cancelPending?.();
-    await Promise.allSettled([this.running, this.indexing, this.summarizing]);
+    await Promise.allSettled([
+      this.running,
+      this.indexing,
+      this.summarizing,
+      ...this.keywordWarmups.values(),
+    ]);
+    this.keywordIndex.clear();
+    this.keywordWarmedAt.clear();
   }
 
   async runOnce(includeDerived = true): Promise<void> {
@@ -518,7 +558,10 @@ export class KnowledgeRuntime {
           (entry) =>
             entry.kind === 'document' &&
             entry.attachments?.some((file) => file.id) &&
-            (!entry.parseStatus || entry.parseStatus === 'pending' || entry.parseStatus === 'error')
+            (!entry.parseStatus ||
+              entry.parseStatus === 'pending' ||
+              (entry.parseStatus === 'error' &&
+                (!entry.parseRetryAt || Date.parse(entry.parseRetryAt) <= Date.now())))
         );
         for (const entry of unparsed.slice(0, 10)) {
           if (this.stopped) return;
@@ -561,7 +604,12 @@ export class KnowledgeRuntime {
     for (const candidate of candidates) {
       if (this.stopped) break;
       const before = this.lastSummaryAt;
-      await this.summarizeOwner(candidate.owner).catch(() => undefined);
+      for (let localBatch = 0; localBatch < 4 && !this.stopped; localBatch++) {
+        const result = await this.summarizeOwner(candidate.owner).catch(() => undefined);
+        if (result !== 'local') break;
+        // Small local inventories need no model cooldown, but yield between owners.
+        this.summaryOwnerCursor = (candidate.index + 1) % summaryOwners.length;
+      }
       if (this.lastSummaryAt !== before) {
         this.summaryOwnerCursor = (candidate.index + 1) % summaryOwners.length;
         break;
@@ -1018,7 +1066,7 @@ export class KnowledgeRuntime {
     return (await this.library.get(owner, detail.entry.id))!;
   }
 
-  private async summarizeOwner(owner: KnowledgeOwner): Promise<void> {
+  private async summarizeOwner(owner: KnowledgeOwner): Promise<'local' | undefined> {
     if (!this.engine || this.stopped || Date.now() - this.lastSummaryAt < 60_000) return;
     await this.assertWritable(owner);
     const entries = await this.library.snapshot(owner);
@@ -1068,8 +1116,10 @@ export class KnowledgeRuntime {
         )
         .sort(
           (a, b) =>
+            Number(isStructuredSummaryCandidate(b)) - Number(isStructuredSummaryCandidate(a)) ||
             Number(b.kind === 'conversation') - Number(a.kind === 'conversation') ||
             (a.summaryAttempts ?? 0) - (b.summaryAttempts ?? 0) ||
+            summaryAgeWeek(a) - summaryAgeWeek(b) ||
             a.sizeBytes - b.sizeBytes
         );
       for (const entry of eligible) {
@@ -1081,6 +1131,7 @@ export class KnowledgeRuntime {
       }
       if (!inputs.length) return;
     }
+    const previousSummaryAt = this.lastSummaryAt;
     this.lastSummaryAt = Date.now();
     this.activeSummary.set(ownerKey(owner), target?.entry.title ?? inputs[0].entry.title);
     if (target)
@@ -1092,6 +1143,19 @@ export class KnowledgeRuntime {
     try {
       const summary = await this.engine.summarizeContent(owner, {
         id: target?.entry.id ?? inputs[0].entry.id,
+        sources: inputs.map((item) => ({
+          id: item.entry.id,
+          title: item.entry.title,
+          kind: item.entry.kind,
+          format:
+            item.entry.kind === 'document'
+              ? extname(item.entry.attachments?.at(-1)?.name ?? item.entry.title)
+                  .slice(1)
+                  .toLowerCase()
+              : undefined,
+          markdown: item.markdown,
+        })),
+        forceSynthesis: Boolean(target),
         content: inputs
           .map(
             (item) =>
@@ -1144,6 +1208,7 @@ export class KnowledgeRuntime {
         kind: 'note',
         title,
         automated: true,
+        summaryMode: summary.summaryMode ?? 'model',
         derivedFrom: target
           ? undefined
           : { entryId: first.entry.id, contentHash: first.contentHash },
@@ -1158,7 +1223,7 @@ export class KnowledgeRuntime {
         generation: { state: 'complete' },
         sourceUrl: `/knowledge?entry=${first.entry.id}`,
         sourceUpdatedAt: first.entry.updatedAt,
-        markdown: `# ${title}\n\n> 根据所列原始资料整理。\n\n${summary.abstract}\n\n${summary.overview}\n\n## 来源\n\n${references}\n`,
+        markdown: `# ${title}\n\n> ${summary.summaryMode === 'structured_overview' ? '本地生成的资料概览，描述文件结构与可核实的统计；不代表逐条解读了所有记录。' : '根据所列原始资料整理。'}\n\n${summary.abstract}\n\n${summary.overview}\n\n## 来源\n\n${references}\n`,
         rawContent: `${JSON.stringify({ sources: inputs.map((item) => ({ id: item.entry.id, hash: item.contentHash })), generatedAt: new Date().toISOString(), ...summary })}\n`,
       });
       if (!target) {
@@ -1170,6 +1235,10 @@ export class KnowledgeRuntime {
           summary: summary.abstract,
           tags: summary.tags,
         });
+      }
+      if (!target && summary.summaryMode === 'structured_overview') {
+        this.lastSummaryAt = previousSummaryAt;
+        return 'local';
       }
     } catch (error) {
       const message =
@@ -1195,6 +1264,22 @@ export class KnowledgeRuntime {
       this.activeSummary.delete(ownerKey(owner));
     }
   }
+}
+
+function isStructuredSummaryCandidate(entry: KnowledgeEntry): boolean {
+  return (
+    entry.kind === 'document' &&
+    ['.json', '.jsonl', '.ndjson', '.csv', '.tsv', '.html', '.htm'].includes(
+      extname(entry.attachments?.at(-1)?.name ?? entry.title).toLowerCase()
+    )
+  );
+}
+
+function summaryAgeWeek(entry: KnowledgeEntry): number {
+  const timestamp = Date.parse(entry.sourceUpdatedAt ?? entry.createdAt);
+  return Number.isFinite(timestamp)
+    ? Math.max(0, Math.floor((Date.now() - timestamp) / 604800_000))
+    : Number.MAX_SAFE_INTEGER;
 }
 
 /** Transcript cwd authorizes only explicitly linked files, never a directory crawl. */

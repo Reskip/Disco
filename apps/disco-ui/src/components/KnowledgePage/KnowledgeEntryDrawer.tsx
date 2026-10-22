@@ -1,4 +1,5 @@
 import {
+  ArrowLeftOutlined,
   CheckOutlined,
   DeleteOutlined,
   DownloadOutlined,
@@ -64,6 +65,8 @@ export function KnowledgeEntryDrawer({
   save,
   confirmReviewed,
   openEntry,
+  previousEntryTitle,
+  returnToPreviousEntry,
   removeEntry,
 }: {
   open: boolean;
@@ -88,6 +91,8 @@ export function KnowledgeEntryDrawer({
   save: () => Promise<void>;
   confirmReviewed: () => Promise<void>;
   openEntry: (id: string) => void;
+  previousEntryTitle?: string;
+  returnToPreviousEntry: () => void;
   removeEntry: (entry: KnowledgeEntry) => void;
 }) {
   const { token } = theme.useToken();
@@ -95,16 +100,25 @@ export function KnowledgeEntryDrawer({
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [downloadingMarkdown, setDownloadingMarkdown] = useState(false);
   const readingRef = useRef<HTMLDivElement>(null);
-  const previousPageRef = useRef<string | null>(null);
+  const detailTopRef = useRef<HTMLDivElement>(null);
+  const previousReadingRef = useRef<{ id: string; offset: number } | null>(null);
   const page = detail?.page;
   const paged = Boolean(page && (page.hasMore || page.offset > 0));
-  const pageKey = detail ? `${detail.entry.id}:${detail.page?.offset ?? 0}` : null;
+  const readingEntryId = detail?.entry.id;
+  const readingOffset = detail?.page?.offset ?? 0;
   useEffect(() => {
-    if (previousPageRef.current && pageKey !== previousPageRef.current) {
+    if (!open) {
+      previousReadingRef.current = null;
+      return;
+    }
+    if (!readingEntryId) return;
+    if (previousReadingRef.current?.id !== readingEntryId) {
+      detailTopRef.current?.scrollIntoView?.({ block: 'start' });
+    } else if (previousReadingRef.current.offset !== readingOffset) {
       readingRef.current?.scrollIntoView?.({ block: 'start' });
     }
-    previousPageRef.current = pageKey;
-  }, [pageKey]);
+    previousReadingRef.current = { id: readingEntryId, offset: readingOffset };
+  }, [open, readingEntryId, readingOffset]);
   const metadata = entryOrganization(detail?.entry);
   const generation = detail?.entry.generation;
   const sources = detail?.sources;
@@ -230,6 +244,25 @@ export function KnowledgeEntryDrawer({
         ) : null
       }
     >
+      <div ref={detailTopRef} />
+      {!editing && previousEntryTitle && (
+        <Button
+          type="link"
+          icon={<ArrowLeftOutlined />}
+          onClick={returnToPreviousEntry}
+          aria-label={`返回上一份资料：${previousEntryTitle}`}
+          disabled={saving || fullLoading}
+          style={{
+            paddingInline: 0,
+            marginBottom: token.marginSM,
+            height: 'auto',
+            whiteSpace: 'normal',
+            textAlign: 'left',
+          }}
+        >
+          返回：{previousEntryTitle}
+        </Button>
+      )}
       {detailLoading && !detail && <Skeleton active paragraph={{ rows: 10 }} />}
       {detailError && (
         <Alert type="error" title={detailError} showIcon style={{ marginBottom: token.margin }} />
@@ -319,7 +352,11 @@ export function KnowledgeEntryDrawer({
               <Space orientation="vertical" size="small" style={{ width: '100%' }}>
                 <Space wrap>
                   <Tag>{metadata.topic}</Tag>
-                  <Tag>{LEVEL_LABELS[metadata.level]}</Tag>
+                  <Tag>
+                    {detail.entry.summaryMode === 'structured_overview'
+                      ? '资料概览'
+                      : LEVEL_LABELS[metadata.level]}
+                  </Tag>
                   {detail.entry.kind === 'note' && (
                     <Tag>{metadata.state === 'reviewed' ? '已确认' : '待审阅'}</Tag>
                   )}

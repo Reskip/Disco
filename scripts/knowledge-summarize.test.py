@@ -4,6 +4,8 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 import tempfile
+import subprocess
+import sys
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("knowledge_summarize", Path(__file__).with_name("knowledge-summarize.py"))
@@ -195,6 +197,43 @@ class SummaryProviderTests(unittest.TestCase):
             with self.assertRaises(module.SummaryFailure) as raised:
                 module.summarize("synthetic", {"vlm": {"provider": "openai-codex"}}, cache_dir=Path(directory))
             self.assertEqual(raised.exception.code, "SUMMARY_CACHE_UNAVAILABLE")
+
+    def test_structured_only_sources_do_not_initialize_a_model_or_require_credentials(self):
+        sources=[{"id":"data-source","title":"站点.json","kind":"document","format":"json","markdown":"[{\"lat\":1,\"lng\":2}]"}]
+        with patch.dict("sys.modules", {"openviking_cli.utils.config.vlm_config": SimpleNamespace(VLMConfig=lambda **_: self.fail("unexpected model call"))}):
+            result=module.summarize("legacy content remains compatible",{},sources=sources)
+        self.assertEqual(result['summaryMode'],'structured_overview')
+        self.assertIn('1 条记录',result['overview'])
+
+    def test_standalone_helper_emits_local_overview_without_a_model_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config=Path(directory)/'config.json'
+            config.write_text('{}',encoding='utf-8')
+            payload={'scope':'disco_'+'a'*32,'entry_id':'synthetic','content':'legacy','sources':[{'id':'data-source','title':'站点.json','kind':'document','format':'json','markdown':'[{"lat":1,"lng":2}]'}]}
+            response=subprocess.run([sys.executable,str(Path(__file__).with_name('knowledge-summarize.py')),'--config',str(config)],input=json.dumps(payload).encode('utf-8'),capture_output=True,timeout=20)
+            self.assertEqual(response.returncode,0,response.stdout.decode('utf-8'))
+            self.assertEqual(json.loads(response.stdout)['summaryMode'],'structured_overview')
+            self.assertFalse((Path(directory)/'summary-work').exists())
+
+    def test_explicit_synthesis_and_mixed_sources_use_prepared_input_without_losing_narrative(self):
+        sources=[{"id":"data-source","title":"数据.csv","kind":"document","format":"csv","markdown":"lat,lng\n1,2\n3,4\n"}]
+        calls=[]
+        class FakeVLM:
+            def __init__(self,**configuration): pass
+            def get_completion(self,**arguments):
+                calls.append(json.loads(arguments['messages'][1]['content'])['archive'])
+                return '{"abstract":"结果","overview":"保留范围与来源","summaryMode":"structured_overview"}'
+            def close(self): pass
+        with patch.dict("sys.modules",{"openviking_cli.utils.config.vlm_config":SimpleNamespace(VLMConfig=FakeVLM)}):
+            result=module.summarize('legacy',{'vlm':{'provider':'openai-codex'}},sources=sources,force_synthesis=True)
+            self.assertEqual(result['summaryMode'],'model')
+            self.assertIn('2 条数据记录',calls[-1])
+            self.assertNotIn('1,2\n3,4',calls[-1])
+            text='完整叙述，包含结尾 LAST_SENTINEL'
+            module.summarize('legacy',{'vlm':{'provider':'openai-codex'}},sources=sources+[{"id":"narrative-source","title":"决定","kind":"conversation","markdown":text}])
+            self.assertIn(text,calls[-1])
+            self.assertIn('/knowledge?entry=data-source',calls[-1])
+            self.assertIn('/knowledge?entry=narrative-source',calls[-1])
 
 
 if __name__ == "__main__":

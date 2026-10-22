@@ -333,6 +333,47 @@ describe('knowledge background synchronization', () => {
     });
   });
 
+  it('batches local file inventories without spending the model cooldown and preserves synthesis provenance', async () => {
+    const session = await createSession(primary, '知识库决定');
+    await append(session, 0, '人工编辑不得被覆盖。');
+    await runtime.runOnce(false);
+    for (const title of ['stations.json', 'tracks.csv']) {
+      const detail = (await runtime.library.upsertSource(owner, {
+        source: 'manual',
+        sourceId: title,
+        title,
+        kind: 'document',
+        markdown: '原件完整数据',
+      }))!;
+      await runtime.library.markParsed(owner, detail.entry.id, 'parsed');
+    }
+    for (const entry of (await runtime.library.list(owner)).entries)
+      await runtime.library.markIndexed(owner, entry.id);
+    const summarizeContent = vi.fn(async (_owner, input) => ({
+      title: `${input.sources[0].title}概览`,
+      abstract: '真实来源的说明',
+      overview: '## 可核实内容\n字段与记录完整统计。',
+      summaryMode: input.sources[0].kind === 'document' ? 'structured_overview' : 'model',
+    }));
+    Object.defineProperty(runtime, 'engine', { value: { summarizeContent } });
+    await runtime.runSummaryOnce();
+    expect(summarizeContent).toHaveBeenCalledTimes(3);
+    expect(
+      summarizeContent.mock.calls
+        .slice(0, 2)
+        .every((call) => call[1].sources[0].kind === 'document')
+    ).toBe(true);
+    expect(summarizeContent.mock.calls[0][1].forceSynthesis).toBe(false);
+    const notes = await runtime.library.list(owner, { kind: 'note' });
+    expect(
+      notes.entries.filter((entry) => entry.summaryMode === 'structured_overview')
+    ).toHaveLength(2);
+    const overview = notes.entries.find((entry) => entry.summaryMode === 'structured_overview')!;
+    expect((await runtime.library.get(owner, overview.id))?.markdown).toContain('不代表逐条解读');
+    await runtime.runSummaryOnce();
+    expect(summarizeContent).toHaveBeenCalledTimes(3);
+  });
+
   it('prioritizes explicit synthesis across owners before unattended historical summaries', async () => {
     const session = await createSession(primary, '后台历史');
     await append(session, 0, '后台需要整理的资料');

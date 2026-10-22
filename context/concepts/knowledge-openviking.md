@@ -72,11 +72,25 @@ that begin midway through a document, preserving source IDs and links. Prompts
 extract conclusions, decisions, reusable methods and unresolved conflicts instead
 of rewriting the transcript in chronological order. Input is never truncated,
 and original library files are never written by the helper.
-Prompt version v6 permits an explicit `archiveOnly` decision for greeting-only,
+Prompt version v7 permits an explicit `archiveOnly` decision for greeting-only,
 connection-test or no-action records without reusable information. Short but
 substantive preferences or decisions remain eligible. Automatic organization
 records the disposition without producing a knowledge note; explicit synthesis
 still receives a truthful explanatory summary.
+
+Optional typed `sources` accompany the backwards-compatible `content` input.
+The pure local `scripts/knowledge_overview.py` module fully scans JSON/CSV
+structures, counts fields and records, and extracts complete static HTML text
+without executing scripts or fetching resources. Structured-only automatic
+requests return `summaryMode: structured_overview` without initializing a VLM;
+the overview explains its limits and preserves source links. Large coordinate
+arrays, record tables and HTML application scripts are not sent to the model.
+Recognized narrative fields, short rules/preferences and ordinary narrative
+documents remain complete inputs. Invalid/unrecognized formats conservatively
+retain the complete Markdown. Explicit `forceSynthesis` or mixed narrative
+sources uses the model on the prepared input, returning `summaryMode: model`.
+This preparation never modifies the portable source or claims row-by-row
+knowledge extraction from a structural overview.
 
 The helper guards the installed Codex adapter's synchronous Responses stream:
 failed/incomplete or missing completion events cannot become partial successes.
@@ -177,6 +191,29 @@ it. The helper reads archives only from stdin and returns only validated summary
 JSON. Provider exceptions and stderr are not exposed to users. OpenViking 0.5.1.1's
 Codex client cleanup lacks `close()` on its shim; that specific cleanup exception
 is suppressed in this isolated helper so it does not discard valid output.
+
+## Retrieval and synthesis operating behavior
+
+Keyword counts are warmed in the background per owner, refreshed when document
+versions change, and shared with concurrent searches. Exact technical identifiers
+(error names, paths, codes) require literal evidence. Unparsed file metadata cannot
+support a semantic claim about that file's contents. Every returned passage is
+checked against the current owner-scoped Markdown and includes versioned offsets.
+
+Summary inputs are format-aware. `scripts/knowledge_overview.py` scans structured
+JSON and CSV locally and extracts static HTML text without executing scripts.
+It preserves narrative fields and short rules in full for model synthesis. Pure
+data inventories are marked `structured_overview`, explain their limits, and do
+not call a model. Their generation does not consume the model cooldown; small
+local batches yield between owners. Explicit cross-source requests still run
+model synthesis over prepared sources. Ordinary narrative archives remain whole
+and use resumable chunked synthesis.
+
+The UI uses one catalog response, bounded reading windows, complete Markdown
+downloads, and complete-body loads before editing. Source navigation has a return
+history, and users can inspect or remove every selected source before organizing.
+Malformed file parsing backs off instead of relaunching a parser on every scan;
+replacing the original resets this retry state.
 
 ## Host MCP
 

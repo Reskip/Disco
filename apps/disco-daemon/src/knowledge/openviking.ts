@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { createHash, createHmac } from 'node:crypto';
 import { lstat, mkdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import type { KnowledgeOwner } from '@disco/core/types';
+import type { KnowledgeKind, KnowledgeOwner } from '@disco/core/types';
 
 /** Provision one OpenViking account per authenticated Disco owner. */
 export function openVikingAccountId(owner: KnowledgeOwner): string {
@@ -57,6 +57,16 @@ export interface KnowledgeSummary {
   tags?: string[];
   archiveOnly?: boolean;
   reason?: string;
+  summaryMode?: 'structured_overview' | 'model';
+}
+
+/** Sources are resolved from the same authenticated library by the caller. */
+export interface KnowledgeSummarySource {
+  id: string;
+  title: string;
+  kind: KnowledgeKind;
+  format?: string;
+  markdown: string;
 }
 
 const providerMessages: Record<string, string> = {
@@ -122,7 +132,9 @@ function summaryDiagnostic(value: unknown): Record<string, string | number> {
   const result: Record<string, string | number> = {};
   if (
     typeof input?.phase === 'string' &&
-    ['stream', 'parse', 'cache', 'configuration', 'reduce', 'cancel'].includes(input.phase)
+    ['stream', 'parse', 'cache', 'configuration', 'prepare', 'reduce', 'cancel'].includes(
+      input.phase
+    )
   )
     result.phase = input.phase;
   if (
@@ -786,10 +798,29 @@ export class OpenVikingClient {
   /** Explicit/manual synthesis need not wait for a derived semantic index. */
   async summarizeContent(
     owner: KnowledgeOwner,
-    document: { id: string; content: string; instructions?: string }
+    document: {
+      id: string;
+      content: string;
+      instructions?: string;
+      sources?: KnowledgeSummarySource[];
+      forceSynthesis?: boolean;
+    }
   ): Promise<KnowledgeSummary> {
     openVikingAccountId(owner);
     safeEntryId(document.id);
+    if (document.sources) {
+      if (!document.sources.length)
+        throw new OpenVikingError('摘要来源为空', 'SUMMARY_CONFIGURATION');
+      for (const source of document.sources) {
+        safeEntryId(source.id);
+        if (
+          typeof source.title !== 'string' ||
+          typeof source.markdown !== 'string' ||
+          !['conversation', 'document', 'note'].includes(source.kind)
+        )
+          throw new OpenVikingError('摘要来源信息无效', 'SUMMARY_CONFIGURATION');
+      }
+    }
     const settings = this.options.summary;
     if (!settings) throw new OpenVikingError('摘要模型尚未配置', 'NOT_CONFIGURED');
     if (
@@ -908,6 +939,9 @@ export class OpenVikingClient {
           resolve({
             abstract: result.abstract,
             overview: result.overview,
+            ...(result.summaryMode === 'structured_overview' || result.summaryMode === 'model'
+              ? { summaryMode: result.summaryMode }
+              : {}),
             ...(typeof result.title === 'string' ? { title: result.title } : {}),
             ...(typeof result.topic === 'string' ? { topic: result.topic } : {}),
             ...(Array.isArray(result.tags) && result.tags.every((tag) => typeof tag === 'string')
@@ -930,6 +964,14 @@ export class OpenVikingClient {
         JSON.stringify({
           content: document.content,
           instructions: document.instructions,
+          sources: document.sources?.map(({ id, title, kind, format, markdown }) => ({
+            id,
+            title,
+            kind,
+            format,
+            markdown,
+          })),
+          forceSynthesis: document.forceSynthesis === true,
           scope: openVikingAccountId(owner),
           entry_id: document.id,
         })

@@ -89,6 +89,17 @@ describe('knowledge document extraction', () => {
     const failure = await extractKnowledgeDocument(library, owner, malformed.entry.id);
     expect(failure).toMatchObject({ parsed: false, status: 'error' });
     expect(failure.detail?.entry.parseStatus).toBe('error');
+    expect(Date.parse(failure.detail!.entry.parseRetryAt!)).toBeGreaterThan(
+      Date.now() + 4 * 60_000
+    );
+    await library.putAttachment(owner, malformed.entry.id, {
+      name: 'invalid.txt',
+      bytes: Buffer.from('修复后的完整文本'),
+    });
+    const replaced = (await library.get(owner, malformed.entry.id))!;
+    expect(replaced.entry.parseStatus).toBe('pending');
+    expect(replaced.entry.parseRetryAt).toBeUndefined();
+    expect((await extractKnowledgeDocument(library, owner, malformed.entry.id)).parsed).toBe(true);
     expect(
       (await library.openAttachment(owner, binary.entry.id, binary.attachment.id!))?.body.destroy()
     ).toBeDefined();

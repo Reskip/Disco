@@ -1,5 +1,6 @@
 import {
   ArrowLeftOutlined,
+  CloseOutlined,
   DeleteOutlined,
   FileTextOutlined,
   PlusOutlined,
@@ -98,6 +99,7 @@ export function KnowledgePage({
   const [error, setError] = useState<string | null>(null);
   const [revision, setRevision] = useState(0);
   const [selectedId, setSelectedId] = useState<string | null>(entryId || null);
+  const [readingHistory, setReadingHistory] = useState<Array<{ id: string; title: string }>>([]);
   const [creating, setCreating] = useState(false);
   const [detail, setDetail] = useState<KnowledgeEntryDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -128,6 +130,7 @@ export function KnowledgePage({
   useEffect(() => {
     setSelectedId(entryId || null);
     setCreating(false);
+    setReadingHistory([]);
   }, [entryId]);
 
   useEffect(() => {
@@ -269,6 +272,7 @@ export function KnowledgePage({
       setFullLoading(false);
       setDetail(null);
       setDetailError(null);
+      setReadingHistory([]);
     };
     if (dirty) {
       modal.confirm({
@@ -441,9 +445,43 @@ export function KnowledgePage({
     setOffset(0);
     setResult(null);
   };
+  const hasActiveFilters = Boolean(
+    query ||
+      source !== 'all' ||
+      topic !== 'all' ||
+      (view === 'notes' ? level !== 'all' || reviewState !== 'all' : material !== 'all')
+  );
+  const clearFilters = () => {
+    setSearch('');
+    setQuery('');
+    setSource('all');
+    setTopic('all');
+    setLevel('all');
+    setMaterial('all');
+    setReviewState('all');
+    setIncludeHistory(false);
+    setOffset(0);
+  };
   const openEntry = (id: string) => {
     setCreating(false);
+    setReadingHistory([]);
     setSelectedId(id);
+  };
+  const openSource = (id: string) => {
+    if (!detail || editingRef.current || saving || id === detail.entry.id) return;
+    setReadingHistory((history) => [
+      ...history,
+      { id: detail.entry.id, title: detail.entry.title },
+    ]);
+    setCreating(false);
+    setSelectedId(id);
+  };
+  const returnToPreviousEntry = () => {
+    const previous = readingHistory.at(-1);
+    if (!previous || editingRef.current || saving) return;
+    setReadingHistory((history) => history.slice(0, -1));
+    setCreating(false);
+    setSelectedId(previous.id);
   };
   const startOrganizing = (mode: 'manual' | 'automatic') => {
     setOrganizeTitle('');
@@ -736,26 +774,27 @@ export function KnowledgePage({
                   ) : (
                     <Empty
                       description={
-                        query ||
-                        source !== 'all' ||
-                        topic !== 'all' ||
-                        (view === 'notes'
-                          ? level !== 'all' || reviewState !== 'all'
-                          : material !== 'all')
+                        hasActiveFilters
                           ? '没有找到匹配的资料'
                           : view === 'notes'
                             ? '还没有整理笔记。可从原始资料中选择内容，人工整理或生成草稿。'
                             : '历史会话将在后台同步，也可以增加本地资料。'
                       }
                     >
-                      {view === 'notes' && (
-                        <Button onClick={() => changeView('sources')}>查看原始资料</Button>
-                      )}
+                      <Space wrap>
+                        {hasActiveFilters && <Button onClick={clearFilters}>清除筛选</Button>}
+                        {view === 'notes' && (
+                          <Button onClick={() => changeView('sources')}>查看原始资料</Button>
+                        )}
+                      </Space>
                     </Empty>
                   ),
                 }}
                 renderItem={(entry) => {
                   const metadata = entryOrganization(entry);
+                  const preview = query
+                    ? entry.snippet || metadata.summary
+                    : metadata.summary || entry.snippet;
                   return (
                     <List.Item>
                       <Flex
@@ -784,10 +823,7 @@ export function KnowledgePage({
                         <div style={{ flex: 1, minWidth: 0 }}>
                           <Button
                             type="link"
-                            onClick={() => {
-                              setCreating(false);
-                              setSelectedId(entry.id);
-                            }}
+                            onClick={() => openEntry(entry.id)}
                             style={{
                               padding: 0,
                               maxWidth: '100%',
@@ -799,13 +835,13 @@ export function KnowledgePage({
                           >
                             {entry.title || '未命名资料'}
                           </Button>
-                          {(metadata.summary || entry.snippet) && (
+                          {preview && (
                             <Typography.Paragraph
                               type="secondary"
                               ellipsis={{ rows: 2 }}
                               style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}
                             >
-                              {metadata.summary || entry.snippet}
+                              {preview}
                             </Typography.Paragraph>
                           )}
                           <Flex
@@ -817,7 +853,9 @@ export function KnowledgePage({
                             <Tag>{metadata.topic}</Tag>
                             <Typography.Text type="secondary">
                               {entry.kind === 'note'
-                                ? LEVEL_LABELS[metadata.level]
+                                ? entry.summaryMode === 'structured_overview'
+                                  ? '资料概览'
+                                  : LEVEL_LABELS[metadata.level]
                                 : MATERIAL_LABELS[entry.materialType ?? entry.kind]}
                             </Typography.Text>
                             <Typography.Text type="secondary">
@@ -902,7 +940,9 @@ export function KnowledgePage({
         setOrganization={setOrganization}
         save={save}
         confirmReviewed={confirmReviewed}
-        openEntry={openEntry}
+        openEntry={openSource}
+        previousEntryTitle={readingHistory.at(-1)?.title}
+        returnToPreviousEntry={returnToPreviousEntry}
         removeEntry={removeEntry}
       />
       <Modal
@@ -913,6 +953,7 @@ export function KnowledgePage({
         }}
         onOk={() => void organize()}
         confirmLoading={organizing}
+        okButtonProps={{ disabled: !selection.size || organizing }}
         okText={organizeMode === 'manual' ? '创建并编辑' : '加入整理队列'}
         cancelText="取消"
         maskClosable={!organizing}
@@ -923,10 +964,41 @@ export function KnowledgePage({
               ? '根据所选资料建立带来源引用的笔记，接下来由你填写要点和结论。'
               : '后台提取共识、结论和未解决事项，生成待审阅草稿。原始资料保持完整，人工维护的笔记不会被覆盖。'}
           </Typography.Paragraph>
-          <Typography.Text type="secondary">
-            已选 {selection.size} 份：{[...selection.values()].slice(0, 3).join('、')}
-            {selection.size > 3 ? '…' : ''}
-          </Typography.Text>
+          <Typography.Text type="secondary">已选 {selection.size} 份来源</Typography.Text>
+          <List
+            size="small"
+            bordered
+            dataSource={[...selection.entries()]}
+            locale={{ emptyText: '已清空选择。关闭此窗口后，可重新选择来源。' }}
+            style={{ width: '100%', maxHeight: token.controlHeight * 7, overflowY: 'auto' }}
+            renderItem={([id, sourceTitle]) => (
+              <List.Item>
+                <Flex
+                  align="center"
+                  justify="space-between"
+                  gap={token.marginSM}
+                  style={{ width: '100%' }}
+                >
+                  <Typography.Text style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
+                    {sourceTitle}
+                  </Typography.Text>
+                  <Button
+                    type="text"
+                    icon={<CloseOutlined />}
+                    aria-label={`移除来源 ${sourceTitle}`}
+                    disabled={organizing}
+                    onClick={() =>
+                      setSelection((previous) => {
+                        const next = new Map(previous);
+                        next.delete(id);
+                        return next;
+                      })
+                    }
+                  />
+                </Flex>
+              </List.Item>
+            )}
+          />
           <Input
             aria-label="整理笔记标题"
             placeholder="笔记标题（可选）"

@@ -689,9 +689,12 @@ export class KnowledgeLibrary {
         attachments: attachments.length ? attachments : undefined,
         derivedFrom,
         summaryContentHash: entry?.summaryContentHash,
+        summaryMode: input.summaryMode ?? entry?.summaryMode,
         sourceVersion,
         parseStatus: entry?.parseStatus,
         parseMessage: entry?.parseMessage,
+        parseAttempts: entry?.parseAttempts,
+        parseRetryAt: entry?.parseRetryAt,
         organization: grouping,
         generation: entry?.humanEdited ? entry.generation : (input.generation ?? entry?.generation),
         indexMessage: entry?.contentHash === digest(body) ? entry.indexMessage : undefined,
@@ -1305,6 +1308,9 @@ export class KnowledgeLibrary {
       if (entry?.kind !== 'document' || !(await this.refreshEntry(base, entry))) return false;
       entry.parseStatus = status;
       entry.parseMessage = message;
+      entry.parseAttempts = status === 'error' ? (entry.parseAttempts ?? 0) + 1 : undefined;
+      entry.parseRetryAt =
+        status === 'error' ? retryDate(entry.parseAttempts!, 5 * 60_000) : undefined;
       await this.save(base, entry);
       return true;
     });
@@ -1381,6 +1387,8 @@ export class KnowledgeLibrary {
       if (!previous && entry.kind === 'document') {
         entry.parseStatus = 'pending';
         entry.parseMessage = undefined;
+        entry.parseAttempts = undefined;
+        entry.parseRetryAt = undefined;
       }
       entry.updatedAt = nowAfter(entry.updatedAt);
       await this.save(base, entry);

@@ -3,6 +3,7 @@ import type { KnowledgeEntryDetail } from '@disco/core/types';
 import { describe, expect, it, vi } from 'vitest';
 import {
   fuseSearchRanks,
+  isExactLookup,
   KnowledgeKeywordIndex,
   searchExcerpt,
   searchTerms,
@@ -35,6 +36,40 @@ function document(
 }
 
 describe('knowledge retrieval acceptance', () => {
+  it('distinguishes exact technical identifiers from natural-language questions', () => {
+    for (const query of ['ResourceBusyError', 'ERR_MODULE_NOT_FOUND', 'node:sqlite', 'C548'])
+      expect(isExactLookup(query)).toBe(true);
+    for (const query of ['文件上传为什么中断', 'backup', '如何解决 ResourceBusyError'])
+      expect(isExactLookup(query)).toBe(false);
+  });
+
+  it('warms incrementally and shares document preparation with simultaneous searches', async () => {
+    const record = document('one', '知识库', '人工笔记永久保存');
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const load = vi.fn(async () => {
+      await gate;
+      return record;
+    });
+    const index = new KnowledgeKeywordIndex();
+    const entries = [record.entry];
+    const ids = new Set(['one']);
+    const warm = index.warm('owner', entries, ids, load);
+    const search = index.search('owner', entries, ids, '笔记', load, 5);
+    release();
+    await warm;
+    expect((await search)[0].id).toBe('one');
+    expect(load).toHaveBeenCalledTimes(1);
+    await index.warm('owner', entries, ids, load);
+    expect(load).toHaveBeenCalledTimes(1);
+    const next = document('one', '知识库', '修改为新结论', '2026-10-24T00:00:00Z');
+    const changed = vi.fn(async () => next);
+    await index.warm('owner', [next.entry], ids, changed);
+    expect(await index.search('owner', [next.entry], ids, '笔记', changed, 5)).toEqual([]);
+    expect(changed).toHaveBeenCalledTimes(1);
+  });
   it('recalls Chinese compounds and technical identifiers without depending on segmenter dictionary coverage', () => {
     expect(searchTerms('文件上传切换会话')).toEqual(
       expect.arrayContaining(['上传', '会话', '切换'])

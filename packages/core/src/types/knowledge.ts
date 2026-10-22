@@ -73,6 +73,8 @@ export interface KnowledgeEntry {
   summaryRetryAt?: string;
   summaryDisposition?: 'summarized' | 'archive_only';
   summaryReason?: string;
+  /** Distinguishes a locally computed file inventory from model-based synthesis. */
+  summaryMode?: 'structured_overview' | 'model';
   /** Superseded import copies remain readable/exportable, outside the normal catalog. */
   historical?: boolean;
   sourceUpdatedAt?: string;
@@ -84,6 +86,8 @@ export interface KnowledgeEntry {
   sourceVersion?: KnowledgeSourceVersion;
   parseStatus?: KnowledgeParseStatus;
   parseMessage?: string;
+  parseAttempts?: number;
+  parseRetryAt?: string;
 }
 
 export interface KnowledgeEntryDetail {
@@ -115,6 +119,7 @@ export interface KnowledgeSourceInput {
   sourceVersion?: KnowledgeSourceVersion;
   organization?: KnowledgeOrganization;
   generation?: KnowledgeGeneration;
+  summaryMode?: 'structured_overview' | 'model';
   /** Server-only: automatic drafts remain writable until a human edits them. */
   automated?: boolean;
 }

@@ -546,6 +546,69 @@ describe('OpenViking derived index isolation', () => {
     }
   });
 
+  it('passes owner-scoped typed sources and explicit synthesis intent without extra object fields', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'disco-summary-sources-'));
+    const script = join(base, 'summary.cjs');
+    try {
+      await writeFile(
+        script,
+        `let body='';process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>body+=chunk);process.stdin.on('end',()=>{const input=JSON.parse(body);process.stdout.write(JSON.stringify({abstract:'本地概览',overview:JSON.stringify(input),summaryMode:'structured_overview'}));});`
+      );
+      const { client, fetcher } = setup(undefined, {
+        pythonExecutable: process.execPath,
+        scriptPath: script,
+        configPath: join(base, 'config.json'),
+      });
+      const source = {
+        id: 'source-a',
+        title: '数据.json',
+        kind: 'document' as const,
+        format: 'json',
+        markdown: '[{"count":1}]',
+        privateField: 'DO_NOT_FORWARD',
+      };
+      const result = await client.summarizeContent(owner, {
+        id: 'synthetic',
+        content: 'legacy-compatible',
+        sources: [source],
+        forceSynthesis: true,
+      });
+      expect(result.summaryMode).toBe('structured_overview');
+      expect(JSON.parse(result.overview)).toMatchObject({
+        scope: openVikingAccountId(owner),
+        content: 'legacy-compatible',
+        forceSynthesis: true,
+        sources: [
+          {
+            id: 'source-a',
+            title: '数据.json',
+            kind: 'document',
+            format: 'json',
+            markdown: '[{"count":1}]',
+          },
+        ],
+      });
+      expect(result.overview).not.toContain('DO_NOT_FORWARD');
+      expect(fetcher).not.toHaveBeenCalled();
+      await expect(
+        client.summarizeContent(owner, {
+          id: 'synthetic',
+          content: 'legacy-compatible',
+          sources: [{ ...source, id: '../another-owner' }],
+        })
+      ).rejects.toMatchObject({ code: 'INVALID_ENTRY_ID' });
+      await expect(
+        client.summarizeContent(owner, {
+          id: 'synthetic',
+          content: 'legacy-compatible',
+          sources: [],
+        })
+      ).rejects.toMatchObject({ code: 'SUMMARY_CONFIGURATION' });
+    } finally {
+      await removeFixture(base);
+    }
+  });
+
   it('deletes only the selected derived summary cache and prevents its recreation', async () => {
     const base = await mkdtemp(join(tmpdir(), 'disco-kb-provider-'));
     try {

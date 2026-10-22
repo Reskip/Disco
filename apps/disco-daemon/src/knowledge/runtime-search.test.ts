@@ -108,7 +108,7 @@ describe('knowledge runtime retrieval evidence and scope', () => {
       { id: manual.entry.id, excerpt: manual.markdown, score: 1 },
     ]);
     const result = await runtime.search(owner, {
-      query: 'ERR_MODULE_NOT_FOUND',
+      query: '启动报错 ERR_MODULE_NOT_FOUND',
       source: 'codex',
       entryIds: [manual.entry.id, codex.entry.id],
     });
@@ -121,6 +121,33 @@ describe('knowledge runtime retrieval evidence and scope', () => {
     const count = search.mock.calls.length;
     expect((await runtime.search(owner, { query: '启动', entryIds: [] })).results).toEqual([]);
     expect(search).toHaveBeenCalledTimes(count);
+  });
+
+  it('does not substitute semantic approximations for an exact technical identifier', async () => {
+    const unrelated = (await save('地图页面', 'source_position_retained_low_quality'))!;
+    const search = provider(async () => [{ id: unrelated.entry.id, excerpt: unrelated.markdown }]);
+    expect((await runtime.search(owner, { query: 'ResourceBusyError' })).results).toEqual([]);
+    expect(search).not.toHaveBeenCalled();
+    const relevant = (await save(
+      '索引故障',
+      '批次重复写入触发 ResourceBusyError，应等待写入结束。'
+    ))!;
+    const result = await runtime.search(owner, { query: 'ResourceBusyError' });
+    expect(result.results.map((hit) => hit.entry.id)).toEqual([relevant.entry.id]);
+    expect(result.results[0].match?.method).toBe('keyword');
+  });
+
+  it('does not treat the metadata of an unparsed attachment as semantic content evidence', async () => {
+    const image = (await save('image', '原件已保存，正文暂不能检索。', {
+      kind: 'document',
+      title: '旅行照片.jpg',
+    }))!;
+    await library.markParsed(owner, image.entry.id, 'unsupported');
+    provider(async () => [{ id: image.entry.id, excerpt: image.markdown }]);
+    expect((await runtime.search(owner, { query: '重试连接' })).results).toEqual([]);
+    expect((await runtime.search(owner, { query: '旅行照片' })).results[0].entry.id).toBe(
+      image.entry.id
+    );
   });
 
   it('does not return a document deleted while semantic retrieval is in flight', async () => {

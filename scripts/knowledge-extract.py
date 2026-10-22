@@ -18,8 +18,12 @@ def cell(value):
 
 def pdf(source):
     from pypdf import PdfReader
+    from pypdf.errors import PdfReadError
 
-    document = PdfReader(source)
+    try:
+        document = PdfReader(source)
+    except PdfReadError as error:
+        raise ValueError("PDF 结构不完整或已损坏，无法读取页面；原件已完整保留，可上传有效版本后重新解析。") from error
     if document.is_encrypted and not document.decrypt(""):
         raise ValueError("PDF 已加密；原件已保存，需要解密后才能解析正文。")
     for number, page in enumerate(document.pages, start=1):

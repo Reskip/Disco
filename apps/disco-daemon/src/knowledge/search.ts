@@ -91,6 +91,12 @@ export function searchTerms(query: string): string[] {
   );
 }
 
+/** Error names, paths, and codes ask for exact evidence, not a semantic approximation. */
+export function isExactLookup(query: string): boolean {
+  const value = query.trim();
+  return /^[a-z0-9_.:/-]+$/i.test(value) && /[a-z][A-Z]|[_.:/-]|[A-Z]{2}|\d/.test(value);
+}
+
 function metadata(entry: KnowledgeEntry): string {
   return [
     entry.title,
@@ -118,9 +124,67 @@ export interface KeywordHit {
 /** Rebuildable, owner-scoped sparse counts; original Markdown is never cached here. */
 export class KnowledgeKeywordIndex {
   private readonly owners = new Map<string, Map<string, IndexedDocument>>();
+  private readonly preparing = new Map<string, Promise<IndexedDocument | null>>();
 
   clear(): void {
     this.owners.clear();
+  }
+
+  private async prepare(
+    owner: string,
+    entries: KnowledgeEntry[],
+    liveIds: Set<string>,
+    load: (id: string) => Promise<KnowledgeEntryDetail | null>,
+    keepGoing: () => boolean = () => true
+  ): Promise<Array<{ id: string; value: IndexedDocument }>> {
+    const cache = this.owners.get(owner) ?? new Map<string, IndexedDocument>();
+    // LRU bounds memory across accounts; eviction changes speed, never search scope/results.
+    this.owners.delete(owner);
+    this.owners.set(owner, cache);
+    while (this.owners.size > 8) this.owners.delete(this.owners.keys().next().value!);
+    for (const id of cache.keys()) if (!liveIds.has(id)) cache.delete(id);
+    const documents: Array<{ id: string; value: IndexedDocument }> = [];
+    for (const entry of entries) {
+      if (!keepGoing()) break;
+      const signature = `${entry.updatedAt}\n${entry.sizeBytes}\n${metadata(entry)}`;
+      let value = cache.get(entry.id);
+      if (!value || value.signature !== signature) {
+        const key = JSON.stringify([owner, entry.id, signature]);
+        let work = this.preparing.get(key);
+        if (!work) {
+          work = (async () => {
+            const detail = await load(entry.id).catch(() => null);
+            if (!detail || detail.entry.historical) return null;
+            return {
+              signature: `${detail.entry.updatedAt}\n${detail.entry.sizeBytes}\n${metadata(detail.entry)}`,
+              contentHash: detail.contentHash,
+              body: await bodyTerms(detail.markdown),
+              metadata: terms(metadata(detail.entry)),
+            };
+          })().finally(() => this.preparing.delete(key));
+          this.preparing.set(key, work);
+        }
+        const prepared = await work;
+        if (!prepared) {
+          cache.delete(entry.id);
+          continue;
+        }
+        value = prepared;
+        cache.set(entry.id, value);
+      }
+      documents.push({ id: entry.id, value });
+    }
+    return documents;
+  }
+
+  async warm(
+    owner: string,
+    entries: KnowledgeEntry[],
+    liveIds: Set<string>,
+    load: (id: string) => Promise<KnowledgeEntryDetail | null>,
+    keepGoing?: () => boolean
+  ): Promise<void> {
+    await this.prepare(owner, entries, liveIds, load, keepGoing);
   }
 
   async search(
@@ -133,32 +197,7 @@ export class KnowledgeKeywordIndex {
   ): Promise<KeywordHit[]> {
     const queryTerms = searchTerms(query);
     if (!queryTerms.length) return [];
-    const cache = this.owners.get(owner) ?? new Map<string, IndexedDocument>();
-    // LRU bounds memory across accounts; eviction changes speed, never search scope/results.
-    this.owners.delete(owner);
-    this.owners.set(owner, cache);
-    while (this.owners.size > 8) this.owners.delete(this.owners.keys().next().value!);
-    for (const id of cache.keys()) if (!liveIds.has(id)) cache.delete(id);
-    const documents: Array<{ id: string; value: IndexedDocument }> = [];
-    for (const entry of entries) {
-      const signature = `${entry.updatedAt}\n${entry.sizeBytes}\n${metadata(entry)}`;
-      let value = cache.get(entry.id);
-      if (!value || value.signature !== signature) {
-        const detail = await load(entry.id).catch(() => null);
-        if (!detail || detail.entry.historical) {
-          cache.delete(entry.id);
-          continue;
-        }
-        value = {
-          signature: `${detail.entry.updatedAt}\n${detail.entry.sizeBytes}\n${metadata(detail.entry)}`,
-          contentHash: detail.contentHash,
-          body: await bodyTerms(detail.markdown),
-          metadata: terms(metadata(detail.entry)),
-        };
-        cache.set(entry.id, value);
-      }
-      documents.push({ id: entry.id, value });
-    }
+    const documents = await this.prepare(owner, entries, liveIds, load);
     const averageLength =
       documents.reduce((sum, document) => sum + document.value.body.length, 0) /
       Math.max(1, documents.length);

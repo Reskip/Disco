@@ -149,6 +149,8 @@ export class KnowledgeRuntime {
   private archiveAbort = new AbortController();
   private states = new Map<string, NonNullable<KnowledgeLibraryStatus['sync']>>();
   private engineStates = new Map<string, NonNullable<KnowledgeLibraryStatus['engine']>>();
+  private engineProbes = new Map<string, Promise<void>>();
+  private engineCheckedAt = new Map<string, number>();
   private checkpoints = new Map<string, string>();
   private hostAttachmentCheckpoints = new Map<string, number>();
   private transcriptCheckpoints = new Map<string, { signature: string; scannedAt: number }>();
@@ -229,6 +231,48 @@ export class KnowledgeRuntime {
   observe(owner: KnowledgeOwner): void {
     this.knownOwners.set(ownerKey(owner), owner);
     this.warmKeywords(owner);
+    this.probeEngine(owner);
+  }
+
+  private recordEngineState(
+    owner: KnowledgeOwner,
+    state: NonNullable<KnowledgeLibraryStatus['engine']>
+  ): void {
+    const key = ownerKey(owner);
+    this.engineStates.set(key, state);
+    this.engineCheckedAt.set(key, Date.now());
+  }
+
+  private probeEngine(owner: KnowledgeOwner): void {
+    const key = ownerKey(owner);
+    if (
+      this.stopped ||
+      !this.engine?.probe ||
+      this.engineProbes.has(key) ||
+      Date.now() - (this.engineCheckedAt.get(key) ?? 0) < 60_000
+    )
+      return;
+    const observed = this.engineStates.get(key);
+    this.engineCheckedAt.set(key, Date.now());
+    const work = Promise.resolve()
+      .then(() => {
+        if (!this.stopped) return this.engine!.probe(owner);
+      })
+      .then(() => {
+        // A search/index operation can finish while health is in flight. Its newer
+        // success/failure is more informative than this earlier connectivity check.
+        if (!this.stopped && this.engineStates.get(key) === observed)
+          this.recordEngineState(owner, { status: 'ready' });
+      })
+      .catch(() => {
+        if (!this.stopped && this.engineStates.get(key) === observed)
+          this.recordEngineState(owner, {
+            status: 'unavailable',
+            message: '语义索引暂不可用，本地文字检索可用',
+          });
+      })
+      .finally(() => this.engineProbes.delete(key));
+    this.engineProbes.set(key, work);
   }
 
   private warmKeywords(owner: KnowledgeOwner): void {
@@ -339,10 +383,10 @@ export class KnowledgeRuntime {
           // out-of-scope chunks cannot crowd out all relevant candidates.
           documentIds: selected || input.source ? [...allowed] : undefined,
         });
-        this.engineStates.set(ownerKey(owner), { status: 'ready' });
+        this.recordEngineState(owner, { status: 'ready' });
         return hits.filter((hit) => allowed.has(hit.id));
       } catch {
-        this.engineStates.set(ownerKey(owner), {
+        this.recordEngineState(owner, {
           status: 'unavailable',
           message: '语义检索暂不可用，已使用本地文字检索',
         });
@@ -498,6 +542,7 @@ export class KnowledgeRuntime {
       this.summarizing,
       cancellation,
       ...this.keywordWarmups.values(),
+      ...this.engineProbes.values(),
     ]);
     this.keywordIndex.clear();
     this.keywordWarmedAt.clear();
@@ -1060,7 +1105,7 @@ export class KnowledgeRuntime {
       try {
         await this.engine.index(owner, { id: entry.id, content: detail.markdown });
         if (!(await this.finishIndexAttempt(owner, entry.id, detail.contentHash))) continue;
-        this.engineStates.set(ownerKey(owner), { status: 'ready' });
+        this.recordEngineState(owner, { status: 'ready' });
       } catch (error) {
         const message =
           error instanceof OpenVikingError ? error.message : '此资料索引失败，将自动重试';
@@ -1069,7 +1114,7 @@ export class KnowledgeRuntime {
           error instanceof OpenVikingError &&
           ['UNAVAILABLE', 'UNAUTHORIZED', 'FORBIDDEN'].includes(error.code)
         )
-          this.engineStates.set(ownerKey(owner), { status: 'unavailable', message });
+          this.recordEngineState(owner, { status: 'unavailable', message });
         // One broken document must not starve the rest. A down service backs off the worker.
         if (error instanceof OpenVikingError && error.code === 'UNAVAILABLE') return;
       } finally {

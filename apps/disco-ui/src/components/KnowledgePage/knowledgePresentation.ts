@@ -1,10 +1,41 @@
 import type {
   KnowledgeEntry,
+  KnowledgeEntryDetail,
   KnowledgeGeneration,
   KnowledgeMaterialType,
   KnowledgeOrganization,
   KnowledgeSummaryProgress,
 } from '@disco/core/types';
+
+/** Hide only a complete server-attested machine marker in the reading view. */
+export function sourceReadingText(detail: KnowledgeEntryDetail): string {
+  const projection = detail.entry.parseProjection;
+  if (
+    detail.entry.humanEdited ||
+    projection?.kind !== 'geospatial' ||
+    projection.version !== 1 ||
+    projection.contentHash !== detail.contentHash
+  )
+    return detail.markdown;
+  return detail.markdown.replace(
+    /^<!-- disco-geospatial-projection:(\{[^\r\n]+\}) -->\r?$(?:\n)?/m,
+    (line, metadata: string) => {
+      try {
+        const value = JSON.parse(metadata);
+        return value.version === 1 &&
+          ['gpx', 'kml'].includes(value.format) &&
+          /^[a-f0-9]{64}$/.test(value.sha256) &&
+          value.counts &&
+          typeof value.counts === 'object' &&
+          !Array.isArray(value.counts)
+          ? ''
+          : line;
+      } catch {
+        return line;
+      }
+    }
+  );
+}
 
 export const MATERIAL_LABELS: Record<KnowledgeMaterialType, string> = {
   conversation: '会话',

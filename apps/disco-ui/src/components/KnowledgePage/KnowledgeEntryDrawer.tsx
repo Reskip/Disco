@@ -42,6 +42,7 @@ import {
   PARSE_LABELS,
   SOURCE_LABELS,
   safeSourceUrl,
+  sourceReadingText,
 } from './knowledgePresentation';
 
 export function KnowledgeEntryDrawer({
@@ -614,7 +615,7 @@ export function KnowledgeEntryDrawer({
                 <Typography.Paragraph
                   style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: 0 }}
                 >
-                  {detail.markdown || '（正文为空）'}
+                  {sourceReadingText(detail) || '（正文为空）'}
                 </Typography.Paragraph>
               )}
             </div>

@@ -39,6 +39,38 @@ function document(
 }
 
 describe('knowledge retrieval acceptance', () => {
+  it('finds escaped Markdown identifiers at original offsets without losing literal Windows paths', async () => {
+    const map = document('map', '路线', '前言😀\nQA\\_GEOROUTE\\_20261023：路线描述');
+    const path = document('path', '原始路径', '路径 C:\\_cache\\route.json');
+    const values = [map, path];
+    const index = new KnowledgeKeywordIndex();
+    const run = (query: string) =>
+      index.search(
+        'owner',
+        values.map((item) => item.entry),
+        new Set(['map', 'path']),
+        query,
+        async (id) => values.find((item) => item.entry.id === id) ?? null,
+        20
+      );
+    expect((await run('QA_GEOROUTE_20261023')).map((item) => item.id)).toEqual(['map']);
+    const evidence = knowledgeSearchEvidence(map, 'QA_GEOROUTE_20261023');
+    expect(evidence.technical).toBe(true);
+    expect(evidence.position).toBe(map.markdown.indexOf('QA'));
+    expect(evidence.phrase).toBe(true);
+    const excerpt = searchExcerpt(map, 'QA_GEOROUTE_20261023', 'keyword');
+    expect(excerpt.excerpt).toBe(map.markdown.slice(excerpt.match.start, excerpt.match.end));
+    expect(excerpt.match.contentHash).toBe(map.contentHash);
+    expect((await run('C:\\_cache\\route.json')).map((item) => item.id)).toEqual(['path']);
+    expect(knowledgeSearchEvidence(path, 'C:\\_cache\\route.json').technical).toBe(true);
+    expect(
+      knowledgeSearchEvidence(
+        document('near', '近似标记', 'QA\\_GEOROUTE\\_20261023EXTRA'),
+        'QA_GEOROUTE_20261023'
+      ).technical
+    ).toBe(false);
+  });
+
   it('anchors mixed code queries without requiring every compared symbol or treating brands as code', async () => {
     expect(technicalAnchors('如何解决 ResourceBusyError')).toEqual(['resourcebusyerror']);
     expect(technicalAnchors('如何解决 resourcebusyerror')).toEqual(['resourcebusyerror']);

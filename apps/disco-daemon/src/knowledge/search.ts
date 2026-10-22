@@ -54,6 +54,9 @@ function* tokens(text: string): Generator<string> {
       if (count > 2 && count <= 12) yield token;
     } else {
       yield token;
+      // Retain the original token too: a backslash can be a real path separator.
+      const readable = token.replace(/\\_/g, '_');
+      if (readable !== token) yield readable;
       for (const part of token.split(/[_.:/\\-]+/))
         if (part.length > 1 && part !== token) yield part;
     }
@@ -124,8 +127,14 @@ export function technicalAnchors(query: string): string[] {
 }
 
 const literal = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// Match rendered underscores while keeping offsets into the untouched Markdown.
+const readingLiteral = (value: string) =>
+  value
+    .split('_')
+    .map(literal)
+    .join(`(?:${literal('\\')})?_`);
 const anchorPattern = (anchor: string) =>
-  new RegExp(`(?<![a-z0-9_$])${literal(anchor)}(?![a-z0-9_$])`, 'giu');
+  new RegExp(`(?<![a-z0-9_$])${readingLiteral(anchor)}(?![a-z0-9_$])`, 'giu');
 
 /** Multiple symbols can be compared across separate sources; never require their intersection. */
 export function hasTechnicalEvidence(text: string, query: string): boolean {
@@ -317,7 +326,7 @@ function keywordEvidence(text: string, query: string, windowSize = 800): Keyword
   const queryTerms = searchTerms(query);
   const anchors = technicalAnchors(query);
   const phrase = query.trim()
-    ? new RegExp(literal(query.trim()), 'iu').exec(text)?.index
+    ? new RegExp(readingLiteral(query.trim()), 'iu').exec(text)?.index
     : undefined;
   // Prefer the densest local group of query terms over the first generic word.
   const windows = new Map<number, { position: number; terms: Set<string>; anchor: boolean }>();
@@ -325,7 +334,7 @@ function keywordEvidence(text: string, query: string, windowSize = 800): Keyword
   const width = Math.max(1, Math.floor(windowSize / 2));
   for (const term of queryTerms) {
     const isAnchor = anchors.includes(term);
-    const expression = isAnchor ? anchorPattern(term) : new RegExp(literal(term), 'giu');
+    const expression = isAnchor ? anchorPattern(term) : new RegExp(readingLiteral(term), 'giu');
     for (const occurrence of text.matchAll(expression)) {
       matched.add(term);
       const offset = occurrence.index;

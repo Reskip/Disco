@@ -465,9 +465,19 @@ export class OpenVikingClient {
     }
   }
 
-  private async identity(owner: KnowledgeOwner): Promise<OpenVikingIdentity> {
+  /** Authenticated, read-only connectivity check; no document or model operation. */
+  async probe(owner: KnowledgeOwner): Promise<void> {
+    await this.identity(owner, true, this.cancellationEpoch);
+  }
+
+  private async identity(
+    owner: KnowledgeOwner,
+    requireHealthy = false,
+    expectedEpoch?: number
+  ): Promise<OpenVikingIdentity> {
     const accountId = openVikingAccountId(owner);
     const identity = await this.options.resolveIdentity(owner);
+    if (expectedEpoch !== undefined) this.assertActive(expectedEpoch);
     if (!identity) throw new OpenVikingError('此用户尚未配置语义索引', 'NOT_CONFIGURED');
     if (
       identity.owner.tenantId !== owner.tenantId ||
@@ -490,6 +500,8 @@ export class OpenVikingClient {
     ) {
       throw new OpenVikingError('OpenViking 身份校验失败', 'IDENTITY_MISMATCH');
     }
+    if (requireHealthy && health.healthy !== true)
+      throw new OpenVikingError('语义索引服务尚未就绪', 'UNAVAILABLE');
     return identity;
   }
 

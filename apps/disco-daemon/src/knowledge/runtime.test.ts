@@ -93,6 +93,115 @@ describe('knowledge background synchronization', () => {
       title,
       working_directory: join(root, user.user_id, randomUUID()),
     });
+
+  it('restores real engine health without indexing work, blocking status, or probing every poll', async () => {
+    let complete!: () => void;
+    const probe = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            complete = resolve;
+          })
+      )
+      .mockResolvedValue(undefined);
+    Object.defineProperty(runtime, 'engine', { value: { probe } });
+    const before = await runtime.status(owner);
+    expect(before.engine?.status).toBe('unavailable');
+    await runtime.status(owner);
+    expect(probe).toHaveBeenCalledTimes(1);
+    complete();
+    await Promise.all(
+      (runtime as unknown as { engineProbes: Map<string, Promise<void>> }).engineProbes.values()
+    );
+    expect((await runtime.status(owner)).engine?.status).toBe('ready');
+    expect(probe).toHaveBeenCalledTimes(1);
+    await runtime.status(otherOwner);
+    await Promise.all(
+      (runtime as unknown as { engineProbes: Map<string, Promise<void>> }).engineProbes.values()
+    );
+    expect(probe).toHaveBeenCalledTimes(2);
+    const now = Date.now();
+    vi.spyOn(Date, 'now').mockReturnValue(now + 61_000);
+    await runtime.status(owner);
+    await Promise.all(
+      (runtime as unknown as { engineProbes: Map<string, Promise<void>> }).engineProbes.values()
+    );
+    expect(probe).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not let an older successful probe erase a newer semantic search failure', async () => {
+    await runtime.library.upsertSource(owner, {
+      source: 'manual',
+      sourceId: 'probe-race',
+      kind: 'note',
+      title: '保存资料',
+      markdown: '保留所有可访问的资料。',
+    });
+    let complete!: () => void;
+    const probe = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          complete = resolve;
+        })
+    );
+    Object.defineProperty(runtime, 'engine', {
+      value: { probe, search: vi.fn().mockRejectedValue(new Error('offline')) },
+    });
+    await runtime.status(owner);
+    await runtime.search(owner, { query: '如何保存资料' });
+    const failed = (await runtime.status(owner)).engine;
+    expect(failed?.status).toBe('unavailable');
+    expect(failed?.message).toContain('语义检索暂不可用');
+    complete();
+    await Promise.all(
+      (runtime as unknown as { engineProbes: Map<string, Promise<void>> }).engineProbes.values()
+    );
+    expect((await runtime.status(owner)).engine).toEqual(failed);
+  });
+
+  it('caches probe failure without exposing provider text or treating configured engine as ready', async () => {
+    const probe = vi.fn().mockRejectedValue(new Error('PRIVATE_CREDENTIAL'));
+    Object.defineProperty(runtime, 'engine', { value: { probe } });
+    await runtime.status(owner);
+    await Promise.all(
+      (runtime as unknown as { engineProbes: Map<string, Promise<void>> }).engineProbes.values()
+    );
+    const failed = await runtime.status(owner);
+    expect(failed.engine?.status).toBe('unavailable');
+    expect(failed.engine?.message).not.toContain('PRIVATE_CREDENTIAL');
+    expect(probe).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not let an older failed probe erase newer search success, or start a probe after stop', async () => {
+    await runtime.library.upsertSource(owner, {
+      source: 'manual',
+      sourceId: 'probe-success-race',
+      kind: 'note',
+      title: '保存资料',
+      markdown: '完整保存资料。',
+    });
+    let reject!: (error: Error) => void;
+    const probe = vi.fn(
+      () =>
+        new Promise<void>((_resolve, fail) => {
+          reject = fail;
+        })
+    );
+    Object.defineProperty(runtime, 'engine', {
+      value: { probe, search: vi.fn().mockResolvedValue([]) },
+    });
+    await runtime.status(owner);
+    await runtime.search(owner, { query: '怎样保存资料' });
+    reject(new Error('old failure'));
+    await Promise.all(
+      (runtime as unknown as { engineProbes: Map<string, Promise<void>> }).engineProbes.values()
+    );
+    expect((await runtime.status(owner)).engine?.status).toBe('ready');
+    runtime.observe(otherOwner);
+    await runtime.stop();
+    expect(probe).toHaveBeenCalledTimes(1);
+  });
   // Seed canonical rows directly. This seam tests the worker's reads, not the
   // message writer; libSQL's separate transactional connections do not share
   // :memory: state and otherwise retain Windows file handles until GC.

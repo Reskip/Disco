@@ -71,6 +71,50 @@ function setup(
 }
 
 describe('OpenViking derived index isolation', () => {
+  it('does not start a health request after cancellation during identity resolution', async () => {
+    let resolveIdentity!: (value: ReturnType<typeof identity>) => void;
+    const fetcher = vi.fn<typeof fetch>();
+    const client = new OpenVikingClient({
+      baseUrl: 'http://127.0.0.1:1933',
+      resolveIdentity: () =>
+        new Promise((resolve) => {
+          resolveIdentity = resolve;
+        }),
+      fetch: fetcher,
+    });
+    const pending = client.probe(owner);
+    await client.cancelPending();
+    resolveIdentity(identity());
+    await expect(pending).rejects.toMatchObject({ code: 'CANCELLED' });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+  it('probes authenticated healthy account identity without reading content or invoking a model', async () => {
+    const { client, fetcher } = setup();
+    await client.probe(owner);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(new URL(String(fetcher.mock.calls[0][0])).pathname).toBe('/health');
+    for (const [account, healthy, code] of [
+      [openVikingAccountId(secondOwner), true, 'IDENTITY_MISMATCH'],
+      [openVikingAccountId(owner), false, 'UNAVAILABLE'],
+    ] as const) {
+      const invalid = new OpenVikingClient({
+        baseUrl: 'http://127.0.0.1:1933',
+        resolveIdentity: identity,
+        fetch: async () =>
+          new Response(
+            JSON.stringify({
+              status: 'ok',
+              healthy,
+              auth_mode: 'api_key',
+              account_id: account,
+              user_id: 'library',
+              role: 'user',
+            })
+          ),
+      });
+      await expect(invalid.probe(owner)).rejects.toMatchObject({ code });
+    }
+  });
   it('uses distinct account names and ordinary user keys for each authenticated owner', async () => {
     const { client, fetcher } = setup();
     await client.index(owner, { id: 'entry-1', content: '# 原件\n完整内容' });
